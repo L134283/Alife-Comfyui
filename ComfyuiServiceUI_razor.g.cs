@@ -1,0 +1,1391 @@
+using System;
+using System.IO;
+using System.Text.Json.Nodes;
+using System.Threading.Tasks;
+using Alife.Framework;
+using Alife.Platform;
+using Microsoft.AspNetCore.Components;
+using Microsoft.AspNetCore.Components.Rendering;
+using Microsoft.AspNetCore.Components.Web;
+using AntDesign;
+
+namespace Alife.Plugin.Comfyui;
+
+public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConfig>
+{
+    string? detectMessage;
+
+    const string Css = @"
+/* ========== 根：旋转霓虹描边 ========== */
+.cfy-root {
+    --pink: #ec4899;
+    --pink-hot: #f472b6;
+    --rose: #fb7185;
+    --blush: #fbcfe8;
+    --cream: #fff7fb;
+    --ink: #5b2145;
+    --ink-soft: #9d4b74;
+    position: relative;
+    width: 100%;
+    box-sizing: border-box;
+    border-radius: 26px;
+    padding: 3px;
+    isolation: isolate;
+    animation: cfy-root-in 0.8s cubic-bezier(.16,1,.3,1) both;
+}
+@keyframes cfy-root-in {
+    from { opacity: 0; transform: scale(0.94) translateY(28px); filter: blur(12px); }
+    to { opacity: 1; transform: scale(1) translateY(0); filter: blur(0); }
+}
+.cfy-root::before {
+    content: '';
+    position: absolute;
+    inset: -40%;
+    z-index: -2;
+    background: conic-gradient(
+        from var(--cfy-angle, 0deg),
+        #ff6bb5, #ff9ad5, #ffd0e8, #fff, #fda4af,
+        #f472b6, #e879f9, #c084fc, #f472b6, #ff6bb5
+    );
+    animation: cfy-spin 4s linear infinite;
+    filter: blur(0px);
+}
+.cfy-root::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: 26px;
+    background: linear-gradient(135deg, #fff9fc, #ffe4ef);
+    box-shadow:
+        0 0 40px rgba(236,72,153,0.35),
+        0 0 80px rgba(244,114,182,0.2),
+        0 25px 60px rgba(190,24,93,0.18),
+        inset 0 1px 0 rgba(255,255,255,0.9);
+}
+@property --cfy-angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+}
+@keyframes cfy-spin {
+    to { --cfy-angle: 360deg; transform: rotate(360deg); }
+}
+
+/* ========== 主容器 ========== */
+.cfy-container {
+    position: relative;
+    width: 100%;
+    box-sizing: border-box;
+    border-radius: 23px;
+    padding: 30px 32px 24px;
+    color: var(--ink);
+    overflow: hidden;
+    background:
+        radial-gradient(ellipse 90% 60% at 0% 0%, rgba(255,154,198,0.45), transparent 55%),
+        radial-gradient(ellipse 80% 50% at 100% 0%, rgba(253,164,175,0.35), transparent 50%),
+        radial-gradient(ellipse 70% 50% at 50% 100%, rgba(232,121,249,0.18), transparent 55%),
+        linear-gradient(165deg, #fffafc 0%, #fff0f6 45%, #ffe8f1 100%);
+}
+
+/* 极光层 */
+.cfy-aurora {
+    position: absolute;
+    inset: -20%;
+    z-index: 0;
+    pointer-events: none;
+    background:
+        linear-gradient(115deg,
+            transparent 20%,
+            rgba(244,114,182,0.18) 35%,
+            rgba(232,121,249,0.14) 45%,
+            rgba(251,113,133,0.16) 55%,
+            transparent 70%);
+    background-size: 200% 200%;
+    animation: cfy-aurora 10s ease-in-out infinite alternate;
+    mix-blend-mode: multiply;
+    filter: blur(8px);
+}
+@keyframes cfy-aurora {
+    0% { background-position: 0% 40%; transform: rotate(-2deg) scale(1.05); }
+    50% { background-position: 80% 60%; transform: rotate(1deg) scale(1.1); }
+    100% { background-position: 100% 30%; transform: rotate(-1deg) scale(1.05); }
+}
+
+/* 扫描线 */
+.cfy-scan {
+    position: absolute;
+    left: 0; right: 0;
+    height: 120px;
+    z-index: 0;
+    pointer-events: none;
+    background: linear-gradient(
+        180deg,
+        transparent 0%,
+        rgba(255,255,255,0.35) 45%,
+        rgba(244,114,182,0.12) 50%,
+        rgba(255,255,255,0.25) 55%,
+        transparent 100%
+    );
+    animation: cfy-scan 5.5s cubic-bezier(.4,0,.2,1) infinite;
+    opacity: 0.55;
+}
+@keyframes cfy-scan {
+    0% { top: -20%; }
+    100% { top: 110%; }
+}
+
+/* 网格 */
+.cfy-grid-bg {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-image:
+        linear-gradient(rgba(244,114,182,0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(244,114,182,0.06) 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, #000 20%, transparent 75%);
+    animation: cfy-grid-drift 20s linear infinite;
+}
+@keyframes cfy-grid-drift {
+    from { background-position: 0 0; }
+    to { background-position: 28px 28px; }
+}
+
+/* 光球 */
+.cfy-orb {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 0;
+    filter: blur(1px);
+    will-change: transform;
+}
+.cfy-orb-1 {
+    width: 280px; height: 280px;
+    top: -90px; right: -70px;
+    background: radial-gradient(circle, rgba(255,120,190,0.75) 0%, rgba(255,120,190,0) 68%);
+    animation: cfy-orb-a 8s ease-in-out infinite;
+}
+.cfy-orb-2 {
+    width: 220px; height: 220px;
+    bottom: 20px; left: -70px;
+    background: radial-gradient(circle, rgba(253,164,175,0.65) 0%, rgba(253,164,175,0) 68%);
+    animation: cfy-orb-b 10s ease-in-out infinite;
+}
+.cfy-orb-3 {
+    width: 160px; height: 160px;
+    top: 40%; left: 55%;
+    background: radial-gradient(circle, rgba(232,121,249,0.4) 0%, rgba(232,121,249,0) 70%);
+    animation: cfy-orb-c 7s ease-in-out infinite;
+}
+.cfy-orb-4 {
+    width: 100px; height: 100px;
+    top: 15%; left: 20%;
+    background: radial-gradient(circle, rgba(255,255,255,0.7) 0%, rgba(255,182,213,0.3) 40%, transparent 70%);
+    animation: cfy-orb-d 6s ease-in-out infinite;
+    filter: blur(0);
+}
+@keyframes cfy-orb-a {
+    0%,100% { transform: translate(0,0) scale(1); }
+    33% { transform: translate(-30px, 40px) scale(1.15); }
+    66% { transform: translate(-10px, 15px) scale(0.92); }
+}
+@keyframes cfy-orb-b {
+    0%,100% { transform: translate(0,0) scale(1); }
+    50% { transform: translate(35px, -30px) scale(1.2); }
+}
+@keyframes cfy-orb-c {
+    0%,100% { transform: translate(0,0) scale(1) rotate(0deg); }
+    50% { transform: translate(-40px, -25px) scale(1.25) rotate(40deg); }
+}
+@keyframes cfy-orb-d {
+    0%,100% { transform: translate(0,0) scale(1); opacity: 0.6; }
+    50% { transform: translate(20px, 30px) scale(1.4); opacity: 1; }
+}
+
+/* 粒子星场 */
+.cfy-particle {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 0;
+    background: #fff;
+    box-shadow: 0 0 6px 1px rgba(255,182,213,0.95), 0 0 14px rgba(236,72,153,0.5);
+    animation: cfy-particle-float linear infinite;
+}
+@keyframes cfy-particle-float {
+    0% { transform: translateY(20px) scale(0.4); opacity: 0; }
+    15% { opacity: 1; }
+    85% { opacity: 0.85; }
+    100% { transform: translateY(-420px) scale(1.2); opacity: 0; }
+}
+.cfy-p1  { width:5px; height:5px; left:6%;  bottom:5%;  animation-duration: 7s;  animation-delay: 0s; }
+.cfy-p2  { width:3px; height:3px; left:14%; bottom:0%;  animation-duration: 9s;  animation-delay: 1.2s; }
+.cfy-p3  { width:4px; height:4px; left:22%; bottom:8%;  animation-duration: 6.5s; animation-delay: 0.4s; }
+.cfy-p4  { width:6px; height:6px; left:35%; bottom:2%;  animation-duration: 8s;  animation-delay: 2s; }
+.cfy-p5  { width:3px; height:3px; left:48%; bottom:10%; animation-duration: 10s; animation-delay: 0.8s; }
+.cfy-p6  { width:5px; height:5px; left:58%; bottom:0%;  animation-duration: 7.5s; animation-delay: 1.6s; }
+.cfy-p7  { width:4px; height:4px; left:68%; bottom:6%;  animation-duration: 9.5s; animation-delay: 0.2s; }
+.cfy-p8  { width:3px; height:3px; left:78%; bottom:3%;  animation-duration: 6s;  animation-delay: 2.4s; }
+.cfy-p9  { width:5px; height:5px; left:88%; bottom:9%;  animation-duration: 8.5s; animation-delay: 1s; }
+.cfy-p10 { width:4px; height:4px; left:42%; bottom:4%;  animation-duration: 11s; animation-delay: 3s; }
+.cfy-p11 { width:3px; height:3px; left:92%; bottom:1%;  animation-duration: 7s;  animation-delay: 1.8s; }
+.cfy-p12 { width:6px; height:6px; left:28%; bottom:7%;  animation-duration: 9s;  animation-delay: 2.8s; }
+
+/* 闪星 */
+.cfy-star {
+    position: absolute;
+    width: 10px; height: 10px;
+    z-index: 0;
+    pointer-events: none;
+    background: radial-gradient(circle, #fff 0%, #ffc0e0 40%, transparent 70%);
+    clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+    animation: cfy-star-twinkle 2.2s ease-in-out infinite;
+}
+.cfy-star-1 { top: 8%;  left: 12%; animation-delay: 0s; }
+.cfy-star-2 { top: 18%; right: 15%; animation-delay: 0.6s; width: 8px; height: 8px; }
+.cfy-star-3 { top: 55%; left: 8%;  animation-delay: 1.1s; width: 7px; height: 7px; }
+.cfy-star-4 { top: 70%; right: 10%; animation-delay: 1.7s; width: 12px; height: 12px; }
+.cfy-star-5 { top: 30%; left: 50%; animation-delay: 0.3s; width: 6px; height: 6px; }
+@keyframes cfy-star-twinkle {
+    0%,100% { opacity: 0.15; transform: scale(0.5) rotate(0deg); }
+    50% { opacity: 1; transform: scale(1.4) rotate(20deg); filter: drop-shadow(0 0 6px #fff); }
+}
+
+/* 内容层 */
+.cfy-content { position: relative; z-index: 2; }
+
+/* 错落入场 */
+.cfy-stagger > * {
+    animation: cfy-rise 0.7s cubic-bezier(.16,1,.3,1) both;
+}
+.cfy-stagger > *:nth-child(1) { animation-delay: 0.05s; }
+.cfy-stagger > *:nth-child(2) { animation-delay: 0.12s; }
+.cfy-stagger > *:nth-child(3) { animation-delay: 0.2s; }
+.cfy-stagger > *:nth-child(4) { animation-delay: 0.28s; }
+.cfy-stagger > *:nth-child(5) { animation-delay: 0.36s; }
+.cfy-stagger > *:nth-child(6) { animation-delay: 0.44s; }
+.cfy-stagger > *:nth-child(7) { animation-delay: 0.52s; }
+.cfy-stagger > *:nth-child(8) { animation-delay: 0.6s; }
+.cfy-stagger > *:nth-child(9) { animation-delay: 0.68s; }
+.cfy-stagger > *:nth-child(10) { animation-delay: 0.76s; }
+@keyframes cfy-rise {
+    from { opacity: 0; transform: translateY(28px) scale(0.96); filter: blur(6px); }
+    to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
+/* ========== Hero ========== */
+.cfy-hero {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+.cfy-title-wrap { flex: 1; min-width: 220px; }
+.cfy-kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #be185d;
+    background: linear-gradient(90deg, rgba(255,255,255,0.95), rgba(255,228,240,0.8));
+    border: 1px solid rgba(244,114,182,0.4);
+    border-radius: 999px;
+    padding: 4px 14px;
+    margin-bottom: 10px;
+    box-shadow: 0 4px 16px rgba(244,114,182,0.2);
+    position: relative;
+    overflow: hidden;
+    animation: cfy-kicker-in 0.8s 0.1s cubic-bezier(.16,1,.3,1) both;
+}
+.cfy-kicker::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8), transparent);
+    transform: translateX(-100%);
+    animation: cfy-sheen 2.8s ease-in-out infinite;
+}
+.cfy-kicker-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #ec4899;
+    box-shadow: 0 0 8px #f472b6;
+    animation: cfy-blink 1.2s ease-in-out infinite;
+}
+@keyframes cfy-blink {
+    0%,100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.7); }
+}
+@keyframes cfy-sheen {
+    0%, 60% { transform: translateX(-100%); }
+    100% { transform: translateX(200%); }
+}
+@keyframes cfy-kicker-in {
+    from { opacity: 0; transform: translateX(-20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.cfy-title {
+    font-size: 32px;
+    font-weight: 900;
+    line-height: 1.1;
+    margin: 0 0 8px;
+    letter-spacing: -0.02em;
+    position: relative;
+    display: inline-block;
+    background: linear-gradient(
+        100deg,
+        #9d174d 0%,
+        #be185d 15%,
+        #ec4899 30%,
+        #f472b6 45%,
+        #fb7185 55%,
+        #e879f9 70%,
+        #f472b6 85%,
+        #be185d 100%
+    );
+    background-size: 300% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation:
+        cfy-title-shimmer 3.5s linear infinite,
+        cfy-title-pop 0.9s 0.15s cubic-bezier(.16,1,.3,1) both;
+    filter: drop-shadow(0 4px 16px rgba(236,72,153,0.35));
+}
+.cfy-title::after {
+    content: 'ComfyUI 生图';
+    position: absolute;
+    left: 0; top: 0;
+    width: 100%;
+    background: linear-gradient(100deg, transparent, rgba(255,255,255,0.85), transparent);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: cfy-title-glint 2.8s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes cfy-title-shimmer {
+    0% { background-position: 0% center; }
+    100% { background-position: 300% center; }
+}
+@keyframes cfy-title-glint {
+    0%, 40% { background-position: -100% center; opacity: 0; }
+    50% { opacity: 1; }
+    100% { background-position: 200% center; opacity: 0; }
+}
+@keyframes cfy-title-pop {
+    from { opacity: 0; transform: scale(0.85) translateY(12px); letter-spacing: 0.15em; }
+    to { opacity: 1; transform: scale(1) translateY(0); letter-spacing: -0.02em; }
+}
+
+.cfy-subtitle {
+    font-size: 13px;
+    color: var(--ink-soft);
+    line-height: 1.55;
+    position: relative;
+    display: inline-block;
+    animation: cfy-sub-in 0.8s 0.35s both;
+}
+.cfy-subtitle::after {
+    content: '';
+    display: inline-block;
+    width: 2px; height: 0.95em;
+    background: #ec4899;
+    margin-left: 3px;
+    vertical-align: -0.1em;
+    animation: cfy-cursor 0.9s step-end infinite;
+    box-shadow: 0 0 6px #f472b6;
+}
+@keyframes cfy-cursor {
+    0%,100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+@keyframes cfy-sub-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* 状态徽章 */
+.cfy-badge-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.cfy-badge-ring {
+    position: absolute;
+    inset: -6px;
+    border-radius: 999px;
+    border: 2px solid rgba(236,72,153,0.45);
+    animation: cfy-ring-pulse 2s ease-out infinite;
+    pointer-events: none;
+}
+.cfy-badge-ring2 {
+    position: absolute;
+    inset: -12px;
+    border-radius: 999px;
+    border: 1.5px solid rgba(244,114,182,0.3);
+    animation: cfy-ring-pulse 2s 0.5s ease-out infinite;
+    pointer-events: none;
+}
+@keyframes cfy-ring-pulse {
+    0% { transform: scale(0.9); opacity: 0.9; }
+    100% { transform: scale(1.35); opacity: 0; }
+}
+.cfy-badge-on, .cfy-badge-off {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 18px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 800;
+    white-space: nowrap;
+    letter-spacing: 0.03em;
+    position: relative;
+    z-index: 1;
+}
+.cfy-badge-on {
+    color: #fff;
+    background: linear-gradient(135deg, #f9a8d4, #f472b6 40%, #ec4899 70%, #db2777);
+    background-size: 200% 200%;
+    animation: cfy-badge-flow 3s ease infinite, cfy-badge-glow 2s ease-in-out infinite;
+    box-shadow:
+        0 6px 22px rgba(236,72,153,0.55),
+        0 0 0 1px rgba(255,255,255,0.4) inset,
+        0 0 30px rgba(244,114,182,0.4);
+}
+.cfy-badge-on::before {
+    content: '';
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 0 10px #fff, 0 0 18px #fbcfe8;
+    animation: cfy-blink 1s ease-in-out infinite;
+}
+@keyframes cfy-badge-flow {
+    0%,100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+@keyframes cfy-badge-glow {
+    0%,100% { filter: brightness(1); }
+    50% { filter: brightness(1.12); }
+}
+.cfy-badge-off {
+    color: var(--ink-soft);
+    background: rgba(255,255,255,0.75);
+    border: 1.5px solid rgba(244,114,182,0.35);
+    backdrop-filter: blur(8px);
+}
+.cfy-badge-off::before {
+    content: '';
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: #f9a8d4;
+}
+
+/* 说明卡片 */
+.cfy-alert {
+    position: relative;
+    background: linear-gradient(135deg, rgba(255,255,255,0.88), rgba(255,240,247,0.72));
+    border: 1px solid rgba(244,114,182,0.3);
+    border-radius: 18px;
+    padding: 16px 20px;
+    margin-bottom: 8px;
+    backdrop-filter: blur(14px);
+    box-shadow:
+        0 10px 30px rgba(244,114,182,0.12),
+        inset 0 1px 0 rgba(255,255,255,0.95);
+    overflow: hidden;
+    transition: transform 0.35s cubic-bezier(.16,1,.3,1), box-shadow 0.35s ease;
+}
+.cfy-alert:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 16px 40px rgba(236,72,153,0.18);
+}
+.cfy-alert::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 5px;
+    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9, #f472b6);
+    background-size: 100% 200%;
+    animation: cfy-bar-flow 2.5s linear infinite;
+    border-radius: 5px 0 0 5px;
+}
+.cfy-alert::after {
+    content: '';
+    position: absolute;
+    top: -50%; right: -10%;
+    width: 140px; height: 140px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(244,114,182,0.2), transparent 70%);
+    animation: cfy-orb-d 5s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes cfy-bar-flow {
+    0% { background-position: 0% 0%; }
+    100% { background-position: 0% 200%; }
+}
+.cfy-alert-title {
+    font-weight: 900;
+    color: #be185d;
+    margin-bottom: 8px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.cfy-alert-title::before {
+    content: '✦';
+    display: inline-block;
+    animation: cfy-spin-icon 4s linear infinite;
+    color: #f472b6;
+    text-shadow: 0 0 10px rgba(244,114,182,0.8);
+}
+@keyframes cfy-spin-icon {
+    to { transform: rotate(360deg); }
+}
+.cfy-alert-desc {
+    font-size: 12.5px;
+    color: #8b3a62;
+    line-height: 1.8;
+    white-space: pre-line;
+}
+
+/* 分区标题 */
+.cfy-section {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 15px;
+    font-weight: 900;
+    color: #be185d;
+    margin: 26px 0 14px;
+    letter-spacing: 0.03em;
+    position: relative;
+}
+.cfy-section::before {
+    content: '';
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #f472b6, #ec4899, #e879f9);
+    background-size: 200% 200%;
+    box-shadow: 0 0 14px rgba(236,72,153,0.85), 0 0 28px rgba(244,114,182,0.4);
+    flex-shrink: 0;
+    animation: cfy-dot-pulse 1.8s ease-in-out infinite, cfy-badge-flow 3s ease infinite;
+}
+.cfy-section::after {
+    content: '';
+    flex: 1;
+    height: 2px;
+    background: linear-gradient(90deg,
+        rgba(244,114,182,0.7),
+        rgba(232,121,249,0.4),
+        rgba(251,207,232,0.15),
+        transparent);
+    border-radius: 2px;
+    position: relative;
+    overflow: hidden;
+}
+@keyframes cfy-dot-pulse {
+    0%,100% { transform: scale(1); }
+    50% { transform: scale(1.35); }
+}
+
+/* 标签 / 提示 */
+.cfy-label {
+    font-weight: 800;
+    margin-bottom: 6px;
+    margin-top: 12px;
+    font-size: 12.5px;
+    color: #9d174d;
+    letter-spacing: 0.02em;
+    transition: color 0.2s;
+}
+.cfy-hint {
+    font-size: 11px;
+    color: #b06a8c;
+    margin: 5px 0 8px 2px;
+    line-height: 1.65;
+}
+
+/* 输入框 */
+.cfy-container .ant-input,
+.cfy-container .cfy-textarea,
+.cfy-container .cfy-select {
+    border: 1.5px solid rgba(244,114,182,0.3) !important;
+    border-radius: 14px !important;
+    background: rgba(255,255,255,0.82) !important;
+    color: var(--ink) !important;
+    box-shadow: 0 2px 10px rgba(244,114,182,0.07);
+    transition: all 0.3s cubic-bezier(.16,1,.3,1) !important;
+    backdrop-filter: blur(6px);
+}
+.cfy-container .ant-input:hover,
+.cfy-container .cfy-textarea:hover,
+.cfy-container .cfy-select:hover {
+    border-color: #f9a8d4 !important;
+    background: rgba(255,255,255,0.96) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(244,114,182,0.14) !important;
+}
+.cfy-container .ant-input:focus,
+.cfy-container .ant-input-focused,
+.cfy-container .cfy-textarea:focus,
+.cfy-container .cfy-select:focus {
+    border-color: #ec4899 !important;
+    box-shadow:
+        0 0 0 4px rgba(236,72,153,0.18),
+        0 8px 24px rgba(244,114,182,0.16) !important;
+    background: #fff !important;
+    transform: translateY(-1px);
+}
+.cfy-container .cfy-textarea {
+    width: 100%;
+    min-height: 96px;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    padding: 12px 14px;
+    box-sizing: border-box;
+}
+.cfy-container .cfy-select {
+    width: 100%;
+    padding: 9px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    outline: none;
+}
+.cfy-container .cfy-select option {
+    background: #fff;
+    color: var(--ink);
+}
+
+/* 分辨率卡片 — 全息 */
+.cfy-reso-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin: 10px 0 8px;
+    perspective: 900px;
+}
+@media (max-width: 720px) {
+    .cfy-reso-grid { grid-template-columns: 1fr; }
+}
+.cfy-reso-card {
+    position: relative;
+    border-radius: 18px;
+    padding: 16px 15px 14px;
+    background:
+        linear-gradient(145deg, rgba(255,255,255,0.95), rgba(255,240,247,0.8));
+    border: 1px solid rgba(244,114,182,0.3);
+    box-shadow: 0 8px 24px rgba(244,114,182,0.12);
+    overflow: hidden;
+    transition: transform 0.4s cubic-bezier(.16,1,.3,1), box-shadow 0.4s ease;
+    transform-style: preserve-3d;
+    animation: cfy-card-float 5s ease-in-out infinite;
+}
+.cfy-reso-card:nth-child(1) { animation-delay: 0s; }
+.cfy-reso-card:nth-child(2) { animation-delay: 0.6s; }
+.cfy-reso-card:nth-child(3) { animation-delay: 1.2s; }
+@keyframes cfy-card-float {
+    0%,100% { transform: translateY(0); }
+    50% { transform: translateY(-5px); }
+}
+.cfy-reso-card:hover {
+    transform: translateY(-8px) rotateX(4deg) rotateY(-3deg) scale(1.03);
+    box-shadow:
+        0 20px 45px rgba(236,72,153,0.28),
+        0 0 0 1px rgba(244,114,182,0.4),
+        0 0 40px rgba(244,114,182,0.2);
+    animation: none;
+}
+.cfy-reso-card::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: 18px;
+    padding: 1.5px;
+    background: conic-gradient(from var(--cfy-angle, 0deg),
+        #f472b6, #e879f9, #fff, #fda4af, #f472b6, #ec4899, #f472b6);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: cfy-spin 3s linear infinite;
+    opacity: 0.7;
+    pointer-events: none;
+}
+.cfy-reso-card::after {
+    content: '';
+    position: absolute;
+    top: -40%; right: -30%;
+    width: 100px; height: 100px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(244,114,182,0.3), transparent 70%);
+    pointer-events: none;
+    transition: transform 0.4s ease;
+}
+.cfy-reso-card:hover::after {
+    transform: scale(1.6) translate(-10px, 10px);
+}
+.cfy-reso-shine {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        115deg,
+        transparent 30%,
+        rgba(255,255,255,0.55) 48%,
+        transparent 62%
+    );
+    transform: translateX(-120%);
+    pointer-events: none;
+}
+.cfy-reso-card:hover .cfy-reso-shine {
+    animation: cfy-card-shine 0.8s ease forwards;
+}
+@keyframes cfy-card-shine {
+    to { transform: translateX(120%); }
+}
+.cfy-reso-tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #fff;
+    background: linear-gradient(135deg, #f472b6, #ec4899, #e879f9);
+    background-size: 200% 200%;
+    animation: cfy-badge-flow 3s ease infinite;
+    border-radius: 999px;
+    padding: 3px 10px;
+    margin-bottom: 10px;
+    box-shadow: 0 3px 12px rgba(236,72,153,0.4);
+    position: relative;
+    z-index: 1;
+}
+.cfy-reso-size {
+    font-size: 18px;
+    font-weight: 900;
+    color: #9d174d;
+    margin-bottom: 3px;
+    position: relative;
+    z-index: 1;
+    letter-spacing: -0.02em;
+}
+.cfy-reso-name {
+    font-size: 13px;
+    color: #b06a8c;
+    font-weight: 700;
+    position: relative;
+    z-index: 1;
+}
+.cfy-reso-hint {
+    font-size: 11px;
+    color: #c084a0;
+    margin-top: 8px;
+    line-height: 1.45;
+    position: relative;
+    z-index: 1;
+}
+
+/* 双栏 */
+.cfy-grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 20px;
+}
+@media (max-width: 720px) {
+    .cfy-grid-2 { grid-template-columns: 1fr; }
+}
+
+/* 玻璃面板 */
+.cfy-panel {
+    position: relative;
+    background: linear-gradient(150deg, rgba(255,255,255,0.78), rgba(255,240,247,0.58));
+    border: 1px solid rgba(244,114,182,0.25);
+    border-radius: 18px;
+    padding: 16px 18px 18px;
+    margin-top: 6px;
+    backdrop-filter: blur(12px);
+    box-shadow:
+        0 10px 30px rgba(244,114,182,0.1),
+        inset 0 1px 0 rgba(255,255,255,0.9);
+    overflow: hidden;
+    transition: box-shadow 0.35s ease, transform 0.35s cubic-bezier(.16,1,.3,1);
+}
+.cfy-panel:hover {
+    box-shadow:
+        0 16px 40px rgba(236,72,153,0.16),
+        inset 0 1px 0 rgba(255,255,255,0.95);
+}
+.cfy-panel::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -40%;
+    width: 40%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+    animation: cfy-panel-sweep 6s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes cfy-panel-sweep {
+    0%, 70% { left: -40%; }
+    100% { left: 140%; }
+}
+
+/* 按钮 — 液态霓虹 */
+.cfy-btn {
+    position: relative;
+    padding: 11px 24px;
+    border-radius: 999px;
+    border: none;
+    background: linear-gradient(135deg, #f9a8d4 0%, #f472b6 30%, #ec4899 60%, #e879f9 100%);
+    background-size: 220% 220%;
+    color: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 900;
+    font-family: inherit;
+    margin: 8px 10px 8px 0;
+    letter-spacing: 0.04em;
+    box-shadow:
+        0 8px 24px rgba(236,72,153,0.5),
+        0 0 0 1px rgba(255,255,255,0.35) inset,
+        0 0 30px rgba(244,114,182,0.3);
+    transition: all 0.35s cubic-bezier(.16,1,.3,1);
+    overflow: hidden;
+    animation: cfy-badge-flow 4s ease infinite;
+    text-shadow: 0 1px 2px rgba(157,23,77,0.3);
+}
+.cfy-btn::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -80%;
+    width: 50%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+    transition: left 0.55s ease;
+}
+.cfy-btn::after {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #f472b6, #e879f9, #f472b6);
+    z-index: -1;
+    opacity: 0;
+    filter: blur(10px);
+    transition: opacity 0.35s ease;
+}
+.cfy-btn:hover {
+    transform: translateY(-3px) scale(1.05);
+    box-shadow:
+        0 14px 36px rgba(236,72,153,0.65),
+        0 0 0 1px rgba(255,255,255,0.5) inset,
+        0 0 50px rgba(244,114,182,0.5);
+}
+.cfy-btn:hover::before { left: 140%; }
+.cfy-btn:hover::after { opacity: 0.85; }
+.cfy-btn:active { transform: translateY(0) scale(0.97); }
+
+/* 识别结果 */
+.cfy-detect {
+    position: relative;
+    background: linear-gradient(135deg, rgba(255,255,255,0.95), rgba(252,231,243,0.9));
+    border: 1px solid rgba(236,72,153,0.35);
+    border-left: 4px solid #ec4899;
+    border-radius: 14px;
+    padding: 12px 16px;
+    margin: 12px 0 8px;
+    font-size: 12.5px;
+    color: #9d174d;
+    white-space: pre-line;
+    line-height: 1.8;
+    box-shadow: 0 6px 20px rgba(236,72,153,0.15);
+    animation: cfy-detect-in 0.5s cubic-bezier(.16,1,.3,1) both;
+    overflow: hidden;
+}
+.cfy-detect::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #f472b6, #e879f9, transparent);
+    animation: cfy-detect-line 1.5s ease-in-out infinite;
+}
+@keyframes cfy-detect-in {
+    from { opacity: 0; transform: scale(0.95) translateY(10px); filter: blur(4px); }
+    to { opacity: 1; transform: scale(1) translateY(0); filter: blur(0); }
+}
+@keyframes cfy-detect-line {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+}
+
+/* 页脚 */
+.cfy-footer {
+    text-align: center;
+    font-size: 11.5px;
+    color: #c084a0;
+    margin-top: 28px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(244,114,182,0.2);
+    letter-spacing: 0.1em;
+    font-weight: 600;
+    position: relative;
+}
+.cfy-footer::before {
+    content: '✦  ✧  ✦';
+    display: block;
+    margin-bottom: 8px;
+    font-size: 10px;
+    letter-spacing: 0.4em;
+    color: #f9a8d4;
+    animation: cfy-star-twinkle 2.5s ease-in-out infinite;
+}
+.cfy-footer span {
+    background: linear-gradient(90deg, #f472b6, #ec4899, #e879f9, #f472b6);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 900;
+    animation: cfy-title-shimmer 3s linear infinite;
+}
+
+/* 装饰彩条 */
+.cfy-rainbow-bar {
+    height: 3px;
+    border-radius: 3px;
+    margin: 4px 0 18px;
+    background: linear-gradient(90deg,
+        #f472b6, #ec4899, #e879f9, #c084fc, #f472b6, #fb7185, #f472b6);
+    background-size: 300% 100%;
+    animation: cfy-title-shimmer 4s linear infinite;
+    box-shadow: 0 0 12px rgba(244,114,182,0.5);
+}
+";
+
+    protected override void BuildRenderTree(RenderTreeBuilder b)
+    {
+        if (Configuration == null)
+        {
+            b.AddContent(0, "Configuration NULL");
+            return;
+        }
+
+        int i = 0;
+
+        b.OpenElement(i++, "style");
+        b.AddContent(i++, Css);
+        b.CloseElement();
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-root");
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-container");
+
+        // 装饰层
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-aurora"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-grid-bg"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-scan"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-1"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-2"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-3"); b.CloseElement();
+        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-4"); b.CloseElement();
+
+        // 粒子
+        for (int p = 1; p <= 12; p++)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", $"cfy-particle cfy-p{p}");
+            b.CloseElement();
+        }
+        // 闪星
+        for (int s = 1; s <= 5; s++)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", $"cfy-star cfy-star-{s}");
+            b.CloseElement();
+        }
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-content cfy-stagger");
+
+        // Hero
+        var configured = !string.IsNullOrWhiteSpace(Configuration.BaseUrl)
+                         && !string.IsNullOrWhiteSpace(Configuration.WorkflowPath);
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-hero");
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-title-wrap");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-kicker");
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", "cfy-kicker-dot");
+        b.CloseElement();
+        b.AddContent(i++, "Doro · ComfyUI · ULTIMATE");
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-title");
+        b.AddContent(i++, "ComfyUI 生图");
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-subtitle");
+        b.AddContent(i++, "粉白梦幻工作台 · 任意工作流 · 智能分辨率 · 固定提示词前缀");
+        b.CloseElement();
+        b.CloseElement();
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-badge-wrap");
+        if (configured)
+        {
+            b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-badge-ring"); b.CloseElement();
+            b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-badge-ring2"); b.CloseElement();
+        }
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", configured ? "cfy-badge-on" : "cfy-badge-off");
+        b.AddContent(i++, configured ? "已配置 · LIVE" : "未配置");
+        b.CloseElement();
+        b.CloseElement();
+
+        b.CloseElement(); // hero
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-rainbow-bar");
+        b.CloseElement();
+
+        // 使用说明
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-alert");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-alert-title");
+        b.AddContent(i++, "使用说明");
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-alert-desc");
+        b.AddContent(i++,
+            "1. 先启动 ComfyUI（默认 http://127.0.0.1:8188）\n" +
+            "2. 工作流可填 UI 格式或 API 格式，插件会自动转换\n" +
+            "3. AI 调用 GenerateImage(prompt, orientation?, width?, height?) 生图\n" +
+            "4. 修改配置后需重新加载模块生效\n" +
+            "5. 分辨率三档：portrait 竖版 / landscape 横版 / square 正方形");
+        b.CloseElement();
+        b.CloseElement();
+
+        // 分辨率
+        AddSection(b, ref i, "分辨率预设");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-reso-grid");
+        AddResoCard(b, ref i, "PORTRAIT", "832 × 1216", "竖版", "全身立绘 · 人物 · 手机壁纸");
+        AddResoCard(b, ref i, "LANDSCAPE", "1216 × 832", "横版", "风景 · 场景 · 横构图");
+        AddResoCard(b, ref i, "SQUARE", "1216 × 1216", "正方形", "头像 · 图标 · 对称构图");
+        b.CloseElement();
+        AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖");
+
+        // 连接 + 工作流
+        AddSection(b, ref i, "连接与工作流");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-grid-2");
+
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "ComfyUI 地址", Configuration.BaseUrl, v => Configuration.BaseUrl = v);
+        AddHint(b, ref i, "例如 http://127.0.0.1:8188");
+        AddInput(b, ref i, "API Token（可选）", Configuration.ApiToken, v => Configuration.ApiToken = v);
+        b.CloseElement();
+
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "工作流 JSON 路径", Configuration.WorkflowPath, v => Configuration.WorkflowPath = v);
+        AddHint(b, ref i, "相对插件目录或绝对路径均可");
+        AddInput(b, ref i, "图片保存目录", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
+        var currentSave = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
+            ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
+            : Configuration.SaveDirectory;
+        AddHint(b, ref i, $"当前: {currentSave}（留空用默认）");
+        b.CloseElement();
+
+        b.CloseElement();
+        b.CloseElement();
+
+        // 提示词
+        AddSection(b, ref i, "提示词前缀与负面");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+        AddTextArea(b, ref i, "固定正向提示词前缀（多行，换行会被保留）", Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
+        AddHint(b, ref i, "生图时自动拼到正向提示词最前面。前缀内空行原样保留。留空则不拼接");
+        AddTextArea(b, ref i, "固定负面提示词（可空=用工作流自带）", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
+        AddHint(b, ref i, "留空则使用工作流自带负面；填写则覆盖");
+        b.CloseElement();
+
+        // 默认参数
+        AddSection(b, ref i, "默认参数");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-grid-2");
+
+        b.OpenElement(i++, "div");
+        AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
+        {
+            ("portrait", "竖版 832×1216"),
+            ("landscape", "横版 1216×832"),
+            ("square", "正方形 1216×1216")
+        });
+        AddHint(b, ref i, "AI 未传 orientation 时的默认方向");
+        AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), v =>
+        {
+            if (int.TryParse(v, out var n)) Configuration.DefaultWidth = n;
+        });
+        AddInput(b, ref i, "兜底高度", Configuration.DefaultHeight.ToString(), v =>
+        {
+            if (int.TryParse(v, out var n)) Configuration.DefaultHeight = n;
+        });
+        b.CloseElement();
+
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "超时秒数", Configuration.TimeoutSeconds.ToString(), v =>
+        {
+            if (int.TryParse(v, out var n)) Configuration.TimeoutSeconds = n;
+        });
+        AddInput(b, ref i, "轮询间隔毫秒", Configuration.PollIntervalMs.ToString(), v =>
+        {
+            if (int.TryParse(v, out var n)) Configuration.PollIntervalMs = n;
+        });
+        b.CloseElement();
+
+        b.CloseElement();
+        b.CloseElement();
+
+        // 节点映射
+        AddSection(b, ref i, "节点映射（高级）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+        AddHint(b, ref i, "留空即可自动识别。特殊工作流可点按钮扫描并回填节点 ID");
+
+        b.OpenElement(i++, "div");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cfy-btn");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, AutoDetectNodes));
+        b.AddContent(i++, "✦ 自动识别节点");
+        b.CloseElement();
+        b.CloseElement();
+
+        if (!string.IsNullOrWhiteSpace(detectMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-detect");
+            b.AddContent(i++, detectMessage);
+            b.CloseElement();
+        }
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-grid-2");
+
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "正向提示词节点 ID", Configuration.PositivePromptNodeId, v => Configuration.PositivePromptNodeId = v);
+        AddInput(b, ref i, "正向提示词字段名", Configuration.PositivePromptInput, v => Configuration.PositivePromptInput = v);
+        AddInput(b, ref i, "分辨率节点 ID", Configuration.ResolutionNodeId, v => Configuration.ResolutionNodeId = v);
+        b.CloseElement();
+
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "负面提示词节点 ID", Configuration.NegativePromptNodeId, v => Configuration.NegativePromptNodeId = v);
+        AddInput(b, ref i, "负面提示词字段名", Configuration.NegativePromptInput, v => Configuration.NegativePromptInput = v);
+        b.CloseElement();
+
+        b.CloseElement();
+        b.CloseElement();
+
+        // footer
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-footer");
+        b.OpenElement(i++, "span");
+        b.AddContent(i++, "ComfyUI × Alife");
+        b.CloseElement();
+        b.AddContent(i++, "  ·  Doro 的妙妙工具  ·  MAX FX");
+        b.CloseElement();
+
+        b.CloseElement(); // content
+        b.CloseElement(); // container
+        b.CloseElement(); // root
+    }
+
+    void AddResoCard(RenderTreeBuilder b, ref int seq, string tag, string size, string name, string hint)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-card");
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-shine");
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-tag");
+        b.AddContent(seq++, tag);
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-size");
+        b.AddContent(seq++, size);
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-name");
+        b.AddContent(seq++, name);
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-hint");
+        b.AddContent(seq++, hint);
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    void AddSection(RenderTreeBuilder b, ref int seq, string text)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-section");
+        b.AddContent(seq++, text);
+        b.CloseElement();
+    }
+
+    void AddHint(RenderTreeBuilder b, ref int seq, string text)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-hint");
+        b.AddContent(seq++, text);
+        b.CloseElement();
+    }
+
+    void AddInput(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddContent(seq++, label);
+        b.CloseElement();
+
+        b.OpenComponent<Input<string>>(seq++);
+        b.AddAttribute(seq++, "Value", value ?? "");
+        b.AddAttribute(seq++, "ValueChanged", EventCallback.Factory.Create<string>(this, onChange));
+        b.AddAttribute(seq++, "Style", "width:100%;");
+        b.CloseComponent();
+    }
+
+    void AddTextArea(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange, int rows = 4)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddContent(seq++, label);
+        b.CloseElement();
+
+        b.OpenElement(seq++, "textarea");
+        b.AddAttribute(seq++, "class", "ant-input cfy-textarea");
+        b.AddAttribute(seq++, "rows", rows);
+        b.AddAttribute(seq++, "spellcheck", "false");
+        b.AddAttribute(seq++, "value", value ?? "");
+        b.AddAttribute(seq++, "oninput",
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+        b.CloseElement();
+    }
+
+    void AddSelect(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange, (string val, string text)[] options)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddContent(seq++, label);
+        b.CloseElement();
+
+        b.OpenElement(seq++, "select");
+        b.AddAttribute(seq++, "class", "cfy-select");
+        b.AddAttribute(seq++, "value", value ?? "");
+        b.AddAttribute(seq++, "onchange",
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+        foreach (var opt in options)
+        {
+            b.OpenElement(seq++, "option");
+            b.AddAttribute(seq++, "value", opt.val);
+            if ((value ?? "") == opt.val)
+                b.AddAttribute(seq++, "selected", "selected");
+            b.AddContent(seq++, opt.text);
+            b.CloseElement();
+        }
+        b.CloseElement();
+    }
+
+    async Task AutoDetectNodes()
+    {
+        try
+        {
+            var path = Configuration.WorkflowPath?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                detectMessage = "请先填写工作流路径";
+                StateHasChanged();
+                return;
+            }
+
+            string full = path;
+            if (!File.Exists(full))
+            {
+                var pluginDir = Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui");
+                try { full = Path.GetFullPath(Path.Combine(pluginDir, path)); } catch { }
+            }
+            if (!File.Exists(full))
+            {
+                detectMessage = $"找不到工作流文件: {path}";
+                StateHasChanged();
+                return;
+            }
+
+            var raw = await File.ReadAllTextAsync(full);
+            if (JsonNode.Parse(raw) is not JsonObject root)
+            {
+                detectMessage = "工作流 JSON 解析失败";
+                StateHasChanged();
+                return;
+            }
+
+            var api = ComfyuiWorkflowConverter.ToApiPrompt(root, null);
+            var (posId, negId) = ComfyuiWorkflowConverter.FindPositiveAndNegativeIds(api);
+            var resId = ComfyuiWorkflowConverter.FindResolutionNodeId(api);
+
+            if (!string.IsNullOrEmpty(posId) && api[posId] is JsonObject posNode)
+            {
+                Configuration.PositivePromptNodeId = posId;
+                var posInputs = posNode["inputs"] as JsonObject ?? new JsonObject();
+                Configuration.PositivePromptInput = ComfyuiWorkflowConverter.ResolvePromptField(posInputs, Configuration.PositivePromptInput);
+            }
+            if (!string.IsNullOrEmpty(negId) && api[negId] is JsonObject negNode)
+            {
+                Configuration.NegativePromptNodeId = negId;
+                var negInputs = negNode["inputs"] as JsonObject ?? new JsonObject();
+                Configuration.NegativePromptInput = ComfyuiWorkflowConverter.ResolvePromptField(negInputs, Configuration.NegativePromptInput);
+            }
+            if (!string.IsNullOrEmpty(resId))
+                Configuration.ResolutionNodeId = resId;
+
+            detectMessage =
+                $"已识别（共 {api.Count} 节点）：\n" +
+                $"· 正向 #{posId ?? "?"}（字段 {Configuration.PositivePromptInput}）\n" +
+                $"· 负面 #{negId ?? "?"}（字段 {Configuration.NegativePromptInput}）\n" +
+                $"· 分辨率 #{resId ?? "?"}" +
+                (string.IsNullOrEmpty(posId) ? "\n提示：未识别到正向节点，请手动指定" : "");
+        }
+        catch (Exception ex)
+        {
+            detectMessage = $"识别失败: {ex.Message}";
+        }
+        StateHasChanged();
+    }
+}

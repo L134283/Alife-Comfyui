@@ -1,0 +1,24 @@
+{
+  "id": "Alife.Plugin.Comfyui",
+  "name": "ComfyUI 生图",
+  "author": "doro",
+  "description": "连接本地/远程 ComfyUI，支持 UI 工作流或 API 工作流 JSON。AI 传入正向提示词与方向/分辨率即可生图，可配置固定提示词前缀与三档常用分辨率。",
+  "dependencies": {
+    "Alife.Function.FunctionCaller": ""
+  },
+  "environments": {
+    "nuget": {},
+    "pip": {}
+  },
+  "tags": [
+    "生图模型",
+    "ComfyUI"
+  ],
+  "releases": {
+    "1.0.0": {
+      "date": "2026-07-17",
+      "note": "初始版本：通用 ComfyUI 生图；支持 UI/API 工作流；自动转换 UI JSON；正向提示词 + 方向/分辨率；固定提示词前缀与负面；三档分辨率预设",
+      "file": ""
+    }
+  }
+}
