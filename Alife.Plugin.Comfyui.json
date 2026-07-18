@@ -18,7 +18,12 @@
     "1.0.0": {
       "date": "2026-07-17",
       "note": "初始版本：通用 ComfyUI 生图；支持 UI/API 工作流；自动转换 UI JSON；正向提示词 + 方向/分辨率；固定提示词前缀与负面；三档分辨率预设",
-      "file": ""
+      "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.0/Alife.Plugin.Comfyui.zip"
+    },
+    "1.0.1": {
+      "date": "2026-07-18",
+      "note": "新增桌面端生图后自动打开图片功能；优化 AI 提示词（QQ/桌面端智能分发）；修复 --gpu-only 模式内存优化",
+      "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.1/Alife.Plugin.Comfyui.zip"
     }
   }
 }

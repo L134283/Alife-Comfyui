@@ -54,4 +54,10 @@ public class ComfyuiConfig
 
     [Description("可选：ComfyUI API 鉴权 Token（部分反代需要）")]
     public string ApiToken { get; set; } = "";
+
+    [Description("提示词种类：tag=纯标签, natural=纯自然语言, hybrid=混合模式")]
+    public string PromptStyle { get; set; } = "tag";
+
+    [Description("桌面端：生完图后自动用系统默认图片查看器打开图片")]
+    public bool AutoOpenImage { get; set; } = false;
 }

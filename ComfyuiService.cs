@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -46,27 +47,51 @@ public class ComfyuiService(
         var saveDir = ResolveSaveDir(cfg);
         var wf = ResolveWorkflowPath(cfg);
 
-        Prompt($$"""
-            此服务可通过 ComfyUI 生成图片。
-            - 调用 GenerateImage，传入正向提示词（必填），可选 orientation 或 width/height。
-            - 分辨率三档预设（按画面需求智能选择其一，也可由用户指定宽高覆盖）：
-              · orientation=portrait  竖版 832×1216，适合全身立绘、人物、手机壁纸
-              · orientation=landscape 横版 1216×832，适合风景、场景、横构图
-              · orientation=square    正方形 1216×1216，适合头像、图标、对称构图
-              · 不传 orientation 时使用配置默认方向（{{cfg.DefaultOrientation}}）
-              · 显式传 width/height 则优先使用指定值
-            - 正向提示词会自动拼上配置里的「固定正向提示词前缀」（若有），前缀内的换行会被保留。
-            - 当前 ComfyUI 地址：{{cfg.BaseUrl}}
-            - 工作流：{{wf}}
-            - 图片保存到：{{saveDir}}
-            - 若在 QQ 环境，生图完成后可用：<qimage image="完整路径" />
+        var styleLabel = cfg.PromptStyle switch
+        {
+            "natural" => "纯自然语言",
+            "hybrid"  => "混合模式",
+            _         => "纯 Tag"
+        };
+        var styleGuide = cfg.PromptStyle switch
+        {
+            "natural" =>
+                "短句束形式，每句含明确实体名词+动词。禁止复杂从句（\"的/着/了/与/和/并/而/且/于/对/从\"连接的长句）。" +
+                "例：A girl with pink hair wears a uniform. She stands in a classroom and looks at the viewer.",
+
+            "hybrid" =>
+                "外貌/表情/服饰用逗号分隔的英文标签，动作/场景/氛围用自然语言追加在最后。" +
+                "例：1girl, pink hair, green eyes, school uniform, smile, standing in a bright classroom, soft light coming through the window",
+
+            _ =>
+                "全小写英文标签，半角逗号分隔。禁止光线/光影标签（sunlight, warm lighting 等）。自然语言补充放所有标签最后。" +
+                "例：1girl, pink hair, long hair, green eyes, school uniform, standing, smile"
+        };
+
+            var autoOpenNote = cfg.AutoOpenImage
+                ? "\n- 桌面端已开启自动打开图片，生图后图片会用系统查看器打开，无需AI再发图。"
+                : "";
+
+            Prompt($$"""
+            此服务通过 ComfyUI 生成图片。
+            - 调用 GenerateImage(prompt, orientation?, width?, height?)，prompt 必填。
+            - 分辨率：portrait=竖版832×1216 / landscape=横版1216×832 / square=正方形1216×1216。
+            - 不传方向用默认{{cfg.DefaultOrientation}}；传 width/height 则覆盖。
+            - 固定前缀会自动拼到 prompt 前面（若有）。
+            - 地址 {{cfg.BaseUrl}} | 工作流 {{wf}} | 保存 {{saveDir}}
+            - QQ环境生图完成用 <qimage image="完整路径" />。若当前在QQ聊天，生完图顺手发出去。{{autoOpenNote}}
+
+            【提示词格式：{{styleLabel}}】
+            {{styleGuide}}
+
+            负面提示词若无特殊需求不要填写，使用工作流默认即可。
             """);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height。固定正向提示词前缀会自动拼接，无需手动传。")]
     public void GenerateImage(
-        [Description("正向提示词，描述画面内容，英文/标签风格更佳（固定前缀会自动拼在最前）")] string prompt,
+        [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
         [Description("图片方向：portrait=竖版832x1216, landscape=横版1216x832, square=正方形1216x1216。不传则用配置默认方向")] string? orientation = null,
         [Description("图片宽度，显式指定则覆盖 orientation")] int? width = null,
         [Description("图片高度，显式指定则覆盖 orientation")] int? height = null)
@@ -296,6 +321,23 @@ public class ComfyuiService(
                 return;
             }
 
+            // 桌面端自动打开图片
+            if (cfg.AutoOpenImage)
+            {
+                foreach (var path in saved)
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                        Log($"已打开图片: {Path.GetFileName(path)}");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWarn($"打开图片失败 {Path.GetFileName(path)}: {ex.Message}");
+                    }
+                }
+            }
+
             Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
         }
         catch (TaskCanceledException)
@@ -446,14 +488,12 @@ public class ComfyuiService(
             var inputs = node["inputs"] as JsonObject;
             var path = inputs?["保存路径"]?.GetValue<string>()
                        ?? inputs?["filename_prefix"]?.GetValue<string>();
-            if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
-                return path;
-            // 若是目录路径
             if (!string.IsNullOrWhiteSpace(path))
             {
+                if (Directory.Exists(path))
+                    return path;
                 try
                 {
-                    if (Directory.Exists(path)) return path;
                     var dir = Path.GetDirectoryName(path);
                     if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
                         return dir;

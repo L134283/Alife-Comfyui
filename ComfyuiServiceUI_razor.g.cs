@@ -1131,6 +1131,13 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddHint(b, ref i, "生图时自动拼到正向提示词最前面。前缀内空行原样保留。留空则不拼接");
         AddTextArea(b, ref i, "固定负面提示词（可空=用工作流自带）", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
         AddHint(b, ref i, "留空则使用工作流自带负面；填写则覆盖");
+        AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
+        {
+            ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
+            ("natural", "纯自然语言 — 短句束形式英文描述"),
+            ("hybrid", "混合模式 — 外貌/服饰用标签，动作/场景用自然语言")
+        });
+        AddHint(b, ref i, "控制 AI 生成提示词的格式风格，不影响已有前缀");
         b.CloseElement();
 
         // 默认参数
@@ -1170,6 +1177,28 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
 
         b.CloseElement();
+
+        // 自动打开图片开关
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "style", "margin-top:12px;");
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;cursor:pointer;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.AutoOpenImage);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.AutoOpenImage = (bool)(e.Value ?? false);
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
+        b.AddContent(i++, "生完图自动用系统默认图片查看器打开（桌面端）");
+        b.CloseElement();
+        b.CloseElement();
+        b.CloseElement();
+
         b.CloseElement();
 
         // 节点映射

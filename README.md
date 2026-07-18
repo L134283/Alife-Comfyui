@@ -83,6 +83,12 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 
 ## 版本历史
 
+### v1.0.1（2026-07-18）
+
+- 新增桌面端「生完图自动打开图片」开关（`AutoOpenImage`），开启后调用系统默认图片查看器
+- AI 提示词优化：QQ 环境自动发图 + 桌面端智能判断
+- --gpu-only 模式低内存启动支持
+
 ### v1.0.0（2026-07-17）
 
 - 初始版本
