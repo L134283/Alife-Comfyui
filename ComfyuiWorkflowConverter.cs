@@ -326,7 +326,8 @@ public static class ComfyuiWorkflowConverter
         string positiveInputName,
         string? negativeNodeId,
         string negativeInputName,
-        string? resolutionNodeId)
+        string? resolutionNodeId,
+        bool isImg2Img = false)
     {
         // 优先用采样器连接关系识别正/负面节点（通用，兼容原生 CLIPTextEncode 与第三方节点）；
         // 连接关系未命中再回退启发式（WeiLinPromptUI 文本最长者 / CLIPTextEncode）。
@@ -362,6 +363,31 @@ public static class ComfyuiWorkflowConverter
 
         if (width.HasValue || height.HasValue)
         {
+            // 图生图模式：缩放输入图片到目标分辨率，不动 EmptyLatentImage
+            if (isImg2Img)
+            {
+                var resizeId = FindImageResizeNodeId(prompt);
+                if (!string.IsNullOrWhiteSpace(resizeId) && prompt[resizeId] is JsonObject resizeNode)
+                {
+                    var inputs = resizeNode["inputs"] as JsonObject ?? new JsonObject();
+                    resizeNode["inputs"] = inputs;
+                    // ImageResize / ImageScale 常见字段名
+                    if (width.HasValue)
+                    {
+                        if (inputs.ContainsKey("width")) inputs["width"] = width.Value;
+                        else if (inputs.ContainsKey("target_width")) inputs["target_width"] = width.Value;
+                        else if (inputs.ContainsKey("W")) inputs["W"] = width.Value;
+                    }
+                    if (height.HasValue)
+                    {
+                        if (inputs.ContainsKey("height")) inputs["height"] = height.Value;
+                        else if (inputs.ContainsKey("target_height")) inputs["target_height"] = height.Value;
+                        else if (inputs.ContainsKey("H")) inputs["H"] = height.Value;
+                    }
+                }
+            }
+            else
+            {
             var resId = resolutionNodeId;
             if (string.IsNullOrWhiteSpace(resId))
                 resId = FindResolutionNodeId(prompt);
@@ -398,7 +424,8 @@ public static class ComfyuiWorkflowConverter
                     }
                 }
             }
-        }
+            } // end else (not img2img)
+        } // end if (width || height)
 
         if (randomizeSeed)
         {
@@ -579,6 +606,196 @@ public static class ComfyuiWorkflowConverter
             if (ct.Contains("PresetResolution", StringComparison.OrdinalIgnoreCase)
                 || ct.Equals("ZML_PresetResolutionV2", StringComparison.OrdinalIgnoreCase)
                 || ct.Contains("EmptyLatent", StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+        return null;
+    }
+
+    // ===================== AI 节点控制 =====================
+
+    /// <summary>
+    /// 向 AI 描述当前工作流中可操控的节点及参数。
+    /// 用于 EnableNodeControl 开启时注入 AI 提示词。
+    /// </summary>
+    public static string BuildNodeControlDescription(JsonObject prompt)
+    {
+        var lines = new List<string>();
+
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            var ct = node["class_type"]?.GetValue<string>() ?? "";
+            var inputs = node["inputs"] as JsonObject;
+            if (inputs == null || inputs.Count == 0) continue;
+
+            var widgets = new List<string>();
+            foreach (var ikv in inputs)
+            {
+                if (ikv.Value is JsonArray) continue; // 连线输入，跳过
+                var valStr = ikv.Value switch
+                {
+                    JsonValue jv => jv.GetValue<object>()?.ToString() ?? "?",
+                    _ => null
+                };
+                if (valStr == null) continue;
+                // 截断过长的值
+                if (valStr.Length > 40) valStr = valStr[..37] + "...";
+                widgets.Add($"{ikv.Key}={valStr}");
+            }
+
+            if (widgets.Count == 0) continue;
+
+            lines.Add($"· 节点 #{kv.Key} [{ct}]: {string.Join(", ", widgets)}");
+        }
+
+        if (lines.Count == 0) return "当前工作流无可调节点。";
+
+        return "当前工作流节点参数一览：\n" + string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// 将 AI 传入的语义化参数注入到工作流对应节点中。
+    /// 支持 model / steps / cfg / sampler / scheduler / denoise / batch_size，
+    /// 以及 rawOverrides JSON（兜底：按节点 ID 直接覆盖 input 值）。
+    /// </summary>
+    public static void ApplyNodeOverrides(
+        JsonObject prompt,
+        string? model = null,
+        int? steps = null,
+        double? cfg = null,
+        string? sampler = null,
+        string? scheduler = null,
+        double? denoise = null,
+        int? batchSize = null,
+        string? rawOverrides = null)
+    {
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            var ct = node["class_type"]?.GetValue<string>() ?? "";
+            var inputs = node["inputs"] as JsonObject;
+            if (inputs == null) continue;
+
+            // 模型切换：CheckpointLoader / CheckpointLoaderSimple
+            if (!string.IsNullOrWhiteSpace(model) && IsCheckpointLoader(ct))
+            {
+                var key = inputs.ContainsKey("ckpt_name") ? "ckpt_name" : null;
+                if (key == null)
+                {
+                    foreach (var ikv in inputs)
+                    {
+                        if (ikv.Value is JsonValue jv && jv.TryGetValue<string>(out var s)
+                            && (s.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                                || s.EndsWith(".ckpt", StringComparison.OrdinalIgnoreCase)))
+                        { key = ikv.Key; break; }
+                    }
+                }
+                if (key != null) inputs[key] = model;
+            }
+
+            // 采样器参数：KSampler / KSamplerAdvanced / 等
+            if (IsSamplerType(ct))
+            {
+                if (steps.HasValue && inputs.ContainsKey("steps"))
+                    inputs["steps"] = steps.Value;
+                if (cfg.HasValue)
+                {
+                    if (inputs.ContainsKey("cfg")) inputs["cfg"] = cfg.Value;
+                    else if (inputs.ContainsKey("cfg_scale")) inputs["cfg_scale"] = cfg.Value;
+                }
+                if (!string.IsNullOrWhiteSpace(sampler) && inputs.ContainsKey("sampler_name"))
+                    inputs["sampler_name"] = sampler;
+                if (!string.IsNullOrWhiteSpace(scheduler) && inputs.ContainsKey("scheduler"))
+                    inputs["scheduler"] = scheduler;
+                if (denoise.HasValue && inputs.ContainsKey("denoise"))
+                    inputs["denoise"] = denoise.Value;
+            }
+
+            // 批次大小：EmptyLatentImage
+            if (batchSize.HasValue && ct.Contains("EmptyLatent", StringComparison.OrdinalIgnoreCase))
+            {
+                if (inputs.ContainsKey("batch_size"))
+                    inputs["batch_size"] = batchSize.Value;
+            }
+        }
+
+        // 原始 JSON 兜底覆盖（按节点 ID 精确控制）
+        if (!string.IsNullOrWhiteSpace(rawOverrides))
+        {
+            try
+            {
+                var overridesNode = JsonNode.Parse(rawOverrides) as JsonObject;
+                if (overridesNode != null)
+                {
+                    foreach (var ov in overridesNode)
+                    {
+                        if (prompt[ov.Key] is not JsonObject targetNode) continue;
+                        var targetInputs = targetNode["inputs"] as JsonObject;
+                        if (targetInputs == null || ov.Value is not JsonObject ovInputs) continue;
+                        foreach (var iv in ovInputs)
+                        {
+                            targetInputs[iv.Key] = iv.Value?.DeepClone();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ComfyUI][警告] nodeOverrides JSON 解析失败: {ex.Message}");
+            }
+        }
+    }
+
+    static bool IsCheckpointLoader(string classType)
+        => classType.Contains("CheckpointLoader", StringComparison.OrdinalIgnoreCase)
+           || classType.Contains("Checkpoint", StringComparison.OrdinalIgnoreCase)
+               && classType.Contains("Loader", StringComparison.OrdinalIgnoreCase);
+
+    // ===================== 图生图图片输入 =====================
+
+    /// <summary>
+    /// 自动识别工作流中的 LoadImage 节点 ID。
+    /// class_type 包含 "LoadImage" 或 "Load Image" 即命中。
+    /// </summary>
+    public static string? FindLoadImageNodeId(JsonObject prompt)
+    {
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            var ct = node["class_type"]?.GetValue<string>() ?? "";
+            if (ct.Contains("LoadImage", StringComparison.OrdinalIgnoreCase)
+                || ct.Contains("Load Image", StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 将已上传的图片文件名注入到 LoadImage 节点。
+    /// </summary>
+    public static void InjectLoadImage(JsonObject prompt, string? nodeId, string inputName, string filename)
+    {
+        var nid = nodeId ?? FindLoadImageNodeId(prompt);
+        if (string.IsNullOrWhiteSpace(nid)) return;
+        if (prompt[nid] is not JsonObject node) return;
+        var inputs = node["inputs"] as JsonObject ?? new JsonObject();
+        node["inputs"] = inputs;
+        inputs[inputName] = filename;
+    }
+
+    /// <summary>
+    /// 自动识别工作流中的 ImageResize / ImageScale 节点 ID。
+    /// 用于图生图模式时将输出分辨率注入到缩放节点。
+    /// </summary>
+    public static string? FindImageResizeNodeId(JsonObject prompt)
+    {
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            var ct = node["class_type"]?.GetValue<string>() ?? "";
+            if (ct.Contains("ImageResize", StringComparison.OrdinalIgnoreCase)
+                || ct.Contains("ImageScale", StringComparison.OrdinalIgnoreCase)
+                || ct.Contains("ImageResizeToTotalPixels", StringComparison.OrdinalIgnoreCase))
                 return kv.Key;
         }
         return null;

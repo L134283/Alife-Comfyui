@@ -60,4 +60,37 @@ public class ComfyuiConfig
 
     [Description("桌面端：生完图后自动用系统默认图片查看器打开图片")]
     public bool AutoOpenImage { get; set; } = false;
+
+    [Description("竖版预设宽度")]
+    public int PortraitWidth { get; set; } = 832;
+
+    [Description("竖版预设高度")]
+    public int PortraitHeight { get; set; } = 1216;
+
+    [Description("横版预设宽度")]
+    public int LandscapeWidth { get; set; } = 1216;
+
+    [Description("横版预设高度")]
+    public int LandscapeHeight { get; set; } = 832;
+
+    [Description("正方形预设宽度")]
+    public int SquareWidth { get; set; } = 1216;
+
+    [Description("正方形预设高度")]
+    public int SquareHeight { get; set; } = 1216;
+
+    [Description("高级模式开关：开启后显示工作流节点概览，供进阶用户使用")]
+    public bool AdvancedMode { get; set; } = false;
+
+    [Description("AI 节点控制开关：开启后 AI 可操控模型/步数/采样器等节点参数。不影响原有简单模式")]
+    public bool EnableNodeControl { get; set; } = false;
+
+    [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"文生图\",\"p\":\"workflows/txt2img.json\",\"e\":true}]。n=名称 p=路径 e=启用")]
+    public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":true},{\"n\":\"图生图\",\"p\":\"\",\"e\":true},{\"n\":\"其他\",\"p\":\"\",\"e\":true}]";
+
+    [Description("图生图 LoadImage 节点 ID。留空则自动识别（class_type 含 LoadImage 的节点）")]
+    public string LoadImageNodeId { get; set; } = "";
+
+    [Description("图生图 LoadImage 节点的图片输入字段名，默认 image")]
+    public string LoadImageInput { get; set; } = "image";
 }

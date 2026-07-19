@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -14,6 +16,22 @@ namespace Alife.Plugin.Comfyui;
 public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConfig>
 {
     string? detectMessage;
+    string _scanDir = "";
+    List<string> _scannedWorkflows = new();
+    bool _showWorkflowDropdown;
+    List<(string NodeId, string ClassType, string KeyParams)> _nodeOverview = new();
+    string? _nodeOverviewError;
+
+    // 命名工作流卡片管理
+    List<WorkflowCard> _workflowCards = new();
+    int _activeScanCardIndex = -1; // 当前展开浏览下拉的卡片索引
+
+    record WorkflowCard
+    {
+        public string Name { get; set; } = "";
+        public string Path { get; set; } = "";
+        public bool Enabled { get; set; } = true;
+    }
 
     const string Css = @"
 /* ========== 根：旋转霓虹描边 ========== */
@@ -31,6 +49,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     border-radius: 26px;
     padding: 3px;
     isolation: isolate;
+    overflow: hidden;
     animation: cfy-root-in 0.8s cubic-bezier(.16,1,.3,1) both;
 }
 @keyframes cfy-root-in {
@@ -718,8 +737,16 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     inset: -1px;
     border-radius: 18px;
     padding: 1.5px;
-    background: conic-gradient(from var(--cfy-angle, 0deg),
-        #f472b6, #e879f9, #fff, #fda4af, #f472b6, #ec4899, #f472b6);
+    background: conic-gradient(
+        from var(--cfy-angle, 0deg),
+        transparent 0%, transparent 3%,
+        rgba(255,255,255,0.95) 4%, rgba(244,114,182,1) 4.5%, rgba(232,121,249,0.8) 5%,
+        transparent 5.5%, transparent 33%,
+        rgba(255,255,255,0.95) 34%, rgba(244,114,182,1) 34.5%, rgba(232,121,249,0.8) 35%,
+        transparent 35.5%, transparent 66%,
+        rgba(255,255,255,0.95) 67%, rgba(244,114,182,1) 67.5%, rgba(232,121,249,0.8) 68%,
+        transparent 68.5%, transparent 100%
+    );
     -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
     mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
     -webkit-mask-composite: xor;
@@ -727,6 +754,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     animation: cfy-spin 3s linear infinite;
     opacity: 0.7;
     pointer-events: none;
+    z-index: 0;
 }
 .cfy-reso-card::after {
     content: '';
@@ -975,6 +1003,435 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     animation: cfy-title-shimmer 4s linear infinite;
     box-shadow: 0 0 12px rgba(244,114,182,0.5);
 }
+
+/* ========== 分辨率卡片可编辑输入 ========== */
+.cfy-reso-input-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 3px;
+    position: relative;
+    z-index: 1;
+}
+.cfy-reso-input {
+    width: 64px;
+    padding: 4px 6px;
+    border: 1.5px solid rgba(244,114,182,0.35);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.85);
+    color: #9d174d;
+    font-size: 13px;
+    font-weight: 700;
+    text-align: center;
+    font-family: inherit;
+    outline: none;
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    box-sizing: border-box;
+}
+.cfy-reso-input:hover {
+    border-color: #f9a8d4;
+    background: rgba(255,255,255,0.96);
+}
+.cfy-reso-input:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.18);
+    background: #fff;
+}
+.cfy-reso-sep {
+    font-weight: 900;
+    color: #c084a0;
+    font-size: 13px;
+}
+
+/* ========== 工作流扫描 ========== */
+.cfy-scan-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+.cfy-scan-row > div:first-child {
+    flex: 1;
+}
+.cfy-scan-btn {
+    padding: 6px 16px;
+    border-radius: 999px;
+    border: 1.5px solid rgba(244,114,182,0.4);
+    background: rgba(255,255,255,0.85);
+    color: #be185d;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 800;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    backdrop-filter: blur(6px);
+    letter-spacing: 0.03em;
+}
+.cfy-scan-btn:hover {
+    background: linear-gradient(135deg, #f9a8d4, #f472b6);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 4px 16px rgba(236,72,153,0.4);
+}
+.cfy-workflow-dropdown {
+    margin-top: 6px;
+}
+.cfy-workflow-dropdown select {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1.5px solid rgba(244,114,182,0.3);
+    border-radius: 12px;
+    background: rgba(255,255,255,0.85);
+    color: var(--ink);
+    font-size: 12.5px;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    backdrop-filter: blur(6px);
+    box-shadow: 0 2px 10px rgba(244,114,182,0.07);
+}
+.cfy-workflow-dropdown select:hover {
+    border-color: #f9a8d4;
+}
+.cfy-workflow-dropdown select:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.18);
+}
+
+/* ========== 高级开关 ========== */
+.cfy-advanced-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    margin: 8px 0;
+    background: linear-gradient(135deg, rgba(255,255,255,0.85), rgba(252,231,243,0.8));
+    border: 1px solid rgba(244,114,182,0.25);
+    border-radius: 14px;
+    cursor: pointer;
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    user-select: none;
+}
+.cfy-advanced-toggle:hover {
+    border-color: #f9a8d4;
+    box-shadow: 0 4px 16px rgba(244,114,182,0.15);
+    transform: translateY(-1px);
+}
+.cfy-advanced-label {
+    font-weight: 800;
+    font-size: 13px;
+    color: #9d174d;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.cfy-advanced-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    color: #fff;
+    background: linear-gradient(135deg, #f472b6, #ec4899);
+    border-radius: 999px;
+    padding: 2px 8px;
+}
+.cfy-advanced-switch {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: rgba(244,114,182,0.3);
+    border-radius: 12px;
+    transition: background 0.3s ease;
+    flex-shrink: 0;
+}
+.cfy-advanced-switch.active {
+    background: linear-gradient(135deg, #f472b6, #ec4899);
+}
+.cfy-advanced-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.3s cubic-bezier(.16,1,.3,1);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+.cfy-advanced-switch.active::after {
+    transform: translateX(20px);
+}
+
+/* ========== 节点概览表 ========== */
+.cfy-node-overview {
+    margin: 10px 0 8px;
+    border: 1px solid rgba(244,114,182,0.25);
+    border-radius: 14px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.85);
+    backdrop-filter: blur(8px);
+    animation: cfy-rise 0.6s cubic-bezier(.16,1,.3,1) both;
+}
+.cfy-node-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+.cfy-node-table th {
+    text-align: left;
+    padding: 9px 14px;
+    background: linear-gradient(135deg, rgba(252,231,243,0.95), rgba(255,240,247,0.8));
+    color: #be185d;
+    font-weight: 800;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border-bottom: 2px solid rgba(244,114,182,0.25);
+}
+.cfy-node-table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(244,114,182,0.1);
+    color: var(--ink);
+    line-height: 1.5;
+}
+.cfy-node-table tr:hover td {
+    background: rgba(252,231,243,0.5);
+}
+.cfy-node-table tr:last-child td {
+    border-bottom: none;
+}
+.cfy-node-table .nid {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 11px;
+    color: #ec4899;
+    font-weight: 700;
+}
+.cfy-node-table .params {
+    color: #8b3a62;
+    font-size: 11px;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cfy-node-count {
+    font-size: 11px;
+    color: #b06a8c;
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+
+/* ========== 命名工作流卡片 ========== */
+.cfy-wf-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 8px 0;
+}
+.cfy-wf-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 14px;
+    background: linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,240,247,0.7));
+    border: 1px solid rgba(244,114,182,0.25);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 16px rgba(244,114,182,0.08);
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    position: relative;
+    overflow: hidden;
+}
+.cfy-wf-card:hover {
+    border-color: #f9a8d4;
+    box-shadow: 0 8px 24px rgba(236,72,153,0.14);
+    transform: translateY(-1px);
+}
+.cfy-wf-card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 4px;
+    border-radius: 4px 0 0 4px;
+    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+.cfy-wf-card.enabled::before {
+    opacity: 1;
+}
+.cfy-wf-card.disabled {
+    opacity: 0.55;
+    background: linear-gradient(135deg, rgba(255,255,255,0.6), rgba(245,235,240,0.5));
+}
+.cfy-wf-toggle {
+    width: 38px;
+    height: 20px;
+    border-radius: 10px;
+    border: none;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+    position: relative;
+    outline: none;
+}
+.cfy-wf-toggle.on {
+    background: linear-gradient(135deg, #f472b6, #ec4899);
+    box-shadow: 0 0 10px rgba(236,72,153,0.4);
+}
+.cfy-wf-toggle.off {
+    background: rgba(244,114,182,0.3);
+}
+.cfy-wf-toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    transition: transform 0.3s cubic-bezier(.16,1,.3,1);
+}
+.cfy-wf-toggle.on::after { left: 20px; }
+.cfy-wf-toggle.off::after { left: 2px; }
+.cfy-wf-name {
+    width: 80px;
+    flex-shrink: 0;
+    border: 1.5px solid rgba(244,114,182,0.25);
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #9d174d;
+    background: rgba(255,255,255,0.8);
+    font-family: inherit;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+}
+.cfy-wf-name:hover, .cfy-wf-name:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
+}
+.cfy-wf-path-row {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.cfy-wf-path {
+    flex: 1;
+    border: 1.5px solid rgba(244,114,182,0.25);
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #5b2145;
+    background: rgba(255,255,255,0.8);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+    min-width: 0;
+}
+.cfy-wf-path:hover, .cfy-wf-path:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
+}
+.cfy-wf-browse {
+    padding: 6px 12px;
+    border-radius: 10px;
+    border: 1.5px solid rgba(244,114,182,0.35);
+    background: rgba(255,255,255,0.85);
+    color: #be185d;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+}
+.cfy-wf-browse:hover {
+    background: linear-gradient(135deg, #f9a8d4, #f472b6);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 3px 12px rgba(236,72,153,0.35);
+}
+.cfy-wf-delete {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(244,114,182,0.3);
+    background: rgba(255,255,255,0.8);
+    color: #d6608a;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: inherit;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+    padding: 0;
+    line-height: 1;
+}
+.cfy-wf-delete:hover {
+    background: #f43f5e;
+    color: #fff;
+    border-color: #f43f5e;
+    box-shadow: 0 3px 12px rgba(244,63,94,0.35);
+}
+.cfy-wf-add {
+    padding: 10px 20px;
+    border-radius: 14px;
+    border: 2px dashed rgba(244,114,182,0.35);
+    background: rgba(255,255,255,0.7);
+    color: #be185d;
+    cursor: pointer;
+    font-size: 12.5px;
+    font-weight: 800;
+    font-family: inherit;
+    width: 100%;
+    transition: all 0.3s ease;
+    letter-spacing: 0.02em;
+}
+.cfy-wf-add:hover {
+    border-color: #f472b6;
+    background: rgba(252,231,243,0.85);
+    box-shadow: 0 4px 16px rgba(244,114,182,0.18);
+    transform: translateY(-1px);
+}
+.cfy-wf-browse-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0; right: 0;
+    z-index: 10;
+    margin-top: 4px;
+    border: 1px solid rgba(244,114,182,0.3);
+    border-radius: 12px;
+    background: rgba(255,255,255,0.97);
+    box-shadow: 0 12px 32px rgba(236,72,153,0.2);
+    max-height: 180px;
+    overflow-y: auto;
+    backdrop-filter: blur(12px);
+}
+.cfy-wf-browse-item {
+    padding: 8px 14px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #5b2145;
+    transition: all 0.15s ease;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.cfy-wf-browse-item:hover {
+    background: linear-gradient(90deg, rgba(244,114,182,0.15), rgba(236,72,153,0.08));
+    color: #be185d;
+}
 ";
 
     protected override void BuildRenderTree(RenderTreeBuilder b)
@@ -1038,7 +1495,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "span");
         b.AddAttribute(i++, "class", "cfy-kicker-dot");
         b.CloseElement();
-        b.AddContent(i++, "Doro · ComfyUI · ULTIMATE");
+        b.AddContent(i++, "Doro · ComfyUI");
         b.CloseElement();
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-title");
@@ -1046,7 +1503,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-subtitle");
-        b.AddContent(i++, "粉白梦幻工作台 · 任意工作流 · 智能分辨率 · 固定提示词前缀");
+        b.AddContent(i++, "任意工作流 · 智能分辨率 · 固定提示词前缀");
         b.CloseElement();
         b.CloseElement();
 
@@ -1091,11 +1548,22 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddSection(b, ref i, "分辨率预设");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-reso-grid");
-        AddResoCard(b, ref i, "PORTRAIT", "832 × 1216", "竖版", "全身立绘 · 人物 · 手机壁纸");
-        AddResoCard(b, ref i, "LANDSCAPE", "1216 × 832", "横版", "风景 · 场景 · 横构图");
-        AddResoCard(b, ref i, "SQUARE", "1216 × 1216", "正方形", "头像 · 图标 · 对称构图");
+        
+        // Portrait card
+        AddEditableResoCard(b, ref i, "PORTRAIT", "竖版", "全身立绘 · 人物 · 手机壁纸",
+            Configuration.PortraitWidth, v => Configuration.PortraitWidth = v,
+            Configuration.PortraitHeight, v => Configuration.PortraitHeight = v);
+        // Landscape card
+        AddEditableResoCard(b, ref i, "LANDSCAPE", "横版", "风景 · 场景 · 横构图",
+            Configuration.LandscapeWidth, v => Configuration.LandscapeWidth = v,
+            Configuration.LandscapeHeight, v => Configuration.LandscapeHeight = v);
+        // Square card
+        AddEditableResoCard(b, ref i, "SQUARE", "正方形", "头像 · 图标 · 对称构图",
+            Configuration.SquareWidth, v => Configuration.SquareWidth = v,
+            Configuration.SquareHeight, v => Configuration.SquareHeight = v);
+        
         b.CloseElement();
-        AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖");
+        AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖。点击数值即可修改预设分辨率。");
 
         // 连接 + 工作流
         AddSection(b, ref i, "连接与工作流");
@@ -1104,15 +1572,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-grid-2");
 
+        // 左栏
         b.OpenElement(i++, "div");
         AddInput(b, ref i, "ComfyUI 地址", Configuration.BaseUrl, v => Configuration.BaseUrl = v);
         AddHint(b, ref i, "例如 http://127.0.0.1:8188");
         AddInput(b, ref i, "API Token（可选）", Configuration.ApiToken, v => Configuration.ApiToken = v);
-        b.CloseElement();
-
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "工作流 JSON 路径", Configuration.WorkflowPath, v => Configuration.WorkflowPath = v);
-        AddHint(b, ref i, "相对插件目录或绝对路径均可");
         AddInput(b, ref i, "图片保存目录", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
         var currentSave = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
             ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
@@ -1120,8 +1584,178 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddHint(b, ref i, $"当前: {currentSave}（留空用默认）");
         b.CloseElement();
 
+        // 右栏 — 默认工作流 + 扫描
+        b.OpenElement(i++, "div");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-label");
+        b.AddContent(i++, "默认工作流");
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-scan-row");
+        b.OpenElement(i++, "div");
+        b.OpenComponent<Input<string>>(i++);
+        b.AddAttribute(i++, "Value", Configuration.WorkflowPath ?? "");
+        b.AddAttribute(i++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.WorkflowPath = v));
+        b.AddAttribute(i++, "Style", "width:100%;");
+        b.CloseComponent();
+        b.CloseElement();
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cfy-scan-btn");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, ScanWorkflows));
+        b.AddContent(i++, "扫描");
         b.CloseElement();
         b.CloseElement();
+        AddHint(b, ref i, "填目录路径后点「扫描」，可在下方命名工作流卡片中使用浏览功能选择文件");
+
+        // 扫描结果下拉
+        if (_showWorkflowDropdown && _scannedWorkflows.Count > 0)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-workflow-dropdown");
+            b.OpenElement(i++, "select");
+            b.AddAttribute(i++, "size", "6");
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                Configuration.WorkflowPath = e.Value?.ToString() ?? "";
+            }));
+            foreach (var wf in _scannedWorkflows)
+            {
+                b.OpenElement(i++, "option");
+                b.AddAttribute(i++, "value", wf);
+                b.AddAttribute(i++, "title", wf);
+                var display = GetWorkflowDisplayName(wf, _scanDir);
+                b.AddContent(i++, display);
+                b.CloseElement();
+            }
+            b.CloseElement();
+            b.CloseElement();
+        }
+
+        b.CloseElement(); // right
+        b.CloseElement(); // grid
+        b.CloseElement(); // panel
+
+        // ========== 命名工作流 ==========
+        AddSection(b, ref i, "命名工作流");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+
+        // 初始化卡片
+        if (_workflowCards.Count == 0) LoadWorkflowCards();
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-wf-list");
+
+        for (int ci = 0; ci < _workflowCards.Count; ci++)
+        {
+            var cardIndex = ci;
+            var card = _workflowCards[ci];
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", $"cfy-wf-card{(card.Enabled ? " enabled" : " disabled")}");
+
+            // 启用开关
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", $"cfy-wf-toggle{(card.Enabled ? " on" : " off")}");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+            {
+                ToggleWorkflowCardEnabled(cardIndex);
+            }));
+            b.CloseElement();
+
+            // 名称输入
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "class", "cfy-wf-name");
+            b.AddAttribute(i++, "value", card.Name);
+            b.AddAttribute(i++, "placeholder", "名称");
+            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                UpdateWorkflowCardName(cardIndex, e.Value?.ToString() ?? "");
+            }));
+            b.CloseElement();
+
+            // 路径行
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-wf-path-row");
+
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "class", "cfy-wf-path");
+            b.AddAttribute(i++, "value", card.Path);
+            b.AddAttribute(i++, "placeholder", "工作流 JSON 路径...");
+            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                UpdateWorkflowCardPath(cardIndex, e.Value?.ToString() ?? "");
+            }));
+            b.CloseElement();
+
+            // 浏览按钮
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cfy-wf-browse");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+            {
+                ToggleWorkflowScan(cardIndex);
+            }));
+            b.AddContent(i++, "浏览");
+            b.CloseElement();
+
+            b.CloseElement(); // path-row
+
+            // 删除按钮
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cfy-wf-delete");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+            {
+                RemoveWorkflowCard(cardIndex);
+            }));
+            b.AddContent(i++, "✕");
+            b.CloseElement();
+
+            b.CloseElement(); // card
+
+            // 浏览下拉
+            if (_activeScanCardIndex == cardIndex && _scannedWorkflows.Count > 0)
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "style", "position:relative;");
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cfy-wf-browse-dropdown");
+                foreach (var wf in _scannedWorkflows)
+                {
+                    var wfPath = wf;
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cfy-wf-browse-item");
+                    b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+                    {
+                        UpdateWorkflowCardPath(cardIndex, wfPath);
+                        _activeScanCardIndex = -1;
+                        StateHasChanged();
+                    }));
+                    b.AddContent(i++, Path.GetFileName(wfPath));
+                    b.CloseElement();
+                }
+                b.CloseElement();
+                b.CloseElement();
+            }
+        }
+
+        b.CloseElement(); // wf-list
+
+        // 添加按钮
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cfy-wf-add");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            AddWorkflowCard();
+        }));
+        b.AddContent(i++, "+ 添加工作流");
+        b.CloseElement();
+
+        b.CloseElement(); // panel
 
         // 提示词
         AddSection(b, ref i, "提示词前缀与负面");
@@ -1150,9 +1784,9 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
         {
-            ("portrait", "竖版 832×1216"),
-            ("landscape", "横版 1216×832"),
-            ("square", "正方形 1216×1216")
+            ("portrait", $"竖版 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}"),
+            ("landscape", $"横版 {Configuration.LandscapeWidth}×{Configuration.LandscapeHeight}"),
+            ("square", $"正方形 {Configuration.SquareWidth}×{Configuration.SquareHeight}")
         });
         AddHint(b, ref i, "AI 未传 orientation 时的默认方向");
         AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), v =>
@@ -1241,13 +1875,65 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
         b.CloseElement();
 
+        // 高级模式开关
+        AddSection(b, ref i, "高级模式");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
+        {
+            Configuration.AdvancedMode = !Configuration.AdvancedMode;
+            if (Configuration.AdvancedMode)
+                await LoadNodeOverview();
+            StateHasChanged();
+        }));
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-label");
+        b.AddContent(i++, "工作流节点概览");
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", "cfy-advanced-badge");
+        b.AddContent(i++, "BETA");
+        b.CloseElement();
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.AdvancedMode ? " active" : "")}");
+        b.CloseElement();
+        b.CloseElement();
+        AddHint(b, ref i, "开启后展示工作流中所有节点类型及关键参数，方便排查问题或手动配置节点映射");
+
+        // AI 节点控制开关
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            Configuration.EnableNodeControl = !Configuration.EnableNodeControl;
+            StateHasChanged();
+        }));
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-label");
+        b.AddContent(i++, "AI 节点控制（高级）");
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", "cfy-advanced-badge");
+        b.AddContent(i++, "ADVANCED");
+        b.CloseElement();
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.EnableNodeControl ? " active" : "")}");
+        b.CloseElement();
+        b.CloseElement();
+        AddHint(b, ref i, "开启后，AI 可直接操控工作流节点参数（更换模型、调整步数/CFG/采样器等）。不开启则保持原有简单模式不受影响。");
+
+        if (Configuration.AdvancedMode)
+        {
+            AddNodeOverview(b, ref i);
+        }
+
         // footer
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-footer");
         b.OpenElement(i++, "span");
         b.AddContent(i++, "ComfyUI × Alife");
         b.CloseElement();
-        b.AddContent(i++, "  ·  Doro 的妙妙工具  ·  MAX FX");
+        b.AddContent(i++, "  ·  Doro 的妙妙工具");
         b.CloseElement();
 
         b.CloseElement(); // content
@@ -1415,6 +2101,393 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         {
             detectMessage = $"识别失败: {ex.Message}";
         }
+        StateHasChanged();
+    }
+
+    void AddEditableResoCard(RenderTreeBuilder b, ref int seq, string tag, string name, string hint,
+        int width, Action<int> onWidthChanged, int height, Action<int> onHeightChanged)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-card");
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-shine");
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-tag");
+        b.AddContent(seq++, tag);
+        b.CloseElement();
+        // editable input row
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-input-row");
+        b.OpenElement(seq++, "input");
+        b.AddAttribute(seq++, "class", "cfy-reso-input");
+        b.AddAttribute(seq++, "type", "number");
+        b.AddAttribute(seq++, "value", width);
+        b.AddAttribute(seq++, "min", "64");
+        b.AddAttribute(seq++, "max", "4096");
+        b.AddAttribute(seq++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            if (int.TryParse(e.Value?.ToString(), out var n))
+                onWidthChanged(Math.Clamp(n, 64, 4096));
+        }));
+        b.CloseElement();
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "cfy-reso-sep");
+        b.AddContent(seq++, "×");
+        b.CloseElement();
+        b.OpenElement(seq++, "input");
+        b.AddAttribute(seq++, "class", "cfy-reso-input");
+        b.AddAttribute(seq++, "type", "number");
+        b.AddAttribute(seq++, "value", height);
+        b.AddAttribute(seq++, "min", "64");
+        b.AddAttribute(seq++, "max", "4096");
+        b.AddAttribute(seq++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            if (int.TryParse(e.Value?.ToString(), out var n))
+                onHeightChanged(Math.Clamp(n, 64, 4096));
+        }));
+        b.CloseElement();
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-name");
+        b.AddContent(seq++, name);
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-reso-hint");
+        b.AddContent(seq++, hint);
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    async Task ScanWorkflows()
+    {
+        var path = (Configuration?.WorkflowPath ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            detectMessage = "请先在路径框中输入 ComfyUI 目录或工作流目录路径";
+            StateHasChanged();
+            return;
+        }
+
+        var dir = ResolveWorkflowScanDir(path);
+        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+        {
+            detectMessage = $"路径无效或目录不存在: {path}";
+            StateHasChanged();
+            return;
+        }
+
+        _scanDir = dir;
+
+        try
+        {
+            var allFiles = Directory.GetFiles(dir, "*.json", SearchOption.TopDirectoryOnly);
+            var workflows = new List<string>();
+            foreach (var file in allFiles)
+            {
+                if (await IsComfyuiWorkflow(file))
+                    workflows.Add(file);
+            }
+
+            _scannedWorkflows = workflows.OrderBy(f => f).ToList();
+            _showWorkflowDropdown = _scannedWorkflows.Count > 0;
+
+            detectMessage = _scannedWorkflows.Count > 0
+                ? $"扫描 {dir}\n找到 {_scannedWorkflows.Count} 个工作流，请在下方选择"
+                : $"在 {dir}\n未找到有效工作流 .json 文件";
+        }
+        catch (Exception ex)
+        {
+            detectMessage = $"扫描失败: {ex.Message}";
+        }
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// 智能定位工作流扫描目录：识别 ComfyUI / aki 版，自动进 workflows 子目录
+    /// </summary>
+    static string ResolveWorkflowScanDir(string enteredPath)
+    {
+        if (!Directory.Exists(enteredPath))
+        {
+            var parent = Path.GetDirectoryName(enteredPath);
+            if (!string.IsNullOrWhiteSpace(parent) && Directory.Exists(parent))
+                return parent;
+            return enteredPath;
+        }
+
+        // 直接是 ComfyUI 根目录（有 main.py）
+        if (File.Exists(Path.Combine(enteredPath, "main.py")))
+        {
+            var wf = TryGetWorkflowsDir(enteredPath);
+            if (wf != null) return wf;
+        }
+
+        // aki 版：ComfyUI/main.py 在子目录里
+        var inner = Path.Combine(enteredPath, "ComfyUI");
+        if (Directory.Exists(inner) && File.Exists(Path.Combine(inner, "main.py")))
+        {
+            var wf = TryGetWorkflowsDir(inner);
+            if (wf != null) return wf;
+        }
+
+        // 非 ComfyUI 根目录，直接用用户输入的目录
+        return enteredPath;
+    }
+
+    static string? TryGetWorkflowsDir(string comfyuiRoot)
+    {
+        var candidates = new[]
+        {
+            Path.Combine(comfyuiRoot, "user", "default", "workflows"),
+            Path.Combine(comfyuiRoot, "workflows"),
+        };
+        foreach (var c in candidates)
+        {
+            if (Directory.Exists(c)) return c;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 判断 JSON 文件是否为 ComfyUI 工作流（非配置文件等）
+    /// </summary>
+    static async Task<bool> IsComfyuiWorkflow(string filePath)
+    {
+        try
+        {
+            var raw = await File.ReadAllTextAsync(filePath);
+            // API 格式：顶层数字键 + class_type
+            if (raw.Contains("\"class_type\""))
+                return true;
+            // UI 格式：last_node_id + nodes + links
+            if (raw.Contains("\"last_node_id\"") && raw.Contains("\"nodes\"") && raw.Contains("\"links\""))
+                return true;
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 下拉列表显示名：仅取文件名，hover 显示完整路径
+    /// </summary>
+    static string GetWorkflowDisplayName(string fullPath, string scanDir)
+    {
+        return Path.GetFileName(fullPath);
+    }
+
+    async Task LoadNodeOverview()
+    {
+        _nodeOverview = new();
+        _nodeOverviewError = null;
+        try
+        {
+            var path = (Configuration?.WorkflowPath ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                _nodeOverviewError = "请先配置工作流路径";
+                return;
+            }
+            var full = path;
+            if (!File.Exists(full))
+            {
+                var pluginDir = Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui");
+                try { full = Path.GetFullPath(Path.Combine(pluginDir, path)); } catch { }
+            }
+            if (!File.Exists(full))
+            {
+                _nodeOverviewError = $"找不到工作流文件: {path}";
+                return;
+            }
+
+            var raw = await File.ReadAllTextAsync(full);
+            if (JsonNode.Parse(raw) is not JsonObject root)
+            {
+                _nodeOverviewError = "工作流 JSON 解析失败";
+                return;
+            }
+
+            var api = ComfyuiWorkflowConverter.ToApiPrompt(root, null);
+            foreach (var kv in api)
+            {
+                if (kv.Value is not JsonObject node) continue;
+                var ct = node["class_type"]?.GetValue<string>() ?? "?";
+                var inputs = node["inputs"] as JsonObject ?? new JsonObject();
+                var keyParams = string.Join(", ", inputs
+                    .Select(i =>
+                    {
+                        var valStr = i.Value switch
+                        {
+                            JsonValue jv => jv.GetValue<object>()?.ToString() ?? "null",
+                            JsonArray => "[…]",
+                            JsonObject => "{…}",
+                            null => "null",
+                            _ => "…"
+                        };
+                        var s = $"{i.Key}: {valStr}";
+                        return s.Length > 50 ? s[..47] + "…" : s;
+                    })
+                    .Take(3));
+                if (string.IsNullOrWhiteSpace(keyParams))
+                    keyParams = $"{inputs.Count} 个输入";
+                _nodeOverview.Add((kv.Key, ct, keyParams));
+            }
+        }
+        catch (Exception ex)
+        {
+            _nodeOverviewError = $"解析失败: {ex.Message}";
+        }
+    }
+
+    void AddNodeOverview(RenderTreeBuilder b, ref int seq)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cfy-node-overview");
+
+        if (!string.IsNullOrWhiteSpace(_nodeOverviewError))
+        {
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "style", "padding:12px 16px;color:#be185d;font-size:12px;");
+            b.AddContent(seq++, _nodeOverviewError);
+            b.CloseElement();
+        }
+        else if (_nodeOverview.Count == 0)
+        {
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "style", "padding:12px 16px;color:#b06a8c;font-size:12px;font-style:italic;");
+            b.AddContent(seq++, "正在加载节点信息...");
+            b.CloseElement();
+        }
+        else
+        {
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "class", "cfy-node-count");
+            b.AddContent(seq++, $"共 {_nodeOverview.Count} 个节点");
+            b.CloseElement();
+
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "style", "max-height:320px;overflow:auto;");
+            b.OpenElement(seq++, "table");
+            b.AddAttribute(seq++, "class", "cfy-node-table");
+            // header
+            b.OpenElement(seq++, "thead");
+            b.OpenElement(seq++, "tr");
+            b.OpenElement(seq++, "th"); b.AddContent(seq++, "节点 ID"); b.CloseElement();
+            b.OpenElement(seq++, "th"); b.AddContent(seq++, "类型"); b.CloseElement();
+            b.OpenElement(seq++, "th"); b.AddContent(seq++, "关键参数"); b.CloseElement();
+            b.CloseElement();
+            b.CloseElement();
+            // body
+            b.OpenElement(seq++, "tbody");
+            foreach (var n in _nodeOverview)
+            {
+                b.OpenElement(seq++, "tr");
+                b.OpenElement(seq++, "td");
+                b.AddAttribute(seq++, "class", "nid");
+                b.AddContent(seq++, n.NodeId);
+                b.CloseElement();
+                b.OpenElement(seq++, "td");
+                b.AddContent(seq++, n.ClassType);
+                b.CloseElement();
+                b.OpenElement(seq++, "td");
+                b.AddAttribute(seq++, "class", "params");
+                b.AddContent(seq++, n.KeyParams);
+                b.CloseElement();
+                b.CloseElement();
+            }
+            b.CloseElement();
+            b.CloseElement();
+            b.CloseElement();
+        }
+        b.CloseElement();
+    }
+
+    // ===================== 命名工作流卡片管理 =====================
+
+    void LoadWorkflowCards()
+    {
+        _workflowCards = new();
+        var json = Configuration?.NamedWorkflows ?? "[]";
+        if (string.IsNullOrWhiteSpace(json)) return;
+
+        try
+        {
+            var arr = System.Text.Json.Nodes.JsonNode.Parse(json) as System.Text.Json.Nodes.JsonArray;
+            if (arr != null)
+            {
+                foreach (var item in arr.OfType<System.Text.Json.Nodes.JsonObject>())
+                {
+                    _workflowCards.Add(new WorkflowCard
+                    {
+                        Name = item["n"]?.GetValue<string>() ?? item["name"]?.GetValue<string>() ?? "",
+                        Path = item["p"]?.GetValue<string>() ?? item["path"]?.GetValue<string>() ?? "",
+                        Enabled = item["e"]?.GetValue<bool>() ?? true
+                    });
+                }
+            }
+        }
+        catch { }
+    }
+
+    void SaveWorkflowCards()
+    {
+        var arr = new System.Text.Json.Nodes.JsonArray();
+        foreach (var card in _workflowCards)
+        {
+            arr.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["n"] = card.Name,
+                ["p"] = card.Path,
+                ["e"] = card.Enabled
+            });
+        }
+        Configuration.NamedWorkflows = arr.ToJsonString();
+    }
+
+    void AddWorkflowCard()
+    {
+        _workflowCards.Add(new WorkflowCard { Name = "新工作流", Path = "", Enabled = true });
+        SaveWorkflowCards();
+        StateHasChanged();
+    }
+
+    void RemoveWorkflowCard(int index)
+    {
+        if (index < 0 || index >= _workflowCards.Count) return;
+        _workflowCards.RemoveAt(index);
+        _activeScanCardIndex = -1;
+        SaveWorkflowCards();
+        StateHasChanged();
+    }
+
+    void UpdateWorkflowCardName(int index, string name)
+    {
+        if (index < 0 || index >= _workflowCards.Count) return;
+        _workflowCards[index] = _workflowCards[index] with { Name = name };
+        SaveWorkflowCards();
+    }
+
+    void UpdateWorkflowCardPath(int index, string path)
+    {
+        if (index < 0 || index >= _workflowCards.Count) return;
+        _workflowCards[index] = _workflowCards[index] with { Path = path };
+        SaveWorkflowCards();
+    }
+
+    void ToggleWorkflowCardEnabled(int index)
+    {
+        if (index < 0 || index >= _workflowCards.Count) return;
+        _workflowCards[index] = _workflowCards[index] with { Enabled = !_workflowCards[index].Enabled };
+        SaveWorkflowCards();
+        StateHasChanged();
+    }
+
+    void ToggleWorkflowScan(int index)
+    {
+        _activeScanCardIndex = _activeScanCardIndex == index ? -1 : index;
         StateHasChanged();
     }
 }
