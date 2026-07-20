@@ -61,6 +61,20 @@ public class ComfyuiConfig
     [Description("桌面端：生完图后自动用系统默认图片查看器打开图片")]
     public bool AutoOpenImage { get; set; } = false;
 
+    /// <summary>
+    /// 优先生图：GenerateImage 会阻塞到出图结束（或超时）才返回，
+    /// 避免同轮对话里桌宠先 TTS 说话、与 Comfy 抢 GPU 导致卡死无声。
+    /// </summary>
+    [Description("优先生图：生图请求发出后等待结果返回再继续（期间勿语音）。超时后自动结束，避免桌宠一直卡住")]
+    public bool PriorityImageGen { get; set; } = false;
+
+    /// <summary>
+    /// 优先生图模式下的硬超时上限（秒）。实际等待 = min(TimeoutSeconds, 本值)。
+    /// 防止 Comfy 彻底卡死时桌宠/对话一直挂起。
+    /// </summary>
+    [Description("优先生图硬超时上限（秒）。实际等待取 min(超时秒数, 本值)，防止生图卡死拖死桌宠")]
+    public int PriorityMaxWaitSeconds { get; set; } = 180;
+
     [Description("竖版预设宽度")]
     public int PortraitWidth { get; set; } = 832;
 
@@ -86,7 +100,7 @@ public class ComfyuiConfig
     public bool EnableNodeControl { get; set; } = false;
 
     [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"文生图\",\"p\":\"workflows/txt2img.json\",\"e\":true}]。n=名称 p=路径 e=启用")]
-    public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":true},{\"n\":\"图生图\",\"p\":\"\",\"e\":true},{\"n\":\"其他\",\"p\":\"\",\"e\":true}]";
+    public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":false},{\"n\":\"图生图\",\"p\":\"\",\"e\":false},{\"n\":\"其他\",\"p\":\"\",\"e\":false}]";
 
     [Description("图生图 LoadImage 节点 ID。留空则自动识别（class_type 含 LoadImage 的节点）")]
     public string LoadImageNodeId { get; set; } = "";

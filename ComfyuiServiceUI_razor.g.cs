@@ -15,7 +15,7 @@ namespace Alife.Plugin.Comfyui;
 
 public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConfig>
 {
-    string? detectMessage;
+    string? detectMessage; string? _scanDetectMessage;
     string _scanDir = "";
     List<string> _scannedWorkflows = new();
     bool _showWorkflowDropdown;
@@ -1606,7 +1606,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddContent(i++, "扫描");
         b.CloseElement();
         b.CloseElement();
-        AddHint(b, ref i, "填目录路径后点「扫描」，可在下方命名工作流卡片中使用浏览功能选择文件");
+        AddHint(b, ref i, "填目录路径后点「扫描」浏览工作流文件，也可在下方多工作流卡片中手动选择");
 
         // 扫描结果下拉
         if (_showWorkflowDropdown && _scannedWorkflows.Count > 0)
@@ -1636,8 +1636,17 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement(); // grid
         b.CloseElement(); // panel
 
-        // ========== 命名工作流 ==========
-        AddSection(b, ref i, "命名工作流");
+        // 显示扫描状态
+        if (!string.IsNullOrWhiteSpace(_scanDetectMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-detect");
+            b.AddContent(i++, _scanDetectMessage);
+            b.CloseElement();
+        }
+
+        // ========== 多工作流（可选） ==========
+        AddSection(b, ref i, "多工作流（可选）");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-panel");
 
@@ -1778,6 +1787,8 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddSection(b, ref i, "默认参数");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-panel");
+
+        // 双栏：仅放 select / input 类控件
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-grid-2");
 
@@ -1810,30 +1821,71 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         });
         b.CloseElement();
 
-        b.CloseElement();
+        b.CloseElement(); // grid-2
 
-        // 自动打开图片开关
+        // 全宽区域：选项开关
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "style", "margin-top:12px;");
+        b.AddAttribute(i++, "style", "display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;margin-top:14px;");
+
+        // 自动打开图片
         b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;cursor:pointer;");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
         b.OpenElement(i++, "input");
         b.AddAttribute(i++, "type", "checkbox");
         b.AddAttribute(i++, "checked", Configuration.AutoOpenImage);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;");
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
         b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
         {
             Configuration.AutoOpenImage = (bool)(e.Value ?? false);
         }));
         b.CloseElement();
         b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
-        b.AddContent(i++, "生完图自动用系统默认图片查看器打开（桌面端）");
-        b.CloseElement();
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
+        b.AddContent(i++, "生完图自动用系统默认图片查看器打开");
         b.CloseElement();
         b.CloseElement();
 
+        // 优先生图
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.PriorityImageGen);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.PriorityImageGen = (bool)(e.Value ?? false);
+        }));
         b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
+        b.AddContent(i++, "优先生图：生图期间阻塞等待结果，禁止同轮语音");
+        b.CloseElement();
+        b.CloseElement();
+
+        b.CloseElement(); // 选项开关行
+
+        // 条件输入：硬超时上限（在开关行下方，独立一行）
+        if (Configuration.PriorityImageGen)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap;");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "width:180px;flex-shrink:0;");
+            AddInput(b, ref i, "硬超时上限（秒）", Configuration.PriorityMaxWaitSeconds.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n))
+                    Configuration.PriorityMaxWaitSeconds = Math.Clamp(n, 30, 1800);
+            });
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;");
+            b.AddContent(i++, "实际 = min(超时秒数, 本上限)，超时强制结束避免卡死");
+            b.CloseElement();
+            b.CloseElement();
+        }
+
+        b.CloseElement(); // panel
 
         // 节点映射
         AddSection(b, ref i, "节点映射（高级）");
@@ -2040,6 +2092,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
     async Task AutoDetectNodes()
     {
+        _scanDetectMessage = null;
         try
         {
             var path = Configuration.WorkflowPath?.Trim() ?? "";
@@ -2161,10 +2214,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
     async Task ScanWorkflows()
     {
+        detectMessage = null;
         var path = (Configuration?.WorkflowPath ?? "").Trim();
         if (string.IsNullOrWhiteSpace(path))
         {
-            detectMessage = "请先在路径框中输入 ComfyUI 目录或工作流目录路径";
+            _scanDetectMessage = "请先在路径框中输入 ComfyUI 目录或工作流目录路径";
             StateHasChanged();
             return;
         }
@@ -2172,7 +2226,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         var dir = ResolveWorkflowScanDir(path);
         if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
         {
-            detectMessage = $"路径无效或目录不存在: {path}";
+            _scanDetectMessage = $"路径无效或目录不存在: {path}";
             StateHasChanged();
             return;
         }
@@ -2192,13 +2246,13 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             _scannedWorkflows = workflows.OrderBy(f => f).ToList();
             _showWorkflowDropdown = _scannedWorkflows.Count > 0;
 
-            detectMessage = _scannedWorkflows.Count > 0
+            _scanDetectMessage = _scannedWorkflows.Count > 0
                 ? $"扫描 {dir}\n找到 {_scannedWorkflows.Count} 个工作流，请在下方选择"
                 : $"在 {dir}\n未找到有效工作流 .json 文件";
         }
         catch (Exception ex)
         {
-            detectMessage = $"扫描失败: {ex.Message}";
+            _scanDetectMessage = $"扫描失败: {ex.Message}";
         }
         StateHasChanged();
     }

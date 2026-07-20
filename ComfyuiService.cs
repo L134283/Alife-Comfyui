@@ -43,6 +43,12 @@ public class ComfyuiService(
     static void LogWarn(string msg) => Console.WriteLine($"[ComfyUI][警告] {msg}");
     static void LogError(string msg) => Console.WriteLine($"[ComfyUI][错误] {msg}");
 
+    /// <summary>当前是否有生图任务在跑（优先生图 / 普通模式共用）。</summary>
+    public static bool IsGenerating => Volatile.Read(ref _activeGens) > 0;
+    static int _activeGens;
+    // 优先生图串行，避免叠多个阻塞任务拖死对话
+    static readonly SemaphoreSlim PriorityGate = new(1, 1);
+
     record WorkflowEntry(string Name, string Path, bool Enabled);
 
     public override async Task AwakeAsync(AwakeContext context)
@@ -73,20 +79,34 @@ public class ComfyuiService(
         {
             "natural" =>
                 "短句束形式，每句含明确实体名词+动词。禁止复杂从句（\"的/着/了/与/和/并/而/且/于/对/从\"连接的长句）。" +
-                "例：A girl with pink hair wears a uniform. She stands in a classroom and looks at the viewer.",
+                "例：girl with pink hair wears uniform, stands in classroom.",
 
             "hybrid" =>
                 "外貌/表情/服饰用逗号分隔的英文标签，动作/场景/氛围用自然语言追加在最后。" +
-                "例：1girl, pink hair, green eyes, school uniform, smile, standing in a bright classroom, soft light coming through the window",
+                "例：1girl, pink hair, school uniform, smile, standing in classroom, soft light.",
 
             _ =>
                 "全小写英文标签，半角逗号分隔。禁止光线/光影标签（sunlight, warm lighting 等）。自然语言补充放所有标签最后。" +
-                "例：1girl, pink hair, long hair, green eyes, school uniform, standing, smile"
+                "例：1girl, pink hair, school uniform, standing, smile"
         };
 
             var autoOpenNote = cfg.AutoOpenImage
                 ? "\n- 桌面端已开启自动打开图片，生图后图片会用系统查看器打开，无需AI再发图。"
                 : "";
+
+            // 优先生图：阻塞到出图结束，禁止同轮先语音
+            var priorityNote = "";
+            if (cfg.PriorityImageGen)
+            {
+                var hardCap = Math.Clamp(cfg.PriorityMaxWaitSeconds, 30, 1800);
+                priorityNote = $"""
+
+                【优先生图模式 · 已开启】
+                - 调 GenerateImage 后必须等函数返回（成功/失败/超时）再继续，不要先长篇语音再调图。
+                - 等图期间：禁止语音输出（不要 Speak / 不要朗读），可发极短文字说明「正在画」；结果返回后再描述。
+                - 硬超时约 {hardCap} 秒，超时会返回失败，届时正常说话即可，不要空等或假装图已生成。
+                """;
+            }
 
             // 工作流列表描述
             var workflowListDesc = "";
@@ -135,42 +155,57 @@ public class ComfyuiService(
                 }
             }
 
-            // denoise 智能选择指南（始终可用，不受高级模式影响）
-            var denoiseGuide = """
-            【降噪强度（denoise）】
-            - 仅图生图（传了 imagePath）时有效，文生图时不要传此参数。
-            - 控制原图保留程度：0.0=完全保留原图，1.0=完全重绘。
-            - 若用户未指定 denoise，AI 根据用户意图智能选择：
-              · 微调（换色/去瑕疵/修颜/换表情）：0.3 ~ 0.45
-              · 中等改动（改姿势/换装/换发型/加配件）：0.55 ~ 0.7
-              · 大幅改动（改构图/换背景/风格迁移）：0.7 ~ 0.85
-              · 几乎重绘（仅借原图轮廓参考）：0.85 ~ 1.0
-            """;
+            // denoise 智能选择指南（仅当工作流包含图生图节点时注入）
+            var denoiseGuide = "";
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(wf) && File.Exists(wf))
+                {
+                    var wfContent = await File.ReadAllTextAsync(wf);
+                    if (wfContent.Contains("\"class_type\": \"LoadImage\""))
+                    {
+                        denoiseGuide = """
+                        【降噪强度（denoise）】
+                        - 仅图生图（传了 imagePath）时有效，文生图时不要传此参数。
+                        - 控制原图保留程度：0.0=完全保留原图，1.0=完全重绘。
+                        - 若用户未指定 denoise，AI 根据用户意图智能选择：
+                          · 微调（换色/去瑕疵/修颜/换表情）：0.3 ~ 0.45
+                          · 中等改动（改姿势/换装/换发型/加配件）：0.55 ~ 0.7
+                          · 大幅改动（改构图/换背景/风格迁移）：0.7 ~ 0.85
+                          · 几乎重绘（仅借原图轮廓参考）：0.85 ~ 1.0
+                        """;
+                    }
+                }
+            }
+            catch { }
+
+            var prefixNote = string.IsNullOrWhiteSpace(cfg.PositivePromptPrefix)
+                ? "" : "\n- 固定提示词前缀会自动拼到正向提示词最前面。";
+            var negNote = string.IsNullOrWhiteSpace(cfg.NegativePrompt)
+                ? "负面提示词若无特殊需求不要填写，使用工作流默认即可。"
+                : "固定负面提示词已配置，无需传此参数。";
 
             Prompt($$"""
             此服务通过 ComfyUI 生成图片。
             - 调用 GenerateImage(prompt, orientation?, imagePath?, width?, height?, denoise?{{(cfg.EnableNodeControl ? ", workflow?, steps?, cfg?, sampler?, scheduler?, model?, batch_size?, nodeOverrides?" : "")}})，prompt 必填。
-            - 分辨率：portrait=竖版{cfg.PortraitWidth}×{cfg.PortraitHeight} / landscape=横版{cfg.LandscapeWidth}×{cfg.LandscapeHeight} / square=正方形{cfg.SquareWidth}×{cfg.SquareHeight}。
-            - 不传方向用默认{{cfg.DefaultOrientation}}；传 width/height 则覆盖。
-            - 固定前缀会自动拼到 prompt 前面（若有）。
-            - imagePath：传入本地路径或图片 URL（如 QQ 图片链接），则自动下载并上传到 ComfyUI 进行图生图。不传则为文生图。
-            - 图生图时提示词必须遵循下方【提示词格式：{{styleLabel}}】规则。不要传"把姿势改成xxx"这类中文指令！你无法看到原图，只需根据用户要求生成目标画面的完整描述即可（用户说"改成M字蹲"→你输出一个包含M字蹲姿态的完整英文提示词）。
-            - QQ 环境用户发的图片链接可原样传入 imagePath，插件会自动下载。
+            - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}} / landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}} / square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}。默认{{cfg.DefaultOrientation}}，传 width/height 覆盖。{{prefixNote}}
+            - imagePath：本地路径/图片URL→自动下载上传图生图。不传=文生图。QQ链接可原样传入。
+            - 图生图时提示词用下方【提示词格式：{{styleLabel}}】规则。不要传中文指令描述动作！应直接生成目标画面的英文提示词描述。
             - 地址 {{cfg.BaseUrl}} | 工作流 {{wf}} | 保存 {{saveDir}}
-            - QQ环境生图完成用 <qimage image="完整路径" />。若当前在QQ聊天，生完图顺手发出去。{{autoOpenNote}}
+            - QQ环境用 <qimage image="完整路径" /> 发图。{{autoOpenNote}}{{priorityNote}}
 
             【提示词格式：{{styleLabel}}】
             {{styleGuide}}
 
             {{denoiseGuide}}
 
-            负面提示词若无特殊需求不要填写，使用工作流默认即可。{{workflowListDesc}}{{nodeControlDesc}}
+            {{negNote}}{{workflowListDesc}}{{nodeControlDesc}}
             """);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。固定正向提示词前缀会自动拼接，无需手动传。高级模式开启后支持 workflow/model/steps/cfg 等额外参数。")]
-    public void GenerateImage(
+    [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。固定正向提示词前缀会自动拼接，无需手动传。高级模式开启后支持 workflow/model/steps/cfg 等额外参数。开启「优先生图」时会等待出图结束再返回。")]
+    public async Task GenerateImage(
         [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
         [Description("图片方向：portrait=竖版832x1216, landscape=横版1216x832, square=正方形1216x1216。不传则用配置默认方向")] string? orientation = null,
         [Description("输入图片路径或 URL（本地路径、QQ 图片链接等）。传了则图生图，不传则为文生图")] string? imagePath = null,
@@ -186,8 +221,41 @@ public class ComfyuiService(
         [Description("【高级】批次大小，覆盖 EmptyLatentImage 中的 batch_size")] int? batchSize = null,
         [Description("【高级】原始 JSON 节点覆盖，格式 {\"节点ID\":{\"参数名\":值}}，用于控制上述参数以外的任意节点")] string? nodeOverrides = null)
     {
-        Poke("生图请求已发出，可以继续聊天");
-        _ = GenerateImageAsync(prompt, orientation, imagePath, width, height, workflow, steps, cfg, sampler, scheduler, model, denoise, batchSize, nodeOverrides);
+        var cfgConfig = Configuration ?? new ComfyuiConfig();
+        if (cfgConfig.PriorityImageGen)
+        {
+            // 阻塞到出图结束：同轮 Speak 等函数返回后再执行，避免 TTS 与 Comfy 抢 GPU
+            Log("优先生图：等待出图完成后再返回…");
+            bool entered = false;
+            try
+            {
+                // 若已有任务在跑，短等；超时则拒绝，避免对话永久挂起
+                entered = await PriorityGate.WaitAsync(TimeSpan.FromSeconds(3));
+                if (!entered)
+                {
+                    Poke("已有生图任务进行中，请稍后再试（优先生图模式不叠任务）");
+                    return;
+                }
+
+                await GenerateImageAsync(
+                    prompt, orientation, imagePath, width, height,
+                    workflow, steps, cfg, sampler, scheduler, model, denoise, batchSize, nodeOverrides,
+                    priorityMode: true);
+            }
+            finally
+            {
+                if (entered)
+                    PriorityGate.Release();
+            }
+        }
+        else
+        {
+            Poke("生图请求已发出，可以继续聊天");
+            _ = GenerateImageAsync(
+                prompt, orientation, imagePath, width, height,
+                workflow, steps, cfg, sampler, scheduler, model, denoise, batchSize, nodeOverrides,
+                priorityMode: false);
+        }
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -227,7 +295,8 @@ public class ComfyuiService(
     async Task GenerateImageAsync(string prompt, string? orientation, string? imagePath,
         int? width, int? height,
         string? workflow, int? steps, double? cfg, string? sampler, string? scheduler,
-        string? model, double? denoise, int? batchSize, string? nodeOverrides)
+        string? model, double? denoise, int? batchSize, string? nodeOverrides,
+        bool priorityMode = false)
     {
         if (string.IsNullOrWhiteSpace(prompt))
         {
@@ -248,9 +317,24 @@ public class ComfyuiService(
         // 图生图：临时图片文件路径（用完清理）
         string? tempImageFile = null;
 
+        // 优先生图：硬超时 = min(配置超时, PriorityMaxWaitSeconds)，防止 Comfy 卡死拖死桌宠
+        int pollTimeoutSec = Math.Clamp(cfgConfig.TimeoutSeconds, 30, 1800);
+        if (priorityMode)
+        {
+            int hardCap = Math.Clamp(cfgConfig.PriorityMaxWaitSeconds, 30, 1800);
+            pollTimeoutSec = Math.Min(pollTimeoutSec, hardCap);
+        }
+
+        Interlocked.Increment(ref _activeGens);
+        using var hardCts = new CancellationTokenSource(
+            TimeSpan.FromSeconds(pollTimeoutSec + 30)); // 比轮询多 30s 余量（上传/下载）
+        var ct = hardCts.Token;
+
         try
         {
-            Log($"开始生图: {Truncate(finalPositive, 80)}");
+            if (priorityMode)
+                Poke($"优先生图进行中（最长约 {pollTimeoutSec} 秒），请稍候，期间不要语音…");
+            Log($"{(priorityMode ? "[优先] " : "")}开始生图: {Truncate(finalPositive, 80)}");
             if (w.HasValue || h.HasValue)
                 Log($"分辨率: {w ?? 0}x{h ?? 0}");
 
@@ -264,7 +348,8 @@ public class ComfyuiService(
                 if (imagePath.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                     || imagePath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 {
-                    tempImageFile = await DownloadInputImageAsync(imagePath);
+                    ct.ThrowIfCancellationRequested();
+                    tempImageFile = await DownloadInputImageAsync(imagePath, ct);
                     Log($"图片下载完成 -> {Path.GetFileName(tempImageFile)}");
                 }
                 else if (File.Exists(imagePath))
@@ -278,7 +363,8 @@ public class ComfyuiService(
                 }
 
                 // 1b) 上传到 ComfyUI
-                uploadedImageName = await UploadImageToComfyUIAsync(baseUrl, tempImageFile, cfgConfig);
+                ct.ThrowIfCancellationRequested();
+                uploadedImageName = await UploadImageToComfyUIAsync(baseUrl, tempImageFile, cfgConfig, ct);
                 Log($"图片已上传到 ComfyUI: {uploadedImageName}");
             }
 
@@ -300,7 +386,7 @@ public class ComfyuiService(
             if (!string.IsNullOrWhiteSpace(workflow))
                 Log($"切换工作流: {workflow} -> {Path.GetFileName(workflowPath)}");
 
-            var rawJson = await File.ReadAllTextAsync(workflowPath);
+            var rawJson = await File.ReadAllTextAsync(workflowPath, ct);
             var root = JsonNode.Parse(rawJson)
                 ?? throw new Exception("工作流 JSON 解析失败");
 
@@ -360,15 +446,16 @@ public class ComfyuiService(
             }
 
             // 6) 提交
+            ct.ThrowIfCancellationRequested();
             var clientId = Guid.NewGuid().ToString("N");
             var promptId = Guid.NewGuid().ToString("N");
             await QueuePromptAsync(baseUrl, cfgConfig, apiPrompt, clientId, promptId);
             Log($"已提交 prompt_id={promptId}");
 
-            // 7) 轮询 history
-            var timeout = TimeSpan.FromSeconds(Math.Clamp(cfgConfig.TimeoutSeconds, 30, 1800));
+            // 7) 轮询 history（优先生图用硬超时上限）
+            var timeout = TimeSpan.FromSeconds(pollTimeoutSec);
             var interval = Math.Clamp(cfgConfig.PollIntervalMs, 500, 10000);
-            var history = await WaitHistoryAsync(baseUrl, cfgConfig, promptId, timeout, interval);
+            var history = await WaitHistoryAsync(baseUrl, cfgConfig, promptId, timeout, interval, ct);
 
             // 8) 取图
             var images = ExtractImages(history, promptId);
@@ -425,7 +512,7 @@ public class ComfyuiService(
                     {
                         try
                         {
-                            bytes = await File.ReadAllBytesAsync(localFile);
+                            bytes = await File.ReadAllBytesAsync(localFile, ct);
                             Log($"从自定义目录读取: {localFile}");
                         }
                         catch (Exception ex)
@@ -446,7 +533,7 @@ public class ComfyuiService(
                         {
                             try
                             {
-                                bytes = await File.ReadAllBytesAsync(fallback.FullName);
+                                bytes = await File.ReadAllBytesAsync(fallback.FullName, ct);
                                 Log($"按名称前缀匹配自定义目录: {fallback.FullName}");
                             }
                             catch (Exception ex)
@@ -463,7 +550,7 @@ public class ComfyuiService(
                 if (string.IsNullOrWhiteSpace(ext2)) ext2 = ".png";
                 var fileName = $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext2}";
                 var path = Path.Combine(saveDir, fileName);
-                await File.WriteAllBytesAsync(path, bytes);
+                await File.WriteAllBytesAsync(path, bytes, ct);
                 saved.Add(path);
                 Log($"保存 ({bytes.Length / 1024.0:F0}KB) -> {fileName}");
             }
@@ -493,9 +580,13 @@ public class ComfyuiService(
 
             Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException)
         {
-            Poke("生图超时，请检查 ComfyUI 是否在跑图，或增大 TimeoutSeconds");
+            // 含 TaskCanceledException：硬超时 / 轮询超时，必须明确结束，避免桌宠一直等
+            LogWarn($"生图超时（{pollTimeoutSec}s{(priorityMode ? "，优先生图硬上限" : "")}）");
+            Poke(priorityMode
+                ? $"优先生图超时（{pollTimeoutSec} 秒），已结束等待。可稍后重试或检查 ComfyUI；现在可以正常说话。"
+                : "生图超时，请检查 ComfyUI 是否在跑图，或增大 TimeoutSeconds");
         }
         catch (HttpRequestException ex)
         {
@@ -509,6 +600,7 @@ public class ComfyuiService(
         }
         finally
         {
+            Interlocked.Decrement(ref _activeGens);
             // 清理图生图下载的临时文件
             if (tempImageFile != null && tempImageFile != imagePath && File.Exists(tempImageFile))
             {
@@ -523,7 +615,7 @@ public class ComfyuiService(
     /// 下载远程图片到临时目录（复用 UniversalImageGen 模式）。
     /// 校验 Content-Type 和大小，防止下载非图片或超大文件。
     /// </summary>
-    async Task<string> DownloadInputImageAsync(string url)
+    async Task<string> DownloadInputImageAsync(string url, CancellationToken ct = default)
     {
         // data: URI → 直接解码到临时文件
         if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
@@ -545,20 +637,20 @@ public class ComfyuiService(
                 throw new Exception($"图片过大 ({bytes.Length / 1024 / 1024}MB > {MaxInputImageBytes / 1024 / 1024}MB)");
             var ext = DetectImageExtension(bytes);
             var tmp = Path.Combine(Path.GetTempPath(), $"comfyui_input_{Guid.NewGuid():N}{ext}");
-            await File.WriteAllBytesAsync(tmp, bytes);
+            await File.WriteAllBytesAsync(tmp, bytes, ct);
             return tmp;
         }
 
         // HTTP/HTTPS URL
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("image/*"));
-        using var resp = await _dlHttp.SendAsync(req);
+        using var resp = await _dlHttp.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
 
         // Content-Type 校验
-        var ct = resp.Content.Headers.ContentType?.MediaType;
-        if (string.IsNullOrWhiteSpace(ct) || !AllowedImageContentTypes.Contains(ct))
-            throw new Exception($"不支持的内容类型: {ct ?? "未知"}（仅支持 png/jpeg/webp/gif/bmp）");
+        var contentType = resp.Content.Headers.ContentType?.MediaType;
+        if (string.IsNullOrWhiteSpace(contentType) || !AllowedImageContentTypes.Contains(contentType))
+            throw new Exception($"不支持的内容类型: {contentType ?? "未知"}（仅支持 png/jpeg/webp/gif/bmp）");
 
         // 大小预检
         var cl = resp.Content.Headers.ContentLength;
@@ -571,7 +663,7 @@ public class ComfyuiService(
 
         var extension = DetectImageExtension(data);
         var tmpPath = Path.Combine(Path.GetTempPath(), $"comfyui_input_{Guid.NewGuid():N}{extension}");
-        await File.WriteAllBytesAsync(tmpPath, data);
+        await File.WriteAllBytesAsync(tmpPath, data, ct);
         return tmpPath;
     }
 
@@ -579,10 +671,10 @@ public class ComfyuiService(
     /// 上传图片到 ComfyUI /upload/image。
     /// 返回 ComfyUI 分配给该图片的文件名。
     /// </summary>
-    async Task<string> UploadImageToComfyUIAsync(string baseUrl, string filePath, ComfyuiConfig cfg)
+    async Task<string> UploadImageToComfyUIAsync(string baseUrl, string filePath, ComfyuiConfig cfg, CancellationToken ct = default)
     {
         using var content = new MultipartFormDataContent();
-        var fileBytes = await File.ReadAllBytesAsync(filePath);
+        var fileBytes = await File.ReadAllBytesAsync(filePath, ct);
         var byteContent = new ByteArrayContent(fileBytes);
         var ext = Path.GetExtension(filePath);
         var mime = ext?.ToLowerInvariant() switch
@@ -662,14 +754,19 @@ public class ComfyuiService(
             throw new Exception($"节点错误: {ne.ToJsonString()}");
     }
 
-    async Task<JsonNode> WaitHistoryAsync(string baseUrl, ComfyuiConfig cfg, string promptId, TimeSpan timeout, int intervalMs)
+    async Task<JsonNode> WaitHistoryAsync(
+        string baseUrl, ComfyuiConfig cfg, string promptId,
+        TimeSpan timeout, int intervalMs,
+        CancellationToken cancellationToken = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.Elapsed < timeout)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/history/{promptId}", cfg);
-            using var resp = await Http.SendAsync(req);
-            var raw = await resp.Content.ReadAsStringAsync();
+            using var resp = await Http.SendAsync(req, cancellationToken);
+            var raw = await resp.Content.ReadAsStringAsync(cancellationToken);
             if (resp.IsSuccessStatusCode)
             {
                 var node = JsonNode.Parse(raw);
@@ -692,7 +789,7 @@ public class ComfyuiService(
                 }
             }
 
-            await Task.Delay(intervalMs);
+            await Task.Delay(intervalMs, cancellationToken);
         }
         throw new TaskCanceledException("等待 history 超时");
     }

@@ -2,7 +2,7 @@
   "id": "Alife.Plugin.Comfyui",
   "name": "ComfyUI 生图",
   "author": "doro",
-  "description": "连接本地/远程 ComfyUI，支持 UI 工作流或 API 工作流 JSON。AI 传入正向提示词与方向/分辨率即可生图，可配置固定提示词前缀与三档常用分辨率。",
+  "description": "连接本地/远程 ComfyUI 进行文生图与图生图。支持 UI/API 工作流自动转换、三种提示词格式（标签/自然语言/混合）、固定前缀、三档分辨率、AI 智能降噪强度选择。",
   "dependencies": {
     "Alife.Function.FunctionCaller": ""
   },
@@ -24,6 +24,16 @@
       "date": "2026-07-18",
       "note": "新增桌面端生图后自动打开图片功能；优化 AI 提示词（QQ/桌面端智能分发）；修复 --gpu-only 模式内存优化",
       "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.1/Alife.Plugin.Comfyui.zip"
+    },
+    "1.0.2": {
+      "date": "2026-07-19",
+      "note": "图生图提示词复用 PromptStyle 规则（不再直接传中文指令）；denoise 降噪强度从高级模式拆出、简单模式始终可用；AI 智能选择降噪强度",
+      "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.2/Alife.Plugin.Comfyui.zip"
+    },
+    "1.0.3": {
+      "date": "2026-07-21",
+      "note": "新增多工作流支持（命名工作流卡片，含启用/禁用开关，默认关闭）；多工作流开启时 AI 可传 workflow 参数切换；默认参数 UI 排版优化（复选框独立全宽行、条件输入自适应）；预设三张工作流卡片默认关闭",
+      "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.3/Alife.Plugin.Comfyui.zip"
     }
   }
 }
