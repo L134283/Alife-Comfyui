@@ -64,8 +64,10 @@ public class ComfyuiConfig
     /// <summary>
     /// 优先生图：GenerateImage 会阻塞到出图结束（或超时）才返回，
     /// 避免同轮对话里桌宠先 TTS 说话、与 Comfy 抢 GPU 导致卡死无声。
+    /// 默认关（纯生图用户不受影响）；与本地 TTS 同机时建议开启。
+    /// 本插件不依赖任何语音插件。
     /// </summary>
-    [Description("优先生图：生图请求发出后等待结果返回再继续（期间勿语音）。超时后自动结束，避免桌宠一直卡住")]
+    [Description("优先生图：生图请求开始后阻塞到出图结束再返回（期间勿语音）。同机有本地 TTS 时建议开；纯生图可关。超时自动结束")]
     public bool PriorityImageGen { get; set; } = false;
 
     /// <summary>

@@ -1859,11 +1859,17 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
         b.OpenElement(i++, "span");
         b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
-        b.AddContent(i++, "优先生图：生图期间阻塞等待结果，禁止同轮语音");
+        b.AddContent(i++, "优先生图：生图开始后等图完再返回（同机 TTS 建议开）");
         b.CloseElement();
         b.CloseElement();
 
         b.CloseElement(); // 选项开关行
+
+        // 同机 TTS 提示（不依赖语音插件）
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;margin-top:8px;line-height:1.45;");
+        b.AddContent(i++, "同机本地 TTS：建议开启「优先生图」。默认关，纯生图用户不受影响。本插件不依赖语音插件。");
+        b.CloseElement();
 
         // 条件输入：硬超时上限（在开关行下方，独立一行）
         if (Configuration.PriorityImageGen)

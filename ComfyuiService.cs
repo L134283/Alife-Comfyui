@@ -586,12 +586,12 @@ public class ComfyuiService(
             LogWarn($"生图超时（{pollTimeoutSec}s{(priorityMode ? "，优先生图硬上限" : "")}）");
             Poke(priorityMode
                 ? $"优先生图超时（{pollTimeoutSec} 秒），已结束等待。可稍后重试或检查 ComfyUI；现在可以正常说话。"
-                : "生图超时，请检查 ComfyUI 是否在跑图，或增大 TimeoutSeconds");
+                : "生图超时，请检查 ComfyUI 是否在跑图，或增大 TimeoutSeconds。若同机开了语音优先，进程也可能被 TTS 结束，请重启 ComfyUI");
         }
         catch (HttpRequestException ex)
         {
             LogError($"网络错误: {ex.Message}");
-            Poke($"无法连接 ComfyUI: {ex.Message}\n请确认地址 {cfgConfig.BaseUrl} 可访问");
+            Poke($"无法连接 ComfyUI: {ex.Message}\n请确认地址 {cfgConfig.BaseUrl} 可访问；若同机语音优先曾腾 GPU，请重启 ComfyUI");
         }
         catch (Exception ex)
         {
