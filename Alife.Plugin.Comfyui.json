@@ -2,7 +2,7 @@
   "id": "Alife.Plugin.Comfyui",
   "name": "ComfyUI 生图",
   "author": "doro",
-  "description": "连接本地/远程 ComfyUI 进行文生图与图生图。支持 UI/API 工作流、优先生图（同机 TTS 建议开）、三种提示词格式、固定前缀、三档分辨率；不依赖语音插件。",
+  "description": "连接本地/远程 ComfyUI 进行文生图与图生图。支持 UI/API 工作流自动转换、AI 节点参数控制、工作流目录扫描、三档可调分辨率、多工作流切换、固定提示词前缀与三种提示词格式",
   "dependencies": {
     "Alife.Function.FunctionCaller": ""
   },
@@ -36,8 +36,8 @@
       "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.3/Alife.Plugin.Comfyui.zip"
     },
     "1.0.4": {
-      "date": "2026-07-21",
-      "note": "文档/UI 补充与本地 TTS 同机建议（优先生图）；超时/连接失败提示可能被语音优先结束；默认仍关优先生图，不依赖语音插件",
+      "date": "2026-07-22",
+      "note": "分辨率预设支持 UI 手改（三档各宽高可设）；工作流目录扫描+下拉选择；高级模式（节点概览表）；AI 节点控制（模型/步数/CFG/采样器/调度器/denoise/batch_size 参数注入）；图生图 ImageResize 自动识别与分辨率注入；多工作流卡片增加浏览按钮",
       "file": "https://github.com/L134283/Alife-Comfyui/releases/download/Comfyui-v1.0.4/Alife.Plugin.Comfyui.zip"
     }
   }
