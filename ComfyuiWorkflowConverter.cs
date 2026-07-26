@@ -333,7 +333,8 @@ public static class ComfyuiWorkflowConverter
         // 连接关系未命中再回退启发式（WeiLinPromptUI 文本最长者 / CLIPTextEncode）。
         var (autoPosId, autoNegId) = FindPositiveAndNegativeIds(prompt);
 
-        var posId = string.IsNullOrWhiteSpace(positiveNodeId) ? autoPosId : positiveNodeId;
+        var posId = ResolvePromptNodeId(
+            prompt, positiveNodeId, positiveInputName, autoPosId);
 
         if (!string.IsNullOrWhiteSpace(posId) && prompt[posId] is JsonObject posNode)
         {
@@ -350,7 +351,8 @@ public static class ComfyuiWorkflowConverter
         // 负面提示词（可选）。留空则保留工作流自带的负面
         if (!string.IsNullOrWhiteSpace(negativePrompt))
         {
-            var negId = string.IsNullOrWhiteSpace(negativeNodeId) ? autoNegId : negativeNodeId;
+            var negId = ResolvePromptNodeId(
+                prompt, negativeNodeId, negativeInputName, autoNegId);
 
             if (!string.IsNullOrWhiteSpace(negId) && prompt[negId] is JsonObject negNode)
             {
@@ -389,7 +391,9 @@ public static class ComfyuiWorkflowConverter
             else
             {
             var resId = resolutionNodeId;
-            if (string.IsNullOrWhiteSpace(resId))
+            if (string.IsNullOrWhiteSpace(resId)
+                || prompt[resId] is not JsonObject configuredResolution
+                || !CanApplyResolution(configuredResolution))
                 resId = FindResolutionNodeId(prompt);
 
             if (!string.IsNullOrWhiteSpace(resId) && prompt[resId] is JsonObject resNode)
@@ -452,6 +456,52 @@ public static class ComfyuiWorkflowConverter
     static bool IsSamplerType(string ct)
         => SamplerTypes.Contains(ct) || ct.Contains("Sampler", StringComparison.OrdinalIgnoreCase);
 
+    static bool IsUsablePromptNode(JsonObject prompt, string? nodeId, string? inputName)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId) || prompt[nodeId] is not JsonObject node)
+            return false;
+
+        var classType = node["class_type"]?.GetValue<string>() ?? "";
+        var inputs = node["inputs"] as JsonObject;
+        if (inputs == null)
+            return false;
+
+        if (IsPromptTextNode(classType))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(inputName)
+            && inputs[inputName] is JsonValue configuredValue
+            && configuredValue.TryGetValue<string>(out _))
+            return true;
+
+        return inputs["text"] is JsonValue text && text.TryGetValue<string>(out _)
+               || inputs["positive"] is JsonValue positive && positive.TryGetValue<string>(out _);
+    }
+
+    static string? ResolvePromptNodeId(
+        JsonObject prompt,
+        string? configuredId,
+        string? configuredInputName,
+        string? autoId)
+    {
+        if (IsUsablePromptNode(prompt, configuredId, configuredInputName))
+            return configuredId;
+        return IsUsablePromptNode(prompt, autoId, null) ? autoId : null;
+    }
+
+    static bool CanApplyResolution(JsonObject node)
+    {
+        var classType = node["class_type"]?.GetValue<string>() ?? "";
+        if (classType.Contains("PresetResolution", StringComparison.OrdinalIgnoreCase)
+            || classType.Contains("EmptyLatent", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var inputs = node["inputs"] as JsonObject;
+        return inputs != null
+               && (inputs.ContainsKey("width") || inputs.ContainsKey("height")
+                   || inputs.ContainsKey("自定义宽") || inputs.ContainsKey("自定义高"));
+    }
+
     static bool IsPromptTextNode(string ct)
         => ct.Contains("TextEncode", StringComparison.OrdinalIgnoreCase)
            || ct.Contains("PromptUI", StringComparison.OrdinalIgnoreCase)
@@ -480,9 +530,9 @@ public static class ComfyuiWorkflowConverter
                 negId = nArr[0]?.GetValue<string>();
         }
 
-        // 采样器直连的节点可能不是文本节点（如 ConditionCombine），沿 CONDITIONING 链追溯一层
-        posId = TraceToPromptNode(prompt, posId);
-        negId = TraceToPromptNode(prompt, negId);
+        // 采样器直连的节点可能不是文本节点（如 ConditionCombine），沿连接图递归追溯。
+        posId = TraceToPromptNode(prompt, posId, preferNegative: false);
+        negId = TraceToPromptNode(prompt, negId, preferNegative: true);
 
         // 连接关系未命中，回退启发式
         posId ??= FindPositiveNodeId(prompt);
@@ -490,27 +540,58 @@ public static class ComfyuiWorkflowConverter
         return (posId, negId);
     }
 
-    static string? TraceToPromptNode(JsonObject prompt, string? startId)
+    static string? TraceToPromptNode(
+        JsonObject prompt, string? startId, bool preferNegative)
     {
-        if (string.IsNullOrWhiteSpace(startId)) return null;
-        if (prompt[startId] is not JsonObject node) return startId;
-        var ct = node["class_type"]?.GetValue<string>() ?? "";
-        if (IsPromptTextNode(ct)) return startId;
+        if (string.IsNullOrWhiteSpace(startId))
+            return null;
 
-        // 沿 conditioning/clip/text 输入追溯
-        var inputs = node["inputs"] as JsonObject;
-        if (inputs == null) return startId;
-        foreach (var ikv in inputs)
+        var queue = new Queue<string>();
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        queue.Enqueue(startId);
+
+        while (queue.Count > 0)
         {
-            if (ikv.Value is JsonArray arr && arr.Count > 0
-                && arr[0]?.GetValue<string>() is string linkedId
-                && prompt[linkedId] is JsonObject linked
-                && IsPromptTextNode(linked["class_type"]?.GetValue<string>() ?? ""))
+            var currentId = queue.Dequeue();
+            if (!visited.Add(currentId) || prompt[currentId] is not JsonObject node)
+                continue;
+
+            var classType = node["class_type"]?.GetValue<string>() ?? "";
+            if (IsPromptTextNode(classType))
+                return currentId;
+
+            if (node["inputs"] is not JsonObject inputs)
+                continue;
+
+            // Conditioning 组合节点常同时包含 positive/negative，优先沿语义相符的分支追踪。
+            var linkedInputs = inputs
+                .Where(kv => kv.Value is JsonArray arr
+                             && arr.Count > 0
+                             && arr[0] is JsonValue)
+                .OrderByDescending(kv => IsPreferredConditioningInput(kv.Key, preferNegative));
+
+            foreach (var input in linkedInputs)
             {
-                return linkedId;
+                if (input.Value is not JsonArray arr || arr.Count == 0)
+                    continue;
+                string? linkedId = null;
+                try { linkedId = arr[0]?.GetValue<string>(); }
+                catch { }
+                if (!string.IsNullOrWhiteSpace(linkedId) && !visited.Contains(linkedId))
+                    queue.Enqueue(linkedId);
             }
         }
-        return startId;
+
+        return null;
+    }
+
+    static bool IsPreferredConditioningInput(string name, bool preferNegative)
+    {
+        if (preferNegative)
+            return name.Contains("negative", StringComparison.OrdinalIgnoreCase)
+                   || name.Contains("负", StringComparison.OrdinalIgnoreCase);
+        return name.Contains("positive", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("正", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -536,7 +617,7 @@ public static class ComfyuiWorkflowConverter
     {
         string? bestWeiLin = null;
         int bestLen = -1;
-        string? clipEncode = null;
+        string? promptTextNode = null;
 
         foreach (var kv in prompt)
         {
@@ -553,13 +634,13 @@ public static class ComfyuiWorkflowConverter
                     bestWeiLin = kv.Key;
                 }
             }
-            else if (ct.Equals("CLIPTextEncode", StringComparison.OrdinalIgnoreCase) && clipEncode == null)
+            else if (IsPromptTextNode(ct) && promptTextNode == null)
             {
-                clipEncode = kv.Key;
+                promptTextNode = kv.Key;
             }
         }
 
-        return bestWeiLin ?? clipEncode;
+        return bestWeiLin ?? promptTextNode;
     }
 
     /// <summary>
@@ -570,7 +651,7 @@ public static class ComfyuiWorkflowConverter
     {
         string? bestWeiLin = null;
         int bestLen = int.MaxValue;
-        string? clipEncode = null;
+        string? promptTextNode = null;
 
         foreach (var kv in prompt)
         {
@@ -588,13 +669,13 @@ public static class ComfyuiWorkflowConverter
                     bestWeiLin = kv.Key;
                 }
             }
-            else if (ct.Equals("CLIPTextEncode", StringComparison.OrdinalIgnoreCase) && clipEncode == null)
+            else if (IsPromptTextNode(ct) && promptTextNode == null)
             {
-                clipEncode = kv.Key;
+                promptTextNode = kv.Key;
             }
         }
 
-        return bestWeiLin ?? clipEncode;
+        return bestWeiLin ?? promptTextNode;
     }
 
     public static string? FindResolutionNodeId(JsonObject prompt)
@@ -773,14 +854,58 @@ public static class ComfyuiWorkflowConverter
     /// <summary>
     /// 将已上传的图片文件名注入到 LoadImage 节点。
     /// </summary>
-    public static void InjectLoadImage(JsonObject prompt, string? nodeId, string inputName, string filename)
+    public static string? InjectLoadImage(JsonObject prompt, string? nodeId, string inputName, string filename)
     {
-        var nid = nodeId ?? FindLoadImageNodeId(prompt);
-        if (string.IsNullOrWhiteSpace(nid)) return;
-        if (prompt[nid] is not JsonObject node) return;
+        var nid = IsUsableLoadImageNode(prompt, nodeId, inputName)
+            ? nodeId
+            : FindLoadImageNodeId(prompt);
+        if (string.IsNullOrWhiteSpace(nid) || prompt[nid] is not JsonObject node)
+            return null;
+
         var inputs = node["inputs"] as JsonObject ?? new JsonObject();
         node["inputs"] = inputs;
-        inputs[inputName] = filename;
+        var field = ResolveLoadImageField(inputs, inputName);
+        inputs[field] = filename;
+        return nid;
+    }
+
+    static bool IsUsableLoadImageNode(JsonObject prompt, string? nodeId, string? inputName)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId) || prompt[nodeId] is not JsonObject node)
+            return false;
+
+        var classType = node["class_type"]?.GetValue<string>() ?? "";
+        if (classType.Contains("LoadImage", StringComparison.OrdinalIgnoreCase)
+            || classType.Contains("Load Image", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var inputs = node["inputs"] as JsonObject;
+        return inputs != null
+               && !string.IsNullOrWhiteSpace(inputName)
+               && inputs[inputName] is JsonValue value
+               && value.TryGetValue<string>(out _);
+    }
+
+    static string ResolveLoadImageField(JsonObject inputs, string? configuredName)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredName)
+            && inputs[configuredName] is JsonValue configuredValue
+            && configuredValue.TryGetValue<string>(out _))
+            return configuredName;
+
+        foreach (var candidate in new[] { "image", "filename", "image_path", "path" })
+        {
+            if (inputs[candidate] is JsonValue value && value.TryGetValue<string>(out _))
+                return candidate;
+        }
+
+        foreach (var input in inputs)
+        {
+            if (input.Value is JsonValue value && value.TryGetValue<string>(out _))
+                return input.Key;
+        }
+
+        return string.IsNullOrWhiteSpace(configuredName) ? "image" : configuredName;
     }
 
     /// <summary>

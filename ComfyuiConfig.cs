@@ -10,7 +10,7 @@ public class ComfyuiConfig
     [Description("工作流 JSON 路径（支持 UI 格式或 API 格式）。可填绝对路径，或相对插件目录的路径。必填")]
     public string WorkflowPath { get; set; } = "";
 
-    [Description("正向提示词节点 ID。留空则自动识别（优先 WeiLinPromptUI / CLIPTextEncode）")]
+    [Description("默认工作流的正向提示词节点 ID。留空则自动识别；命名工作流始终按各自连接关系识别")]
     public string PositivePromptNodeId { get; set; } = "";
 
     [Description("正向提示词输入字段名，默认 positive；标准 CLIPTextEncode 用 text")]
@@ -22,13 +22,13 @@ public class ComfyuiConfig
     [Description("固定负面提示词。留空则使用工作流自带的负面提示词")]
     public string NegativePrompt { get; set; } = "";
 
-    [Description("负面提示词节点 ID。留空则自动识别（正向节点之外的另一个 WeiLinPromptUI / CLIPTextEncode）")]
+    [Description("默认工作流的负面提示词节点 ID。留空则自动识别；命名工作流始终按各自连接关系识别")]
     public string NegativePromptNodeId { get; set; } = "";
 
     [Description("负面提示词输入字段名，默认 positive；标准 CLIPTextEncode 用 text")]
     public string NegativePromptInput { get; set; } = "positive";
 
-    [Description("分辨率节点 ID（如 ZML_PresetResolutionV2 / EmptyLatentImage）。留空则自动识别")]
+    [Description("默认工作流的分辨率节点 ID。留空则自动识别；命名工作流始终独立识别")]
     public string ResolutionNodeId { get; set; } = "";
 
     [Description("默认方向：portrait=竖版(832×1216)、landscape=横版(1216×832)、square=正方形(1216×1216)。AI 调用时可传 orientation 覆盖，也可直接指定 width/height")]
@@ -104,7 +104,7 @@ public class ComfyuiConfig
     [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"文生图\",\"p\":\"workflows/txt2img.json\",\"e\":true}]。n=名称 p=路径 e=启用")]
     public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":false},{\"n\":\"图生图\",\"p\":\"\",\"e\":false},{\"n\":\"其他\",\"p\":\"\",\"e\":false}]";
 
-    [Description("图生图 LoadImage 节点 ID。留空则自动识别（class_type 含 LoadImage 的节点）")]
+    [Description("默认工作流的图生图 LoadImage 节点 ID。留空则自动识别；命名工作流始终独立识别")]
     public string LoadImageNodeId { get; set; } = "";
 
     [Description("图生图 LoadImage 节点的图片输入字段名，默认 image")]

@@ -1931,6 +1931,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
 
         b.CloseElement();
+        AddHint(b, ref i, "手动节点 ID 仅用于默认工作流；命名工作流会按各自连接关系自动识别");
         b.CloseElement();
 
         // 高级模式开关
@@ -2134,20 +2135,21 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             var (posId, negId) = ComfyuiWorkflowConverter.FindPositiveAndNegativeIds(api);
             var resId = ComfyuiWorkflowConverter.FindResolutionNodeId(api);
 
+            // 先清空旧结果，避免更换工作流后识别失败却继续使用上一份节点 ID。
+            Configuration.PositivePromptNodeId = posId ?? "";
+            Configuration.NegativePromptNodeId = negId ?? "";
+            Configuration.ResolutionNodeId = resId ?? "";
+
             if (!string.IsNullOrEmpty(posId) && api[posId] is JsonObject posNode)
             {
-                Configuration.PositivePromptNodeId = posId;
                 var posInputs = posNode["inputs"] as JsonObject ?? new JsonObject();
                 Configuration.PositivePromptInput = ComfyuiWorkflowConverter.ResolvePromptField(posInputs, Configuration.PositivePromptInput);
             }
             if (!string.IsNullOrEmpty(negId) && api[negId] is JsonObject negNode)
             {
-                Configuration.NegativePromptNodeId = negId;
                 var negInputs = negNode["inputs"] as JsonObject ?? new JsonObject();
                 Configuration.NegativePromptInput = ComfyuiWorkflowConverter.ResolvePromptField(negInputs, Configuration.NegativePromptInput);
             }
-            if (!string.IsNullOrEmpty(resId))
-                Configuration.ResolutionNodeId = resId;
 
             detectMessage =
                 $"已识别（共 {api.Count} 节点）：\n" +

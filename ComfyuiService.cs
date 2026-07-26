@@ -34,7 +34,8 @@ public class ComfyuiService(
     const int MaxInputImageBytes = 20 * 1024 * 1024; // 20MB
     static readonly HashSet<string> AllowedImageContentTypes = new(StringComparer.OrdinalIgnoreCase)
     {
-        "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"
+        "image/png", "image/x-png", "image/jpeg", "image/jpg",
+        "image/webp", "image/gif", "image/bmp"
     };
 
     public ComfyuiConfig? Configuration { get; set; } = new();
@@ -65,7 +66,9 @@ public class ComfyuiService(
 
         // 解析命名工作流列表（仅启用的）
         var namedWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows)
-            .Where(w => w.Enabled)
+            .Where(w => w.Enabled
+                        && !string.IsNullOrWhiteSpace(w.Name)
+                        && !string.IsNullOrWhiteSpace(w.Path))
             .ToList();
         var hasMultiWorkflow = namedWorkflows.Count > 0;
 
@@ -131,9 +134,9 @@ public class ComfyuiService(
                     "- denoise: 降噪强度（0.0~1.0，图生图常用）\n" +
                     "- batch_size: 批次大小\n" +
                     "- nodeOverrides: 原始 JSON 直接控制任意节点。格式 {\"节点ID\":{\"参数名\":值}}\n" +
-                    "不需要的参数请勿传入，保持工作流默认值即可。";
+                    "不需要的参数请勿传入，保持工作流默认值即可。切换命名工作流时，不要沿用下方默认工作流的节点 ID。";
 
-                // 尝试读取当前工作流的节点概览注入提示词
+                // 节点概览只描述默认工作流；其他工作流在执行时按自身结构识别。
                 try
                 {
                     var wfPath = ResolveWorkflowPath(cfg);
@@ -187,7 +190,7 @@ public class ComfyuiService(
 
             Prompt($$"""
             此服务通过 ComfyUI 生成图片。
-            - 调用 GenerateImage(prompt, orientation?, imagePath?, width?, height?, denoise?{{(cfg.EnableNodeControl ? ", workflow?, steps?, cfg?, sampler?, scheduler?, model?, batch_size?, nodeOverrides?" : "")}})，prompt 必填。
+            - 调用 GenerateImage(prompt, orientation?, imagePath?, width?, height?, denoise?{{(hasMultiWorkflow ? ", workflow?" : "")}}{{(cfg.EnableNodeControl ? ", steps?, cfg?, sampler?, scheduler?, model?, batch_size?, nodeOverrides?" : "")}})，prompt 必填。
             - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}} / landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}} / square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}。默认{{cfg.DefaultOrientation}}，传 width/height 覆盖。{{prefixNote}}
             - imagePath：本地路径/图片URL→自动下载上传图生图。不传=文生图。QQ链接可原样传入。
             - 图生图时提示词用下方【提示词格式：{{styleLabel}}】规则。不要传中文指令描述动作！应直接生成目标画面的英文提示词描述。
@@ -204,7 +207,7 @@ public class ComfyuiService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。固定正向提示词前缀会自动拼接，无需手动传。高级模式开启后支持 workflow/model/steps/cfg 等额外参数。开启「优先生图」时会等待出图结束再返回。")]
+    [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。配置多个工作流后可传 workflow 切换；AI 节点控制开启后可传 model/steps/cfg 等高级参数。开启「优先生图」时会等待出图结束再返回。")]
     public async Task GenerateImage(
         [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
         [Description("图片方向：portrait=竖版832x1216, landscape=横版1216x832, square=正方形1216x1216。不传则用配置默认方向")] string? orientation = null,
@@ -346,7 +349,8 @@ public class ComfyuiService(
 
                 // 1a) 如果是 URL → 下载到临时文件
                 if (imagePath.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                    || imagePath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                    || imagePath.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                    || imagePath.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
                 {
                     ct.ThrowIfCancellationRequested();
                     tempImageFile = await DownloadInputImageAsync(imagePath, ct);
@@ -383,6 +387,12 @@ public class ComfyuiService(
                 return;
             }
 
+            // UI 中手动指定的节点 ID 属于默认工作流；其他工作流必须按自身结构重新识别。
+            var defaultWorkflowPath = ResolveWorkflowPath(cfgConfig);
+            var useConfiguredNodeIds = PathsEqual(workflowPath, defaultWorkflowPath);
+            if (!useConfiguredNodeIds)
+                Log("非默认工作流：自动识别提示词、分辨率和图片输入节点");
+
             if (!string.IsNullOrWhiteSpace(workflow))
                 Log($"切换工作流: {workflow} -> {Path.GetFileName(workflowPath)}");
 
@@ -390,15 +400,22 @@ public class ComfyuiService(
             var root = JsonNode.Parse(rawJson)
                 ?? throw new Exception("工作流 JSON 解析失败");
 
-            // 3) 可选拉取 object_info 辅助转换
+            // 3) UI 工作流才需要 object_info 辅助转换；API 格式直接使用。
             JsonObject? objectInfo = null;
-            try
+            if (!ComfyuiWorkflowConverter.IsApiFormat(root))
             {
-                objectInfo = await FetchObjectInfoAsync(baseUrl, cfgConfig);
-            }
-            catch (Exception ex)
-            {
-                LogWarn($"获取 object_info 失败，将用本地规则转换: {ex.Message}");
+                try
+                {
+                    objectInfo = await FetchObjectInfoAsync(baseUrl, cfgConfig, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    LogWarn($"获取 object_info 失败，将用本地规则转换: {ex.Message}");
+                }
             }
 
             // 4) 转 API
@@ -413,43 +430,56 @@ public class ComfyuiService(
                 w,
                 h,
                 cfgConfig.RandomizeSeed,
-                string.IsNullOrWhiteSpace(cfgConfig.PositivePromptNodeId) ? null : cfgConfig.PositivePromptNodeId,
+                useConfiguredNodeIds && !string.IsNullOrWhiteSpace(cfgConfig.PositivePromptNodeId) ? cfgConfig.PositivePromptNodeId : null,
                 string.IsNullOrWhiteSpace(cfgConfig.PositivePromptInput) ? "positive" : cfgConfig.PositivePromptInput,
-                string.IsNullOrWhiteSpace(cfgConfig.NegativePromptNodeId) ? null : cfgConfig.NegativePromptNodeId,
+                useConfiguredNodeIds && !string.IsNullOrWhiteSpace(cfgConfig.NegativePromptNodeId) ? cfgConfig.NegativePromptNodeId : null,
                 string.IsNullOrWhiteSpace(cfgConfig.NegativePromptInput) ? "positive" : cfgConfig.NegativePromptInput,
-                string.IsNullOrWhiteSpace(cfgConfig.ResolutionNodeId) ? null : cfgConfig.ResolutionNodeId,
+                useConfiguredNodeIds && !string.IsNullOrWhiteSpace(cfgConfig.ResolutionNodeId) ? cfgConfig.ResolutionNodeId : null,
                 isImg2Img: !string.IsNullOrWhiteSpace(uploadedImageName));
 
-            // 5.5) 注入高级节点参数（如果启用了节点控制且有参数传入）
-            var hasNodeOverrides = model != null || steps.HasValue || cfg.HasValue
-                || sampler != null || scheduler != null || denoise.HasValue
-                || batchSize.HasValue || !string.IsNullOrWhiteSpace(nodeOverrides);
-            if (hasNodeOverrides)
+            // denoise 始终可用；其余高级参数必须由配置开关明确授权。
+            var advancedOverridesRequested = model != null || steps.HasValue || cfg.HasValue
+                || sampler != null || scheduler != null || batchSize.HasValue
+                || !string.IsNullOrWhiteSpace(nodeOverrides);
+            if (advancedOverridesRequested && !cfgConfig.EnableNodeControl)
+                LogWarn("AI 节点控制未开启，已忽略高级节点参数");
+
+            if (denoise.HasValue || advancedOverridesRequested && cfgConfig.EnableNodeControl)
             {
-                Log("注入高级节点参数...");
+                Log("注入节点参数...");
                 ComfyuiWorkflowConverter.ApplyNodeOverrides(
-                    apiPrompt, model, steps, cfg, sampler, scheduler,
-                    denoise, batchSize, nodeOverrides);
+                    apiPrompt,
+                    cfgConfig.EnableNodeControl ? model : null,
+                    cfgConfig.EnableNodeControl ? steps : null,
+                    cfgConfig.EnableNodeControl ? cfg : null,
+                    cfgConfig.EnableNodeControl ? sampler : null,
+                    cfgConfig.EnableNodeControl ? scheduler : null,
+                    denoise,
+                    cfgConfig.EnableNodeControl ? batchSize : null,
+                    cfgConfig.EnableNodeControl ? nodeOverrides : null);
             }
 
             // 5.6) 图生图：注入已上传的图片文件名到 LoadImage 节点
             if (!string.IsNullOrWhiteSpace(uploadedImageName))
             {
-                var loadImageNodeId = string.IsNullOrWhiteSpace(cfgConfig.LoadImageNodeId)
-                    ? null : cfgConfig.LoadImageNodeId;
+                var loadImageNodeId = useConfiguredNodeIds
+                    && !string.IsNullOrWhiteSpace(cfgConfig.LoadImageNodeId)
+                        ? cfgConfig.LoadImageNodeId : null;
                 var loadImageInput = string.IsNullOrWhiteSpace(cfgConfig.LoadImageInput)
                     ? "image" : cfgConfig.LoadImageInput;
 
-                ComfyuiWorkflowConverter.InjectLoadImage(
+                var injectedNodeId = ComfyuiWorkflowConverter.InjectLoadImage(
                     apiPrompt, loadImageNodeId, loadImageInput, uploadedImageName);
-                Log($"注入图片 {uploadedImageName} 到 LoadImage 节点");
+                if (string.IsNullOrWhiteSpace(injectedNodeId))
+                    throw new Exception("当前工作流未找到可用的 LoadImage 节点，无法执行图生图");
+                Log($"注入图片 {uploadedImageName} 到 LoadImage 节点 #{injectedNodeId}");
             }
 
             // 6) 提交
             ct.ThrowIfCancellationRequested();
             var clientId = Guid.NewGuid().ToString("N");
-            var promptId = Guid.NewGuid().ToString("N");
-            await QueuePromptAsync(baseUrl, cfgConfig, apiPrompt, clientId, promptId);
+            var promptId = await QueuePromptAsync(
+                baseUrl, cfgConfig, apiPrompt, clientId, ct);
             Log($"已提交 prompt_id={promptId}");
 
             // 7) 轮询 history（优先生图用硬超时上限）
@@ -496,7 +526,12 @@ public class ComfyuiService(
                 byte[]? bytes = null;
                 try
                 {
-                    bytes = await ViewImageAsync(baseUrl, cfgConfig, img.Filename, img.Subfolder, img.Type);
+                    bytes = await ViewImageAsync(
+                        baseUrl, cfgConfig, img.Filename, img.Subfolder, img.Type, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -514,6 +549,10 @@ public class ComfyuiService(
                         {
                             bytes = await File.ReadAllBytesAsync(localFile, ct);
                             Log($"从自定义目录读取: {localFile}");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
                         }
                         catch (Exception ex)
                         {
@@ -535,6 +574,10 @@ public class ComfyuiService(
                             {
                                 bytes = await File.ReadAllBytesAsync(fallback.FullName, ct);
                                 Log($"按名称前缀匹配自定义目录: {fallback.FullName}");
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
                             }
                             catch (Exception ex)
                             {
@@ -617,21 +660,30 @@ public class ComfyuiService(
     /// </summary>
     async Task<string> DownloadInputImageAsync(string url, CancellationToken ct = default)
     {
-        // data: URI → 直接解码到临时文件
+        // data: URI -> 仅接受显式 Base64 图片，避免把任意数据伪装成 PNG。
         if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
         {
             var commaIdx = url.IndexOf(',');
-            if (commaIdx < 0) throw new Exception("无效的 data URI");
-            var b64 = url[(commaIdx + 1)..];
+            if (commaIdx < 0)
+                throw new Exception("无效的 data URI");
+
+            var metadata = url[5..commaIdx];
+            var metadataParts = metadata.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            var mediaType = metadataParts.FirstOrDefault() ?? "";
+            if (!AllowedImageContentTypes.Contains(mediaType))
+                throw new Exception($"data URI 图片类型不受支持: {mediaType}");
+            if (!metadataParts.Any(p => p.Equals("base64", StringComparison.OrdinalIgnoreCase)))
+                throw new Exception("data URI 仅支持 Base64 编码");
+
             byte[] bytes;
             try
             {
-                bytes = Convert.FromBase64String(b64);
+                bytes = Convert.FromBase64String(
+                    Uri.UnescapeDataString(url[(commaIdx + 1)..]));
             }
-            catch
+            catch (FormatException ex)
             {
-                // 可能不是 Base64，尝试 URL 解码再 Base64
-                bytes = Convert.FromBase64String(Uri.UnescapeDataString(b64));
+                throw new Exception("data URI 的 Base64 内容无效", ex);
             }
             if (bytes.Length > MaxInputImageBytes)
                 throw new Exception($"图片过大 ({bytes.Length / 1024 / 1024}MB > {MaxInputImageBytes / 1024 / 1024}MB)");
@@ -657,7 +709,7 @@ public class ComfyuiService(
         if (cl.HasValue && cl.Value > MaxInputImageBytes)
             throw new Exception($"图片过大 ({cl.Value / 1024 / 1024}MB > {MaxInputImageBytes / 1024 / 1024}MB)");
 
-        var data = await resp.Content.ReadAsByteArrayAsync();
+        var data = await resp.Content.ReadAsByteArrayAsync(ct);
         if (data.Length > MaxInputImageBytes)
             throw new Exception($"图片过大 ({data.Length / 1024 / 1024}MB > {MaxInputImageBytes / 1024 / 1024}MB)");
 
@@ -673,11 +725,15 @@ public class ComfyuiService(
     /// </summary>
     async Task<string> UploadImageToComfyUIAsync(string baseUrl, string filePath, ComfyuiConfig cfg, CancellationToken ct = default)
     {
+        var fileInfo = new FileInfo(filePath);
+        if (fileInfo.Length > MaxInputImageBytes)
+            throw new Exception($"图片过大 ({fileInfo.Length / 1024 / 1024}MB > {MaxInputImageBytes / 1024 / 1024}MB)");
+
         using var content = new MultipartFormDataContent();
         var fileBytes = await File.ReadAllBytesAsync(filePath, ct);
+        var detectedExtension = DetectImageExtension(fileBytes);
         var byteContent = new ByteArrayContent(fileBytes);
-        var ext = Path.GetExtension(filePath);
-        var mime = ext?.ToLowerInvariant() switch
+        var mime = detectedExtension switch
         {
             ".jpg" or ".jpeg" => "image/jpeg",
             ".webp" => "image/webp",
@@ -686,7 +742,8 @@ public class ComfyuiService(
             _ => "image/png"
         };
         byteContent.Headers.ContentType = new MediaTypeHeaderValue(mime);
-        content.Add(byteContent, "image", Path.GetFileName(filePath));
+        var uploadName = Path.ChangeExtension(Path.GetFileName(filePath), detectedExtension);
+        content.Add(byteContent, "image", uploadName);
         content.Add(new StringContent("true"), "overwrite");
 
         using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/upload/image")
@@ -696,9 +753,9 @@ public class ComfyuiService(
         if (!string.IsNullOrWhiteSpace(cfg.ApiToken))
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cfg.ApiToken);
 
-        using var resp = await Http.SendAsync(req);
+        using var resp = await Http.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
-        var raw = await resp.Content.ReadAsStringAsync();
+        var raw = await resp.Content.ReadAsStringAsync(ct);
         var result = JsonNode.Parse(raw) as JsonObject
             ?? throw new Exception($"上传图片响应格式异常: {raw}");
         var name = result["name"]?.GetValue<string>()
@@ -709,37 +766,43 @@ public class ComfyuiService(
     static string DetectImageExtension(byte[] data)
     {
         if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xD8) return ".jpg";
-        if (data.Length >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47) return ".png";
+        if (data.Length >= 8 && data[0] == 0x89 && data[1] == 0x50
+            && data[2] == 0x4E && data[3] == 0x47 && data[4] == 0x0D
+            && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A) return ".png";
         if (data.Length >= 3 && data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46) return ".gif";
-        if (data.Length >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46) return ".webp";
+        if (data.Length >= 12 && data[0] == 0x52 && data[1] == 0x49
+            && data[2] == 0x46 && data[3] == 0x46 && data[8] == 0x57
+            && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50) return ".webp";
         if (data.Length >= 2 && data[0] == 0x42 && data[1] == 0x4D) return ".bmp";
-        return ".png";
+        throw new InvalidDataException("文件内容不是受支持的图片格式");
     }
 
     // ===================== HTTP =====================
 
-    async Task<JsonObject?> FetchObjectInfoAsync(string baseUrl, ComfyuiConfig cfg)
+    async Task<JsonObject?> FetchObjectInfoAsync(
+        string baseUrl, ComfyuiConfig cfg, CancellationToken ct)
     {
         using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/object_info", cfg);
-        using var resp = await Http.SendAsync(req);
+        using var resp = await Http.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
-        var raw = await resp.Content.ReadAsStringAsync();
+        var raw = await resp.Content.ReadAsStringAsync(ct);
         return JsonNode.Parse(raw) as JsonObject;
     }
 
-    async Task QueuePromptAsync(string baseUrl, ComfyuiConfig cfg, JsonObject prompt, string clientId, string promptId)
+    async Task<string> QueuePromptAsync(
+        string baseUrl, ComfyuiConfig cfg, JsonObject prompt,
+        string clientId, CancellationToken ct)
     {
         var body = new JsonObject
         {
             ["prompt"] = prompt,
-            ["client_id"] = clientId,
-            ["prompt_id"] = promptId
+            ["client_id"] = clientId
         };
 
         using var req = CreateRequest(HttpMethod.Post, $"{baseUrl}/prompt", cfg);
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        using var resp = await Http.SendAsync(req);
-        var raw = await resp.Content.ReadAsStringAsync();
+        using var resp = await Http.SendAsync(req, ct);
+        var raw = await resp.Content.ReadAsStringAsync(ct);
 
         if (!resp.IsSuccessStatusCode)
         {
@@ -747,11 +810,16 @@ public class ComfyuiService(
             throw new Exception($"提交工作流失败 (HTTP {(int)resp.StatusCode}): {preview}");
         }
 
-        var node = JsonNode.Parse(raw);
-        if (node?["error"] != null)
+        var node = JsonNode.Parse(raw) as JsonObject
+            ?? throw new Exception($"ComfyUI 提交响应格式异常: {raw}");
+        if (node["error"] != null)
             throw new Exception($"ComfyUI 拒绝工作流: {node["error"]}");
-        if (node?["node_errors"] is JsonObject ne && ne.Count > 0)
+        if (node["node_errors"] is JsonObject ne && ne.Count > 0)
             throw new Exception($"节点错误: {ne.ToJsonString()}");
+        var promptId = node["prompt_id"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(promptId))
+            throw new Exception($"ComfyUI 提交响应缺少 prompt_id: {raw}");
+        return promptId;
     }
 
     async Task<JsonNode> WaitHistoryAsync(
@@ -794,17 +862,19 @@ public class ComfyuiService(
         throw new TaskCanceledException("等待 history 超时");
     }
 
-    async Task<byte[]?> ViewImageAsync(string baseUrl, ComfyuiConfig cfg, string filename, string subfolder, string type)
+    async Task<byte[]?> ViewImageAsync(
+        string baseUrl, ComfyuiConfig cfg, string filename, string subfolder,
+        string type, CancellationToken ct)
     {
         var qs = $"filename={Uri.EscapeDataString(filename)}&subfolder={Uri.EscapeDataString(subfolder ?? "")}&type={Uri.EscapeDataString(type ?? "output")}";
         using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/view?{qs}", cfg);
-        using var resp = await Http.SendAsync(req);
+        using var resp = await Http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)
         {
             LogWarn($"下载图片失败 {filename} HTTP {(int)resp.StatusCode}");
             return null;
         }
-        return await resp.Content.ReadAsByteArrayAsync();
+        return await resp.Content.ReadAsByteArrayAsync(ct);
     }
 
     static HttpRequestMessage CreateRequest(HttpMethod method, string url, ComfyuiConfig cfg)
@@ -932,6 +1002,22 @@ public class ComfyuiService(
         return url.Trim().TrimEnd('/');
     }
 
+    static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            return false;
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(left), Path.GetFullPath(right),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     static string ResolveSaveDir(ComfyuiConfig cfg)
     {
         if (!string.IsNullOrWhiteSpace(cfg.SaveDirectory))
@@ -946,23 +1032,42 @@ public class ComfyuiService(
 
     string ResolveWorkflowPath(ComfyuiConfig cfg, string? workflowName)
     {
-        // 如果传了 workflowName，从命名工作流列表中按名称查找
         if (!string.IsNullOrWhiteSpace(workflowName))
         {
             var allWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows);
-            var match = allWorkflows.Find(w =>
-                w.Name.Equals(workflowName.Trim(), StringComparison.OrdinalIgnoreCase));
-            if (match != null)
+            var requestedName = workflowName.Trim();
+            var matches = allWorkflows
+                .Where(w => w.Enabled
+                            && w.Name.Equals(requestedName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (matches.Count == 0)
             {
-                var resolved = ResolveSinglePath(cfg, match.Path);
-                if (File.Exists(resolved))
-                    return resolved;
-                LogWarn($"已选工作流 \"{workflowName}\" 路径无效: {match.Path}");
+                if (allWorkflows.Any(w => !w.Enabled
+                    && w.Name.Equals(requestedName, StringComparison.OrdinalIgnoreCase)))
+                    throw new Exception($"工作流 \"{requestedName}\" 已禁用");
+
+                var available = allWorkflows
+                    .Where(w => w.Enabled && !string.IsNullOrWhiteSpace(w.Name))
+                    .Select(w => w.Name)
+                    .Distinct(StringComparer.OrdinalIgnoreCase);
+                var availableText = string.Join("、", available);
+                throw new Exception(string.IsNullOrWhiteSpace(availableText)
+                    ? $"未找到已启用的工作流 \"{requestedName}\""
+                    : $"未找到已启用的工作流 \"{requestedName}\"；可用：{availableText}");
             }
-            else
-            {
-                LogWarn($"未找到名为 \"{workflowName}\" 的工作流，回退默认工作流");
-            }
+
+            if (matches.Count > 1)
+                throw new Exception($"工作流名称 \"{requestedName}\" 重复，请在配置中保持名称唯一");
+
+            var match = matches[0];
+            if (string.IsNullOrWhiteSpace(match.Path))
+                throw new Exception($"工作流 \"{requestedName}\" 未配置 JSON 路径");
+
+            var resolved = ResolveSinglePath(cfg, match.Path);
+            if (!File.Exists(resolved))
+                throw new Exception($"工作流 \"{requestedName}\" 文件不存在: {resolved}");
+            return resolved;
         }
 
         return ResolveSinglePath(cfg, cfg.WorkflowPath ?? "");
