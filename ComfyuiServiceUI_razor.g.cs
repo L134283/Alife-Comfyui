@@ -1777,7 +1777,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
         {
             ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
-            ("natural", "纯自然语言 — 短句束形式英文描述"),
+            ("natural", "自然语言 — 角色 Tag 置前 + 英文短句"),
             ("hybrid", "混合模式 — 外貌/服饰用标签，动作/场景用自然语言")
         });
         AddHint(b, ref i, "控制 AI 生成提示词的格式风格，不影响已有前缀");

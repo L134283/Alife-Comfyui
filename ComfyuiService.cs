@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -6,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -20,7 +22,7 @@ namespace Alife.Plugin.Comfyui;
 
 [Module(
     "ComfyUI 生图",
-    "连接 ComfyUI 执行工作流生图。支持 UI 工作流 JSON 自动转换，也可直接使用 API 格式。可配置固定提示词前缀与三档常用分辨率。",
+    "连接 ComfyUI 执行工作流生图。支持 UI/API 工作流、角色 Tag 模糊检索、固定提示词前缀与三档常用分辨率。",
     defaultCategory: "Doro的妙妙工具",
     EditorUI = typeof(ComfyuiServiceUI))]
 public class ComfyuiService(
@@ -49,168 +51,238 @@ public class ComfyuiService(
     static int _activeGens;
     // 优先生图串行，避免叠多个阻塞任务拖死对话
     static readonly SemaphoreSlim PriorityGate = new(1, 1);
+    static readonly ConcurrentDictionary<string, long> ClaimedCustomOutputs = new(StringComparer.OrdinalIgnoreCase);
 
     record WorkflowEntry(string Name, string Path, bool Enabled);
+    CharacterPromptIndex? _characterPromptIndex;
 
     public override async Task AwakeAsync(AwakeContext context)
     {
         await base.AwakeAsync(context);
-        functionService.RegisterHandler(new XmlHandler(this)
-        {
-            Description = "此服务通过 ComfyUI 本地/远程工作流生成图片。"
-        });
-
         var cfg = Configuration ?? new ComfyuiConfig();
-        var saveDir = ResolveSaveDir(cfg);
         var wf = ResolveWorkflowPath(cfg);
 
-        // 解析命名工作流列表（仅启用的）
-        var namedWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows)
+        try
+        {
+            var catalogPath = ResolveCharacterCatalogPath();
+            if (File.Exists(catalogPath))
+            {
+                _characterPromptIndex = CharacterPromptIndex.Load(catalogPath);
+                Log($"已加载角色提示词索引: {_characterPromptIndex.Count} 个角色");
+            }
+            else
+            {
+                LogWarn($"角色提示词索引不存在: {catalogPath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _characterPromptIndex = null;
+            LogWarn($"角色提示词索引加载失败: {ex.Message}");
+        }
+
+        // 只向 AI 暴露名称唯一且文件存在的工作流。
+        var configuredWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows)
             .Where(w => w.Enabled
                         && !string.IsNullOrWhiteSpace(w.Name)
                         && !string.IsNullOrWhiteSpace(w.Path))
             .ToList();
-        var hasMultiWorkflow = namedWorkflows.Count > 0;
+        var namedWorkflows = new List<WorkflowEntry>();
+        foreach (var group in configuredWorkflows.GroupBy(w => w.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            if (group.Count() != 1)
+            {
+                LogWarn($"工作流名称重复，未向 AI 暴露: {group.Key}");
+                continue;
+            }
+
+            var entry = group.First();
+            var resolved = ResolveSinglePath(cfg, entry.Path);
+            if (!File.Exists(resolved))
+            {
+                LogWarn($"命名工作流文件不存在，未向 AI 暴露: {entry.Name}");
+                continue;
+            }
+            namedWorkflows.Add(entry with { Path = resolved });
+        }
+        var hasNamedWorkflows = namedWorkflows.Count > 0;
+        var workflowPaths = new[] { wf }.Concat(namedWorkflows.Select(w => w.Path));
+        var supportsImageInput = await AnyWorkflowSupportsImageInputAsync(workflowPaths);
+
+        RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput);
 
         var styleLabel = cfg.PromptStyle switch
         {
-            "natural" => "纯自然语言",
+            "natural" => "自然语言",
             "hybrid"  => "混合模式",
             _         => "纯 Tag"
         };
         var styleGuide = cfg.PromptStyle switch
         {
             "natural" =>
-                "短句束形式，每句含明确实体名词+动词。禁止复杂从句（\"的/着/了/与/和/并/而/且/于/对/从\"连接的长句）。" +
-                "例：girl with pink hair wears uniform, stands in classroom.",
+                "检索得到的角色 Tag 必须原样放在开头；其后用 2~4 个简洁英文短句依次写服装、动作、构图、场景与光线。" +
+                "避免故事叙述、否定句和互相冲突的描述。",
 
             "hybrid" =>
-                "外貌/表情/服饰用逗号分隔的英文标签，动作/场景/氛围用自然语言追加在最后。" +
-                "例：1girl, pink hair, school uniform, smile, standing in classroom, soft light.",
+                "角色身份、外貌、服装和表情使用逗号分隔的英文 Tag；复杂动作、人物关系、构图和场景用 1~2 个简洁英文短句追加在末尾。",
 
             _ =>
-                "全小写英文标签，半角逗号分隔。禁止光线/光影标签（sunlight, warm lighting 等）。自然语言补充放所有标签最后。" +
-                "例：1girl, pink hair, school uniform, standing, smile"
+                "使用具体的 Danbooru 风格英文 Tag，半角逗号分隔。顺序为主体身份、人数、外貌、服装、表情动作、构图、背景与光线；去重并避免矛盾。"
         };
 
-            var autoOpenNote = cfg.AutoOpenImage
-                ? "\n- 桌面端已开启自动打开图片，生图后图片会用系统查看器打开，无需AI再发图。"
-                : "";
+        var autoOpenNote = cfg.AutoOpenImage
+            ? "\n- 桌面端会自动打开成图，无需再发送本地图片。"
+            : "";
 
-            // 优先生图：阻塞到出图结束，禁止同轮先语音
-            var priorityNote = "";
-            if (cfg.PriorityImageGen)
+        var priorityNote = "";
+        if (cfg.PriorityImageGen)
+        {
+            var hardCap = Math.Clamp(cfg.PriorityMaxWaitSeconds, 30, 1800);
+            priorityNote = $"""
+
+            【优先生图】调用 generateimage 后等待结果再继续；等待期间不要调用语音功能。最长约 {hardCap} 秒。
+            """;
+        }
+
+        var workflowListDesc = hasNamedWorkflows
+            ? $"\n- 可选 workflow：{string.Join("、", namedWorkflows.Select(w => $"\"{w.Name}\""))}；不传则使用默认工作流。"
+            : "";
+
+        var nodeControlDesc = cfg.EnableNodeControl
+            ? "\n- 高级节点控制已开启；仅在用户明确要求时修改。需要节点信息时先调用 getcomfyuicontrols。"
+            : "";
+
+        var denoiseGuide = supportsImageInput
+            ? "\n- 图生图 denoise：微调 0.30~0.45，换装/姿势 0.55~0.70，大改 0.70~0.85；文生图不要传。"
+            : "";
+        var imageInputNote = supportsImageInput
+            ? "\n- imagepath 仅在图生图时传本地路径或图片 URL；文生图不要传。"
+            : "";
+
+        var prefixNote = string.IsNullOrWhiteSpace(cfg.PositivePromptPrefix)
+            ? "" : "\n- 固定正向前缀由插件自动添加，不要重复写入 prompt。";
+        var characterLookupNote = _characterPromptIndex == null
+            ? ""
+            : """
+
+            【具体角色检索】
+            - 仅当主体是有明确名字的既有动漫、游戏、漫画或虚拟主播角色时，先调用 findcharacterprompt；作品已知时同时传 work。
+            - 画你自己的人设、原创角色、普通人物、真人，或只指定服装/动作/画风时，直接组织提示词，不要检索。
+            - 仅使用 status: matched 的结果。prompt 必须保留 trigger_tags_xml 与 appearance_tags_xml；动作、构图和场景按当前请求自由组合。
+            - 用户指定了新服装时舍弃 default_outfit_tags_xml，只写新服装；未指定服装时可使用默认服装。
+            - 返回字段已按 XML 属性转义，组合进 generateimage 的 prompt 属性时保持 &amp; 等转义文本原样，不要还原或翻译。
+            """;
+
+        Prompt($$"""
+        【ComfyUI 生图】
+        - 所有 prompt 使用英文，直接描述目标画面，不要把用户的中文命令原句塞进 prompt。
+        - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}}，landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}}，square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}；默认 {{cfg.DefaultOrientation}}。
+        - 提示词模式：{{styleLabel}}。{{styleGuide}}{{prefixNote}}{{workflowListDesc}}{{imageInputNote}}{{denoiseGuide}}{{nodeControlDesc}}{{autoOpenNote}}
+        - QQ 环境需要发图时使用 <qimage image="完整路径" />。{{characterLookupNote}}{{priorityNote}}
+        """);
+    }
+
+    void RegisterFunctionHandlers(
+        ComfyuiConfig cfg, bool hasNamedWorkflows, bool supportsImageInput)
+    {
+        var discovered = new XmlHandler(this);
+        var functions = discovered.Functions.ToDictionary(
+            function => function.Name, StringComparer.OrdinalIgnoreCase);
+
+        if (functions.TryGetValue("checkcomfyuistatus", out var statusFunction))
+        {
+            functionService.RegisterHandlerWithoutDocument(new XmlHandler
             {
-                var hardCap = Math.Clamp(cfg.PriorityMaxWaitSeconds, 30, 1800);
-                priorityNote = $"""
+                Name = "ComfyuiStatusInternal",
+                Instance = this,
+                Functions = new List<XmlFunction> { statusFunction }
+            });
+        }
 
-                【优先生图模式 · 已开启】
-                - 调 GenerateImage 后必须等函数返回（成功/失败/超时）再继续，不要先长篇语音再调图。
-                - 等图期间：禁止语音输出（不要 Speak / 不要朗读），可发极短文字说明「正在画」；结果返回后再描述。
-                - 硬超时约 {hardCap} 秒，超时会返回失败，届时正常说话即可，不要空等或假装图已生成。
-                """;
+        var exposed = new List<XmlFunction>();
+        if (functions.TryGetValue("generateimage", out var generateFunction))
+        {
+            var hiddenParameters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!hasNamedWorkflows)
+                hiddenParameters.Add("workflow");
+            if (!supportsImageInput)
+            {
+                hiddenParameters.Add("imagepath");
+                hiddenParameters.Add("denoise");
             }
-
-            // 工作流列表描述
-            var workflowListDesc = "";
-            if (hasMultiWorkflow)
+            if (!cfg.EnableNodeControl)
             {
-                var names = namedWorkflows.Select(w => $"\"{w.Name}\"").ToList();
-                workflowListDesc = $"\n\n【可用工作流】\n- {string.Join("\n- ", names)}\n" +
-                    $"调用 GenerateImage 时传 workflow=\"工作流名\" 即可切换。不传则用默认工作流 \"{Path.GetFileNameWithoutExtension(wf)}\"。";
-            }
-
-            // 节点控制描述
-            var nodeControlDesc = "";
-            if (cfg.EnableNodeControl)
-            {
-                nodeControlDesc = "\n\n【高级节点控制已开启】\n" +
-                    "GenerateImage 额外可选参数：\n" +
-                    "- model: 更换大模型（如 meinamix_v11.safetensors）\n" +
-                    "- steps: 采样步数（整数）\n" +
-                    "- cfg: CFG Scale（如 7.0）\n" +
-                    "- sampler: 采样器名（如 euler, dpmpp_2m, ddim）\n" +
-                    "- scheduler: 调度器（如 normal, karras）\n" +
-                    "- denoise: 降噪强度（0.0~1.0，图生图常用）\n" +
-                    "- batch_size: 批次大小\n" +
-                    "- nodeOverrides: 原始 JSON 直接控制任意节点。格式 {\"节点ID\":{\"参数名\":值}}\n" +
-                    "不需要的参数请勿传入，保持工作流默认值即可。切换命名工作流时，不要沿用下方默认工作流的节点 ID。";
-
-                // 节点概览只描述默认工作流；其他工作流在执行时按自身结构识别。
-                try
+                foreach (var name in new[]
                 {
-                    var wfPath = ResolveWorkflowPath(cfg);
-                    if (!string.IsNullOrWhiteSpace(wfPath) && File.Exists(wfPath))
-                    {
-                        var rawJson = await File.ReadAllTextAsync(wfPath);
-                        var root = JsonNode.Parse(rawJson);
-                        if (root != null)
-                        {
-                            var apiPrompt = ComfyuiWorkflowConverter.ToApiPrompt(root, null);
-                            var overview = ComfyuiWorkflowConverter.BuildNodeControlDescription(apiPrompt);
-                            nodeControlDesc += "\n\n" + overview;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogWarn($"无法生成节点概览: {ex.Message}");
-                }
+                    "model", "steps", "cfg", "sampler", "scheduler",
+                    "batch_size", "nodeoverrides"
+                })
+                    hiddenParameters.Add(name);
             }
 
-            // denoise 智能选择指南（仅当工作流包含图生图节点时注入）
-            var denoiseGuide = "";
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(wf) && File.Exists(wf))
-                {
-                    var wfContent = await File.ReadAllTextAsync(wf);
-                    if (wfContent.Contains("\"class_type\": \"LoadImage\""))
-                    {
-                        denoiseGuide = """
-                        【降噪强度（denoise）】
-                        - 仅图生图（传了 imagePath）时有效，文生图时不要传此参数。
-                        - 控制原图保留程度：0.0=完全保留原图，1.0=完全重绘。
-                        - 若用户未指定 denoise，AI 根据用户意图智能选择：
-                          · 微调（换色/去瑕疵/修颜/换表情）：0.3 ~ 0.45
-                          · 中等改动（改姿势/换装/换发型/加配件）：0.55 ~ 0.7
-                          · 大幅改动（改构图/换背景/风格迁移）：0.7 ~ 0.85
-                          · 几乎重绘（仅借原图轮廓参考）：0.85 ~ 1.0
-                        """;
-                    }
-                }
-            }
-            catch { }
+            var description = supportsImageInput
+                ? "使用 ComfyUI 生成图片；传 imagepath 时执行图生图。"
+                : "使用 ComfyUI 生成图片。";
+            exposed.Add(CloneFunctionDocument(
+                generateFunction, description, hiddenParameters));
+        }
 
-            var prefixNote = string.IsNullOrWhiteSpace(cfg.PositivePromptPrefix)
-                ? "" : "\n- 固定提示词前缀会自动拼到正向提示词最前面。";
-            var negNote = string.IsNullOrWhiteSpace(cfg.NegativePrompt)
-                ? "负面提示词若无特殊需求不要填写，使用工作流默认即可。"
-                : "固定负面提示词已配置，无需传此参数。";
+        if (_characterPromptIndex != null
+            && functions.TryGetValue("findcharacterprompt", out var characterFunction))
+        {
+            exposed.Add(CloneFunctionDocument(
+                characterFunction,
+                "仅在明确生成某个既有动漫、游戏、漫画或虚拟主播角色时调用；返回身份、稳定外貌和默认服装 Tag。"));
+        }
 
-            Prompt($$"""
-            此服务通过 ComfyUI 生成图片。
-            - 调用 GenerateImage(prompt, orientation?, imagePath?, width?, height?, denoise?{{(hasMultiWorkflow ? ", workflow?" : "")}}{{(cfg.EnableNodeControl ? ", steps?, cfg?, sampler?, scheduler?, model?, batch_size?, nodeOverrides?" : "")}})，prompt 必填。
-            - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}} / landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}} / square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}。默认{{cfg.DefaultOrientation}}，传 width/height 覆盖。{{prefixNote}}
-            - imagePath：本地路径/图片URL→自动下载上传图生图。不传=文生图。QQ链接可原样传入。
-            - 图生图时提示词用下方【提示词格式：{{styleLabel}}】规则。不要传中文指令描述动作！应直接生成目标画面的英文提示词描述。
-            - 地址 {{cfg.BaseUrl}} | 工作流 {{wf}} | 保存 {{saveDir}}
-            - QQ环境用 <qimage image="完整路径" /> 发图。{{autoOpenNote}}{{priorityNote}}
+        if (cfg.EnableNodeControl
+            && functions.TryGetValue("getcomfyuicontrols", out var controlsFunction))
+        {
+            var hiddenParameters = hasNamedWorkflows
+                ? null
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "workflow" };
+            exposed.Add(CloneFunctionDocument(
+                controlsFunction,
+                "按需查看当前工作流允许 AI 调整的安全节点参数。",
+                hiddenParameters));
+        }
 
-            【提示词格式：{{styleLabel}}】
-            {{styleGuide}}
+        functionService.RegisterHandler(new XmlHandler
+        {
+            Name = "ComfyuiImageGeneration",
+            Description = _characterPromptIndex == null
+                ? "ComfyUI 生图。"
+                : "ComfyUI 生图与具体二次元角色提示词检索。",
+            Instance = this,
+            Functions = exposed
+        });
+    }
 
-            {{denoiseGuide}}
-
-            {{negNote}}{{workflowListDesc}}{{nodeControlDesc}}
-            """);
+    static XmlFunction CloneFunctionDocument(
+        XmlFunction source,
+        string description,
+        IReadOnlySet<string>? hiddenParameters = null)
+    {
+        return new XmlFunction
+        {
+            Name = source.Name,
+            Order = source.Order,
+            Mode = source.Mode,
+            Description = description,
+            ContentName = source.ContentName,
+            ContentDescription = source.ContentDescription,
+            Parameters = source.Parameters
+                .Where(parameter => hiddenParameters?.Contains(parameter.Name) != true)
+                .ToList(),
+            Invoker = source.Invoker
+        };
     }
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。配置多个工作流后可传 workflow 切换；AI 节点控制开启后可传 model/steps/cfg 等高级参数。开启「优先生图」时会等待出图结束再返回。")]
     public async Task GenerateImage(
         [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
-        [Description("图片方向：portrait=竖版832x1216, landscape=横版1216x832, square=正方形1216x1216。不传则用配置默认方向")] string? orientation = null,
+        [Description("图片方向：portrait=竖版、landscape=横版、square=正方形；实际尺寸取当前配置")] string? orientation = null,
         [Description("输入图片路径或 URL（本地路径、QQ 图片链接等）。传了则图生图，不传则为文生图")] string? imagePath = null,
         [Description("图片宽度，显式指定则覆盖 orientation")] int? width = null,
         [Description("图片高度，显式指定则覆盖 orientation")] int? height = null,
@@ -221,8 +293,8 @@ public class ComfyuiService(
         [Description("【高级】调度器名称（如 normal, karras），覆盖 KSampler 中的 scheduler")] string? scheduler = null,
         [Description("【高级】大模型文件名（如 meinamix_v11.safetensors），覆盖 CheckpointLoader 中的 ckpt_name")] string? model = null,
         [Description("降噪强度 0.0~1.0，仅图生图有效。控制原图保留程度，文生图请勿传入")] double? denoise = null,
-        [Description("【高级】批次大小，覆盖 EmptyLatentImage 中的 batch_size")] int? batchSize = null,
-        [Description("【高级】原始 JSON 节点覆盖，格式 {\"节点ID\":{\"参数名\":值}}，用于控制上述参数以外的任意节点")] string? nodeOverrides = null)
+        [Description("【高级】批次大小，覆盖 EmptyLatentImage 中的 batch_size")] int? batch_size = null,
+        [Description("【高级】安全节点覆盖，格式 {\"节点ID\":{\"参数名\":标量值}}")] string? nodeOverrides = null)
     {
         var cfgConfig = Configuration ?? new ComfyuiConfig();
         if (cfgConfig.PriorityImageGen)
@@ -240,9 +312,9 @@ public class ComfyuiService(
                     return;
                 }
 
-                await GenerateImageAsync(
+                await RunGenerationSafelyAsync(
                     prompt, orientation, imagePath, width, height,
-                    workflow, steps, cfg, sampler, scheduler, model, denoise, batchSize, nodeOverrides,
+                    workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
                     priorityMode: true);
             }
             finally
@@ -254,9 +326,9 @@ public class ComfyuiService(
         else
         {
             Poke("生图请求已发出，可以继续聊天");
-            _ = GenerateImageAsync(
+            _ = RunGenerationSafelyAsync(
                 prompt, orientation, imagePath, width, height,
-                workflow, steps, cfg, sampler, scheduler, model, denoise, batchSize, nodeOverrides,
+                workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
                 priorityMode: false);
         }
     }
@@ -266,6 +338,100 @@ public class ComfyuiService(
     public void CheckComfyuiStatus()
     {
         _ = CheckStatusAsync();
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("仅检索明确指定的既有二次元角色；支持中文、英文、别名、部分名称和少量错字。")]
+    public void FindCharacterPrompt(
+        [Description("角色名，支持中文、英文、别名或不完整名称")] string name,
+        [Description("可选作品名；同名角色或短名称时建议填写")] string? work = null)
+    {
+        if (_characterPromptIndex == null)
+        {
+            Poke("角色提示词索引未加载，请检查 character-prompts.json 是否位于插件目录");
+            return;
+        }
+
+        var matches = _characterPromptIndex.Search(name, work, 3);
+        if (matches.Count == 0)
+        {
+            Poke("status: not_found\nquery: " + name
+                 + (string.IsNullOrWhiteSpace(work) ? "" : $"\nwork: {work}")
+                 + "\naction: 不要编造角色 Tag；检查角色名或作品名后再查询");
+            return;
+        }
+
+        var best = matches[0];
+        var strongWorkMatch = !string.IsNullOrWhiteSpace(work) && best.WorkScore >= 0.85;
+        var ambiguous = best.Score < 0.80
+            || matches.Count > 1
+               && best.Score - matches[1].Score < 0.04
+               && !strongWorkMatch;
+
+        if (ambiguous)
+        {
+            var candidates = string.Join("\n", matches.Select((match, index) =>
+                $"{index + 1}. {match.Entry.ChineseName} [{match.Entry.EnglishName}] | " +
+                $"{DisplayWork(match.Entry)} | match_score: {(int)Math.Round(match.Score * 100)}/100"));
+            Poke($"status: ambiguous\nquery: {name}\ncandidates:\n{candidates}\n" +
+                 "action: 不要使用任何角色 Tag；请结合上下文选定角色后，带作品名 work 重新查询");
+            Log($"角色检索存在歧义: {name}");
+            return;
+        }
+
+        var matchScore = (int)Math.Round(best.Score * 100);
+        var result = new StringBuilder()
+            .AppendLine("status: matched")
+            .Append("character: ").Append(best.Entry.ChineseName)
+            .Append(" [").Append(best.Entry.EnglishName).Append("] | ")
+            .AppendLine(DisplayWork(best.Entry))
+            .Append("match_score: ").Append(matchScore).AppendLine("/100")
+            .Append("trigger_tags_xml: ").AppendLine(XmlSafe(best.Entry.TriggerTags))
+            .Append("appearance_tags_xml: ").AppendLine(XmlSafe(best.Entry.AppearanceTags))
+            .Append("default_outfit_tags_xml: ").AppendLine(XmlSafe(best.Entry.DefaultOutfitTags))
+            .Append("usage: 必须保留前两项；指定新服装时不要使用默认服装，动作、构图和场景按请求自由组合");
+
+        Poke(result.ToString());
+        Log($"角色检索: {name} -> {best.Entry.EnglishName} ({matchScore}/100)");
+    }
+
+    static string DisplayWork(CharacterPromptEntry entry)
+        => !string.IsNullOrWhiteSpace(entry.ChineseWork)
+            ? entry.ChineseWork
+            : entry.EnglishWork;
+
+    static string XmlSafe(string value)
+        => SecurityElement.Escape(value) ?? "";
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("按需返回当前工作流中允许 AI 调整的安全节点参数。")]
+    public async Task GetComfyuiControls(
+        [Description("可选工作流名称；不传则查看默认工作流")] string? workflow = null)
+    {
+        try
+        {
+            var cfg = Configuration ?? new ComfyuiConfig();
+            if (!cfg.EnableNodeControl)
+            {
+                Poke("AI 节点控制未开启");
+                return;
+            }
+
+            var workflowPath = ResolveWorkflowPath(cfg, workflow);
+            if (string.IsNullOrWhiteSpace(workflowPath) || !File.Exists(workflowPath))
+                throw new FileNotFoundException("工作流文件不存在", workflowPath);
+
+            var raw = await File.ReadAllTextAsync(workflowPath);
+            var root = JsonNode.Parse(raw) ?? throw new InvalidDataException("工作流 JSON 为空");
+            var prompt = ComfyuiWorkflowConverter.ToApiPrompt(root);
+            var label = string.IsNullOrWhiteSpace(workflow) ? "默认工作流" : workflow.Trim();
+            Poke($"workflow: {label}\n{ComfyuiWorkflowConverter.BuildNodeControlDescription(prompt)}");
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"读取节点控制信息失败: {ex.Message}");
+            Poke($"读取节点控制信息失败: {ex.Message}");
+        }
     }
 
     async Task CheckStatusAsync()
@@ -295,10 +461,59 @@ public class ComfyuiService(
         }
     }
 
+    async Task RunGenerationSafelyAsync(
+        string prompt, string? orientation, string? imagePath,
+        int? width, int? height,
+        string? workflow, int? steps, double? cfg, string? sampler, string? scheduler,
+        string? model, double? denoise, int? batch_size, string? nodeOverrides,
+        bool priorityMode)
+    {
+        try
+        {
+            await GenerateImageAsync(
+                prompt, orientation, imagePath, width, height,
+                workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size,
+                nodeOverrides, priorityMode);
+        }
+        catch (Exception ex)
+        {
+            LogError($"生图任务启动失败: {ex.Message}");
+            Poke($"生图失败: {ex.Message}");
+        }
+    }
+
+    async Task<bool> AnyWorkflowSupportsImageInputAsync(IEnumerable<string> workflowPaths)
+    {
+        foreach (var path in workflowPaths
+                     .Where(path => !string.IsNullOrWhiteSpace(path))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!File.Exists(path))
+                continue;
+
+            try
+            {
+                var raw = await File.ReadAllTextAsync(path);
+                var root = JsonNode.Parse(raw);
+                if (root == null)
+                    continue;
+                var prompt = ComfyuiWorkflowConverter.ToApiPrompt(root);
+                if (ComfyuiWorkflowConverter.FindLoadImageNodeId(prompt) != null)
+                    return true;
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"检查工作流图生图能力失败 ({Path.GetFileName(path)}): {ex.Message}");
+            }
+        }
+
+        return false;
+    }
+
     async Task GenerateImageAsync(string prompt, string? orientation, string? imagePath,
         int? width, int? height,
         string? workflow, int? steps, double? cfg, string? sampler, string? scheduler,
-        string? model, double? denoise, int? batchSize, string? nodeOverrides,
+        string? model, double? denoise, int? batch_size, string? nodeOverrides,
         bool priorityMode = false)
     {
         if (string.IsNullOrWhiteSpace(prompt))
@@ -307,6 +522,7 @@ public class ComfyuiService(
             return;
         }
 
+        var generationStartedUtc = DateTime.UtcNow;
         var cfgConfig = Configuration ?? new ComfyuiConfig();
         var baseUrl = NormalizeBaseUrl(cfgConfig.BaseUrl);
         var saveDir = ResolveSaveDir(cfgConfig);
@@ -439,7 +655,7 @@ public class ComfyuiService(
 
             // denoise 始终可用；其余高级参数必须由配置开关明确授权。
             var advancedOverridesRequested = model != null || steps.HasValue || cfg.HasValue
-                || sampler != null || scheduler != null || batchSize.HasValue
+                || sampler != null || scheduler != null || batch_size.HasValue
                 || !string.IsNullOrWhiteSpace(nodeOverrides);
             if (advancedOverridesRequested && !cfgConfig.EnableNodeControl)
                 LogWarn("AI 节点控制未开启，已忽略高级节点参数");
@@ -455,9 +671,12 @@ public class ComfyuiService(
                     cfgConfig.EnableNodeControl ? sampler : null,
                     cfgConfig.EnableNodeControl ? scheduler : null,
                     denoise,
-                    cfgConfig.EnableNodeControl ? batchSize : null,
+                    cfgConfig.EnableNodeControl ? batch_size : null,
                     cfgConfig.EnableNodeControl ? nodeOverrides : null);
             }
+
+            // 在提交前确定自定义输出目录；后续只认领本任务开始后新写入的文件。
+            var customDir = TryFindCustomSavePath(apiPrompt);
 
             // 5.6) 图生图：注入已上传的图片文件名到 LoadImage 节点
             if (!string.IsNullOrWhiteSpace(uploadedImageName))
@@ -492,19 +711,17 @@ public class ComfyuiService(
             if (images.Count == 0)
             {
                 // 可能保存到自定义路径（ZML_SaveImageV2），history 无 images
-                var customPath = TryFindCustomSavePath(apiPrompt);
-                if (!string.IsNullOrWhiteSpace(customPath) && Directory.Exists(customPath))
+                if (!string.IsNullOrWhiteSpace(customDir) && Directory.Exists(customDir))
                 {
-                    var latest = new DirectoryInfo(customPath)
-                        .GetFiles("*.*", SearchOption.TopDirectoryOnly)
-                        .Where(f => f.Extension is ".png" or ".jpg" or ".jpeg" or ".webp")
-                        .OrderByDescending(f => f.LastWriteTimeUtc)
-                        .FirstOrDefault();
-                    if (latest != null && (DateTime.UtcNow - latest.LastWriteTimeUtc).TotalMinutes < 10)
+                    var output = TryClaimCustomOutput(customDir, generationStartedUtc);
+                    if (output != null)
                     {
-                        var dest = Path.Combine(saveDir, $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{latest.Name}");
-                        File.Copy(latest.FullName, dest, true);
-                        Log($"从自定义目录复制: {latest.FullName} -> {dest}");
+                        var ext = string.IsNullOrWhiteSpace(output.Extension) ? ".png" : output.Extension;
+                        var dest = Path.Combine(
+                            saveDir,
+                            $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext}");
+                        File.Copy(output.FullName, dest, false);
+                        Log($"从自定义目录复制: {output.FullName} -> {dest}");
                         Poke($"图片已生成\n{dest}");
                         return;
                     }
@@ -517,9 +734,6 @@ public class ComfyuiService(
 
             // ZML_SaveImageV2 等自定义保存节点会把文件写到「保存路径」指定的绝对目录，
             // 不进 ComfyUI output；但 history.outputs 仍会上报 filename，导致 /view 404。
-            // 提前算一次自定义目录，下载失败时按 filename 回退本地读取。
-            var customDir = TryFindCustomSavePath(apiPrompt);
-
             var saved = new List<string>();
             foreach (var img in images)
             {
@@ -542,13 +756,14 @@ public class ComfyuiService(
                 if ((bytes == null || bytes.Length == 0)
                     && !string.IsNullOrWhiteSpace(customDir) && Directory.Exists(customDir))
                 {
-                    var localFile = Path.Combine(customDir, img.Filename);
-                    if (File.Exists(localFile))
+                    var localFile = TryClaimCustomOutput(
+                        customDir, generationStartedUtc, img.Filename);
+                    if (localFile != null)
                     {
                         try
                         {
-                            bytes = await File.ReadAllBytesAsync(localFile, ct);
-                            Log($"从自定义目录读取: {localFile}");
+                            bytes = await File.ReadAllBytesAsync(localFile.FullName, ct);
+                            Log($"从自定义目录读取: {localFile.FullName}");
                         }
                         catch (OperationCanceledException)
                         {
@@ -556,33 +771,7 @@ public class ComfyuiService(
                         }
                         catch (Exception ex)
                         {
-                            LogWarn($"读取本地文件失败 {localFile}: {ex.Message}");
-                        }
-                    }
-                    else
-                    {
-                        // filename 含特殊字符或前缀不一致时，按扩展名 + 最近修改时间兜底匹配
-                        var ext = Path.GetExtension(img.Filename);
-                        var fallback = new DirectoryInfo(customDir)
-                            .GetFiles("*" + ext, SearchOption.TopDirectoryOnly)
-                            .Where(f => f.Name.StartsWith(Path.GetFileNameWithoutExtension(img.Filename), StringComparison.OrdinalIgnoreCase))
-                            .OrderByDescending(f => f.LastWriteTimeUtc)
-                            .FirstOrDefault();
-                        if (fallback != null && (DateTime.UtcNow - fallback.LastWriteTimeUtc).TotalMinutes < 10)
-                        {
-                            try
-                            {
-                                bytes = await File.ReadAllBytesAsync(fallback.FullName, ct);
-                                Log($"按名称前缀匹配自定义目录: {fallback.FullName}");
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                throw;
-                            }
-                            catch (Exception ex)
-                            {
-                                LogWarn($"读取本地文件失败 {fallback.FullName}: {ex.Message}");
-                            }
+                            LogWarn($"读取本地文件失败 {localFile.FullName}: {ex.Message}");
                         }
                     }
                 }
@@ -939,6 +1128,81 @@ public class ComfyuiService(
         return null;
     }
 
+    static FileInfo? TryClaimCustomOutput(
+        string directory,
+        DateTime generationStartedUtc,
+        string? expectedFilename = null)
+    {
+        if (!Directory.Exists(directory))
+            return null;
+
+        var expectedName = string.IsNullOrWhiteSpace(expectedFilename)
+            ? null
+            : Path.GetFileName(expectedFilename);
+        var expectedStem = expectedName == null
+            ? null
+            : Path.GetFileNameWithoutExtension(expectedName);
+        var expectedExtension = expectedName == null
+            ? null
+            : Path.GetExtension(expectedName);
+
+        IEnumerable<FileInfo> candidates = new DirectoryInfo(directory)
+            .GetFiles("*.*", SearchOption.TopDirectoryOnly)
+            .Where(file => IsOutputImageExtension(file.Extension))
+            .Where(file => file.LastWriteTimeUtc >= generationStartedUtc);
+
+        if (expectedName != null)
+        {
+            candidates = candidates
+                .Where(file => file.Name.Equals(expectedName, StringComparison.OrdinalIgnoreCase)
+                               || file.Extension.Equals(expectedExtension, StringComparison.OrdinalIgnoreCase)
+                                  && file.Name.StartsWith(expectedStem!, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(file => file.Name.Equals(expectedName, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenByDescending(file => file.LastWriteTimeUtc);
+        }
+        else
+        {
+            candidates = candidates.OrderByDescending(file => file.LastWriteTimeUtc);
+        }
+
+        foreach (var file in candidates)
+        {
+            file.Refresh();
+            if (!file.Exists || file.LastWriteTimeUtc < generationStartedUtc)
+                continue;
+
+            var key = $"{file.FullName}|{file.LastWriteTimeUtc.Ticks}|{file.Length}";
+            if (ClaimedCustomOutputs.TryAdd(key, DateTime.UtcNow.Ticks))
+            {
+                PruneCustomOutputClaims();
+                return file;
+            }
+        }
+
+        return null;
+    }
+
+    static bool IsOutputImageExtension(string extension)
+        => extension.Equals(".png", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals(".webp", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals(".gif", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals(".bmp", StringComparison.OrdinalIgnoreCase);
+
+    static void PruneCustomOutputClaims()
+    {
+        if (ClaimedCustomOutputs.Count <= 4096)
+            return;
+
+        var cutoff = DateTime.UtcNow.AddDays(-1).Ticks;
+        foreach (var claim in ClaimedCustomOutputs)
+        {
+            if (claim.Value < cutoff)
+                ClaimedCustomOutputs.TryRemove(claim.Key, out _);
+        }
+    }
+
     // ===================== 路径 =====================
 
     Dictionary<string, (int w, int h)> GetOrientationPresets(ComfyuiConfig cfg)
@@ -1137,6 +1401,16 @@ public class ComfyuiService(
         // 回退：Storage/Plugins/Alife.Plugin.Comfyui
         var fallback = Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui");
         return fallback;
+    }
+
+    string ResolveCharacterCatalogPath()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(GetPluginDirectory(), "character-prompts.json"),
+            Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui", "character-prompts.json"),
+        };
+        return candidates.FirstOrDefault(File.Exists) ?? candidates[0];
     }
 
     static string Truncate(string s, int max)

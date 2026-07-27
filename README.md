@@ -10,7 +10,45 @@
 - **固定正向提示词前缀**：生图时自动拼到正向提示词最前面，内部换行原样保留
 - **固定负面提示词**：可选，留空则使用工作流自带负面
 - **多工作流**：可配置多个命名工作流，AI 通过 `workflow` 参数切换
+- **角色提示词检索**：内置 8906 个角色的中文/英文/别名索引，支持错字、部分名称与作品名消歧
 - AI 调用参数：正向提示词（必填）、方向 / 宽高（可选）
+
+## 角色提示词检索
+
+插件启动时会一次性加载 `character-prompts.json`，角色数据不会注入系统提示词。只有用户明确要画某个已有动漫、游戏、漫画或 VTuber 角色时，模型才应调用：
+
+```xml
+<findcharacterprompt name="初音未来" work="VOCALOID"/>
+```
+
+普通人物、真人、原创角色、Bot 自己的人设，以及只指定服装、动作或画风的请求都不检索，直接由 Bot 编写提示词。
+
+匹配成功会返回三段英文 Tag：
+
+- `trigger_tags_xml`：角色触发词与作品标识，必须保留
+- `appearance_tags_xml`：稳定外貌特征，必须保留
+- `default_outfit_tags_xml`：默认服装；用户没有指定服装时才使用
+
+返回字段已经过 XML 属性转义。组合进函数调用时应保留 `&amp;` 等转义写法。若结果为 `status: ambiguous`，函数只返回候选、不返回任何 Tag；应带作品名 `work` 重新查询，不能使用“最像”的候选猜测生图。
+
+例如“雷姆穿哥特萝莉服”：保留雷姆的 `trigger_tags_xml` 和 `appearance_tags_xml`，舍弃默认女仆装，追加哥特萝莉服、当前动作、构图与场景。这样角色身份稳定，但服装和画面仍可自由变化。
+
+- 中文常用名、英文 Danbooru Tag 和当前两个词库可验证的别名都会参与搜索
+- 无当前来源佐证的旧译名不进入运行时索引；已验证别名的权重仍低于规范名
+- 支持少量错字、名称片段和括号前的角色本名
+- 1–2 字短名称不做单字纠错，避免把不同角色强行猜成同一人
+- 短名称、同名角色或多个版本建议同时传 `work`
+- 精简 JSON 运行时索引约 3.0 MiB，加载后在本地搜索，不消耗对话 token
+
+校订版工作簿位于 `outputs/character-prompt-index/角色提示词校订版.xlsx`，包含筛选状态、别名与逐行来源。
+
+### 角色数据来源
+
+- 译名主词库：<https://github.com/ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table>
+- 译名交叉校验：<https://github.com/sw1313/danbooru-tags-translation>
+- 结构化外貌/服装：<https://github.com/tcpassos/mcp-danbooru-characters>
+
+外貌 Tag 反映 Danbooru/模型训练分布，不等同于官方角色设定。性转或同人占比高的角色可能出现与原作不同的性别或服装 Tag。上述译名库还包含各自的上游数据与许可要求；发布含数据文件的插件包前应再次核对来源许可。
 
 ## 分辨率三档
 
@@ -39,6 +77,14 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 生图时实际发送给 ComfyUI 的正向提示词为：`前缀` + 换行 + `AI 传入的 prompt`。
 前缀内部的空行会被原样保留（分段作用不受影响）。
 
+## 提示词模式
+
+- `natural`：检索到的角色 Tag 原样置前，后接 2–4 个简洁英文短句描述服装、动作、构图、场景和光线
+- `hybrid`：身份、外貌、服装和表情用 Tag，复杂动作、人物关系、构图和场景用简洁英文短句
+- `tag`：全程使用去重、无冲突的 Danbooru 风格英文 Tag，按身份、人数、外貌、服装、动作、构图、背景、光线排序
+
+三种模式都使用英文提示词，不把用户中文命令原句直接塞进工作流。
+
 ## 使用
 
 1. 启动 ComfyUI
@@ -49,17 +95,12 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 
 ## AI 调用示例
 
-```
+```xml
 <!-- 竖版立绘 -->
-<function>GenerateImage</function>
-<arg name="prompt">1girl, hololive, tokoyami towa, demon tail, ...</arg>
-<arg name="orientation">portrait</arg>
+<generateimage prompt="1girl, hololive, tokoyami towa, demon tail, ..." orientation="portrait"/>
 
 <!-- 横版风景，自定义宽高 -->
-<function>GenerateImage</function>
-<arg name="prompt">a beautiful landscape, mountains, sunset</arg>
-<arg name="width">1216</arg>
-<arg name="height">832</arg>
+<generateimage prompt="a beautiful landscape, mountains, sunset" width="1216" height="832"/>
 ```
 
 ## 节点自动识别
@@ -83,7 +124,7 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 
 - 自定义节点（WeiLin / ZML / LoRA 等）必须在 ComfyUI 侧已安装
 - UI 工作流中的 **Anything Everywhere** 会尽量通过 `ue_links` 还原；若失败，请改用 API 导出或显式连线
-- 若 history 无图但 ZML 保存到了自定义目录，插件会尝试从该目录复制最新图片
+- 若 history 无图但 ZML 保存到了自定义目录，插件只会认领本次任务开始后新写入且尚未被其他任务认领的图片
 - `workflows/艾芙.json` 仅作为示例工作流，可替换为任意你自己的工作流
 
 ## 与本地 TTS 同机（可选）
@@ -107,6 +148,14 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v1.1.0（2026-07-28）
+
+- 新增 8906 个二次元角色的本地中英文、别名、错字与作品名模糊检索
+- 返回角色触发词、稳定外貌和默认服装三段 Tag；指定新服装时保留角色身份与外貌、舍弃默认服装
+- 原创角色、Bot 自身人设、真人和普通人物不调用角色检索；歧义结果只返候选、不返猜测 Tag
+- 精简系统提示词并按配置动态裁剪函数文档；高级节点参数改为按需查询
+- 限制节点覆盖范围，修复 `batch_size`、XML 转义、重复 Tag、自定义输出并发误匹配和后台启动异常
 
 ### v1.0.5（2026-07-27）
 

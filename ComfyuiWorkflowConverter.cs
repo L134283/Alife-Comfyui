@@ -694,16 +694,26 @@ public static class ComfyuiWorkflowConverter
 
     // ===================== AI 节点控制 =====================
 
-    /// <summary>
-    /// 向 AI 描述当前工作流中可操控的节点及参数。
-    /// 用于 EnableNodeControl 开启时注入 AI 提示词。
-    /// </summary>
+    static readonly HashSet<string> AiVisibleNodeFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ckpt_name", "steps", "cfg", "cfg_scale", "sampler_name", "scheduler",
+        "denoise", "batch_size", "width", "height"
+    };
+
+    static readonly string[] SensitiveOverrideFragments =
+    {
+        "path", "save", "directory", "url", "command", "script", "token", "password",
+        "filename", "file_name", "保存", "路径", "目录", "地址", "命令", "脚本", "令牌", "密码"
+    };
+
+    /// <summary>按需描述允许 AI 操作的安全标量参数。</summary>
     public static string BuildNodeControlDescription(JsonObject prompt)
     {
         var lines = new List<string>();
 
         foreach (var kv in prompt)
         {
+            if (lines.Count >= 40) break;
             if (kv.Value is not JsonObject node) continue;
             var ct = node["class_type"]?.GetValue<string>() ?? "";
             var inputs = node["inputs"] as JsonObject;
@@ -712,15 +722,11 @@ public static class ComfyuiWorkflowConverter
             var widgets = new List<string>();
             foreach (var ikv in inputs)
             {
-                if (ikv.Value is JsonArray) continue; // 连线输入，跳过
-                var valStr = ikv.Value switch
-                {
-                    JsonValue jv => jv.GetValue<object>()?.ToString() ?? "?",
-                    _ => null
-                };
-                if (valStr == null) continue;
-                // 截断过长的值
-                if (valStr.Length > 40) valStr = valStr[..37] + "...";
+                if (widgets.Count >= 10) break;
+                if (!AiVisibleNodeFields.Contains(ikv.Key) || ikv.Value is not JsonValue)
+                    continue;
+                var valStr = ikv.Value.ToString();
+                if (valStr.Length > 80) valStr = valStr[..77] + "...";
                 widgets.Add($"{ikv.Key}={valStr}");
             }
 
@@ -731,7 +737,7 @@ public static class ComfyuiWorkflowConverter
 
         if (lines.Count == 0) return "当前工作流无可调节点。";
 
-        return "当前工作流节点参数一览：\n" + string.Join("\n", lines);
+        return "允许调整的节点参数：\n" + string.Join("\n", lines);
     }
 
     /// <summary>
@@ -747,9 +753,11 @@ public static class ComfyuiWorkflowConverter
         string? sampler = null,
         string? scheduler = null,
         double? denoise = null,
-        int? batchSize = null,
+        int? batch_size = null,
         string? rawOverrides = null)
     {
+        ValidateSemanticOverrides(model, steps, cfg, sampler, scheduler, denoise, batch_size);
+
         foreach (var kv in prompt)
         {
             if (kv.Value is not JsonObject node) continue;
@@ -793,38 +801,125 @@ public static class ComfyuiWorkflowConverter
             }
 
             // 批次大小：EmptyLatentImage
-            if (batchSize.HasValue && ct.Contains("EmptyLatent", StringComparison.OrdinalIgnoreCase))
+            if (batch_size.HasValue && ct.Contains("EmptyLatent", StringComparison.OrdinalIgnoreCase))
             {
                 if (inputs.ContainsKey("batch_size"))
-                    inputs["batch_size"] = batchSize.Value;
+                    inputs["batch_size"] = batch_size.Value;
             }
         }
 
-        // 原始 JSON 兜底覆盖（按节点 ID 精确控制）
+        // 原始覆盖仅允许现有节点的现有标量字段，禁止连线和路径类参数。
         if (!string.IsNullOrWhiteSpace(rawOverrides))
+            ApplyValidatedRawOverrides(prompt, rawOverrides);
+    }
+
+    static void ValidateSemanticOverrides(
+        string? model, int? steps, double? cfg, string? sampler, string? scheduler,
+        double? denoise, int? batch_size)
+    {
+        if (model?.Length > 260)
+            throw new ArgumentOutOfRangeException(nameof(model), "模型名称过长");
+        if (sampler?.Length > 80)
+            throw new ArgumentOutOfRangeException(nameof(sampler), "采样器名称过长");
+        if (scheduler?.Length > 80)
+            throw new ArgumentOutOfRangeException(nameof(scheduler), "调度器名称过长");
+        if (steps is < 1 or > 200)
+            throw new ArgumentOutOfRangeException(nameof(steps), "steps 必须在 1~200 之间");
+        if (cfg is < 0 or > 30)
+            throw new ArgumentOutOfRangeException(nameof(cfg), "cfg 必须在 0~30 之间");
+        if (denoise is < 0 or > 1)
+            throw new ArgumentOutOfRangeException(nameof(denoise), "denoise 必须在 0~1 之间");
+        if (batch_size is < 1 or > 16)
+            throw new ArgumentOutOfRangeException(nameof(batch_size), "batch_size 必须在 1~16 之间");
+    }
+
+    static void ApplyValidatedRawOverrides(JsonObject prompt, string rawOverrides)
+    {
+        if (rawOverrides.Length > 8192)
+            throw new ArgumentException("nodeOverrides 不能超过 8192 个字符", nameof(rawOverrides));
+
+        JsonObject overrides;
+        try
         {
-            try
+            overrides = JsonNode.Parse(rawOverrides) as JsonObject
+                ?? throw new ArgumentException("nodeOverrides 顶层必须是 JSON 对象");
+        }
+        catch (JsonException ex)
+        {
+            throw new ArgumentException($"nodeOverrides JSON 无效: {ex.Message}", nameof(rawOverrides));
+        }
+
+        var pending = new List<(JsonObject Inputs, string Field, JsonNode Value)>();
+        var overrideCount = 0;
+        foreach (var nodeOverride in overrides)
+        {
+            if (prompt[nodeOverride.Key] is not JsonObject targetNode)
+                throw new ArgumentException($"nodeOverrides 包含不存在的节点 #{nodeOverride.Key}");
+            if (targetNode["inputs"] is not JsonObject targetInputs)
+                throw new ArgumentException($"节点 #{nodeOverride.Key} 没有可覆盖的 inputs");
+            if (nodeOverride.Value is not JsonObject fields)
+                throw new ArgumentException($"节点 #{nodeOverride.Key} 的覆盖值必须是 JSON 对象");
+
+            foreach (var fieldOverride in fields)
             {
-                var overridesNode = JsonNode.Parse(rawOverrides) as JsonObject;
-                if (overridesNode != null)
-                {
-                    foreach (var ov in overridesNode)
-                    {
-                        if (prompt[ov.Key] is not JsonObject targetNode) continue;
-                        var targetInputs = targetNode["inputs"] as JsonObject;
-                        if (targetInputs == null || ov.Value is not JsonObject ovInputs) continue;
-                        foreach (var iv in ovInputs)
-                        {
-                            targetInputs[iv.Key] = iv.Value?.DeepClone();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ComfyUI][警告] nodeOverrides JSON 解析失败: {ex.Message}");
+                if (++overrideCount > 32)
+                    throw new ArgumentException("nodeOverrides 最多允许 32 个字段");
+                if (IsSensitiveOverrideField(fieldOverride.Key))
+                    throw new ArgumentException($"禁止覆盖敏感字段 #{nodeOverride.Key}.{fieldOverride.Key}");
+                if (!targetInputs.TryGetPropertyValue(fieldOverride.Key, out var currentValue))
+                    throw new ArgumentException($"节点 #{nodeOverride.Key} 不存在字段 {fieldOverride.Key}");
+                if (currentValue is not JsonValue || fieldOverride.Value is not JsonValue newValue)
+                    throw new ArgumentException(
+                        $"#{nodeOverride.Key}.{fieldOverride.Key} 只允许标量值，不能修改连线、对象或数组");
+                if (!AreCompatibleScalarTypes(currentValue, newValue))
+                    throw new ArgumentException($"#{nodeOverride.Key}.{fieldOverride.Key} 的值类型不匹配");
+                if (newValue.GetValueKind() == JsonValueKind.String
+                    && (newValue.GetValue<string>()?.Length ?? 0) > 512)
+                    throw new ArgumentException($"#{nodeOverride.Key}.{fieldOverride.Key} 的字符串值过长");
+
+                ValidateKnownRawRange(fieldOverride.Key, newValue);
+                pending.Add((targetInputs, fieldOverride.Key, newValue.DeepClone()));
             }
         }
+
+        foreach (var change in pending)
+            change.Inputs[change.Field] = change.Value;
+    }
+
+    static bool IsSensitiveOverrideField(string field)
+        => SensitiveOverrideFragments.Any(fragment =>
+            field.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+
+    static bool AreCompatibleScalarTypes(JsonNode currentValue, JsonValue newValue)
+    {
+        var currentKind = currentValue.GetValueKind();
+        var newKind = newValue.GetValueKind();
+        if (currentKind is JsonValueKind.True or JsonValueKind.False)
+            return newKind is JsonValueKind.True or JsonValueKind.False;
+        return currentKind == newKind
+               && currentKind is JsonValueKind.String or JsonValueKind.Number;
+    }
+
+    static void ValidateKnownRawRange(string field, JsonValue value)
+    {
+        if (value.GetValueKind() != JsonValueKind.Number)
+            return;
+
+        var number = value.GetValue<double>();
+        if (field.Equals("steps", StringComparison.OrdinalIgnoreCase) && number is < 1 or > 200)
+            throw new ArgumentOutOfRangeException(field, "steps 必须在 1~200 之间");
+        if ((field.Equals("cfg", StringComparison.OrdinalIgnoreCase)
+             || field.Equals("cfg_scale", StringComparison.OrdinalIgnoreCase))
+            && number is < 0 or > 30)
+            throw new ArgumentOutOfRangeException(field, "cfg 必须在 0~30 之间");
+        if (field.Equals("denoise", StringComparison.OrdinalIgnoreCase) && number is < 0 or > 1)
+            throw new ArgumentOutOfRangeException(field, "denoise 必须在 0~1 之间");
+        if (field.Equals("batch_size", StringComparison.OrdinalIgnoreCase) && number is < 1 or > 16)
+            throw new ArgumentOutOfRangeException(field, "batch_size 必须在 1~16 之间");
+        if ((field.Equals("width", StringComparison.OrdinalIgnoreCase)
+             || field.Equals("height", StringComparison.OrdinalIgnoreCase))
+            && number is < 64 or > 4096)
+            throw new ArgumentOutOfRangeException(field, "width/height 必须在 64~4096 之间");
     }
 
     static bool IsCheckpointLoader(string classType)
