@@ -26,11 +26,23 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     List<WorkflowCard> _workflowCards = new();
     int _activeScanCardIndex = -1; // 当前展开浏览下拉的卡片索引
 
+    // 提示词预设卡片管理
+    List<PresetCard> _presetCards = new();
+    int _activePresetIndex = -1; // 当前展开编辑的预设索引
+    string _newPresetName = "";
+    string _newPresetContent = "";
+
     record WorkflowCard
     {
         public string Name { get; set; } = "";
         public string Path { get; set; } = "";
         public bool Enabled { get; set; } = true;
+    }
+
+    record PresetCard
+    {
+        public string Name { get; set; } = "";
+        public string Content { get; set; } = "";
     }
 
     const string Css = @"
@@ -1432,6 +1444,192 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     background: linear-gradient(90deg, rgba(244,114,182,0.15), rgba(236,72,153,0.08));
     color: #be185d;
 }
+
+/* ========== 提示词预设卡片 ========== */
+.cfy-ps-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 8px 0;
+}
+.cfy-ps-card {
+    border-radius: 14px;
+    background: linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,240,247,0.7));
+    border: 1px solid rgba(244,114,182,0.25);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 16px rgba(244,114,182,0.08);
+    transition: all 0.3s cubic-bezier(.16,1,.3,1);
+    overflow: hidden;
+    position: relative;
+}
+.cfy-ps-card:hover {
+    border-color: #f9a8d4;
+    box-shadow: 0 8px 24px rgba(236,72,153,0.14);
+}
+.cfy-ps-card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 4px;
+    border-radius: 4px 0 0 4px;
+    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9);
+    opacity: 1;
+}
+.cfy-ps-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px 10px 18px;
+    cursor: pointer;
+}
+.cfy-ps-name {
+    flex: 1;
+    font-size: 13px;
+    font-weight: 700;
+    color: #9d174d;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cfy-ps-preview {
+    font-size: 11px;
+    color: #a85569;
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.cfy-ps-expand {
+    color: #d6608a;
+    font-size: 12px;
+    flex-shrink: 0;
+    transition: transform 0.3s ease;
+}
+.cfy-ps-card.expanded .cfy-ps-expand { transform: rotate(90deg); }
+.cfy-ps-body {
+    padding: 0 14px 12px 18px;
+    display: none;
+}
+.cfy-ps-card.expanded .cfy-ps-body { display: block; }
+.cfy-ps-textarea {
+    width: 100%;
+    min-height: 80px;
+    border: 1.5px solid rgba(244,114,182,0.25);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #5b2145;
+    background: rgba(255,255,255,0.85);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+    resize: vertical;
+}
+.cfy-ps-textarea:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
+}
+.cfy-ps-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+.cfy-ps-btn {
+    padding: 6px 14px;
+    border-radius: 10px;
+    border: 1.5px solid rgba(244,114,182,0.35);
+    background: rgba(255,255,255,0.85);
+    color: #be185d;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: all 0.3s ease;
+}
+.cfy-ps-btn:hover {
+    background: linear-gradient(135deg, #f9a8d4, #f472b6);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 3px 12px rgba(236,72,153,0.35);
+}
+.cfy-ps-btn.danger {
+    border-color: rgba(220,38,38,0.3);
+    color: #b91c1c;
+}
+.cfy-ps-btn.danger:hover {
+    background: linear-gradient(135deg, #f87171, #ef4444);
+    color: #fff;
+    border-color: transparent;
+}
+.cfy-ps-add-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+.cfy-ps-add-name {
+    width: 120px;
+    border: 1.5px solid rgba(244,114,182,0.25);
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #9d174d;
+    background: rgba(255,255,255,0.8);
+    font-family: inherit;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+}
+.cfy-ps-add-name:focus { border-color: #ec4899; box-shadow: 0 0 0 3px rgba(236,72,153,0.12); }
+.cfy-ps-add-content {
+    flex: 1;
+    min-width: 200px;
+    min-height: 40px;
+    border: 1.5px solid rgba(244,114,182,0.25);
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #5b2145;
+    background: rgba(255,255,255,0.8);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+    resize: vertical;
+}
+.cfy-ps-add-content:focus { border-color: #ec4899; box-shadow: 0 0 0 3px rgba(236,72,153,0.12); }
+.cfy-ps-add-btn {
+    padding: 6px 16px;
+    border-radius: 10px;
+    border: none;
+    background: linear-gradient(135deg, #f472b6, #ec4899);
+    color: #fff;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+    box-shadow: 0 3px 12px rgba(236,72,153,0.3);
+}
+.cfy-ps-add-btn:hover {
+    background: linear-gradient(135deg, #ec4899, #db2777);
+    box-shadow: 0 6px 20px rgba(236,72,153,0.45);
+    transform: translateY(-1px);
+}
+.cfy-ps-empty {
+    text-align: center;
+    padding: 16px;
+    color: #a85569;
+    font-size: 12px;
+    opacity: 0.7;
+}
 ";
 
     protected override void BuildRenderTree(RenderTreeBuilder b)
@@ -1531,16 +1729,15 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(i++, "class", "cfy-alert");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-alert-title");
-        b.AddContent(i++, "使用说明");
+        b.AddContent(i++, "功能说明");
         b.CloseElement();
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-alert-desc");
         b.AddContent(i++,
-            "1. 先启动 ComfyUI（默认 http://127.0.0.1:8188）\n" +
-            "2. 工作流可填 UI 格式或 API 格式，插件会自动转换\n" +
-            "3. AI 调用 GenerateImage(prompt, orientation?, width?, height?) 生图\n" +
-            "4. 修改配置后需重新加载模块生效\n" +
-            "5. 分辨率三档：portrait 竖版 / landscape 横版 / square 正方形");
+            "【角色提示词检索】内置数千个动漫/游戏角色的中英文索引，AI 生图前可自动检索角色触发词、稳定外貌和默认服装，大幅提升角色还原度。原创角色和普通人物不检索。\n" +
+            "【提示词预设】可在下方保存常用提示词片段（角色人设/动作/背景），AI 生图时按需调用复用。支持实时增删改；也可在聊天中直接发预设内容给 AI，让 AI 自主调用函数存储。\n" +
+            "【使用步骤】1. 启动 ComfyUI → 2. 配置地址和工作流 → 3. AI 调用 GenerateImage 生图\n" +
+            "【分辨率】portrait 竖版 / landscape 横版 / square 正方形，AI 智能选择或手动指定");
         b.CloseElement();
         b.CloseElement();
 
@@ -1764,6 +1961,138 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddContent(i++, "+ 添加工作流");
         b.CloseElement();
 
+        b.CloseElement(); // panel
+
+        // ========== 提示词预设 ==========
+        AddSection(b, ref i, "提示词预设");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+
+        AddHint(b, ref i, "保存常用提示词片段（角色人设/复杂动作/完整背景），AI 生图时按需调用复用。实时增删改即时生效；也可在聊天中发预设内容给 AI，让 AI 自主调用 savepromptpreset 存储。");
+
+        if (_presetCards.Count == 0) LoadPresetCards();
+
+        // 新增预设输入区
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-ps-add-row");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "class", "cfy-ps-add-name");
+        b.AddAttribute(i++, "value", _newPresetName);
+        b.AddAttribute(i++, "placeholder", "预设名称");
+        b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            _newPresetName = e.Value?.ToString() ?? "";
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "textarea");
+        b.AddAttribute(i++, "class", "cfy-ps-add-content");
+        b.AddAttribute(i++, "value", _newPresetContent);
+        b.AddAttribute(i++, "placeholder", "提示词内容（tag 串或自然语言）...");
+        b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            _newPresetContent = e.Value?.ToString() ?? "";
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cfy-ps-add-btn");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            AddPresetCard();
+        }));
+        b.AddContent(i++, "+ 保存预设");
+        b.CloseElement();
+        b.CloseElement(); // add-row
+
+        // 预设卡片列表
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-ps-list");
+
+        if (_presetCards.Count == 0)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-ps-empty");
+            b.AddContent(i++, "暂无预设。上方输入名称和内容后点「保存预设」，或在聊天中发内容给 AI 让其自主存储");
+            b.CloseElement();
+        }
+
+        for (int pi = 0; pi < _presetCards.Count; pi++)
+        {
+            var presetIndex = pi;
+            var preset = _presetCards[pi];
+            var expanded = _activePresetIndex == pi;
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", $"cfy-ps-card{(expanded ? " expanded" : "")}");
+
+            // 卡片头部（点击展开）
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-ps-head");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+            {
+                TogglePresetExpand(presetIndex);
+            }));
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-ps-name");
+            b.AddContent(i++, preset.Name);
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-ps-preview");
+            var preview = preset.Content.Length > 50
+                ? preset.Content[..50] + "..." : preset.Content;
+            b.AddContent(i++, preview);
+            b.CloseElement();
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cfy-ps-expand");
+            b.AddContent(i++, "▶");
+            b.CloseElement();
+            b.CloseElement(); // head
+
+            // 展开内容（编辑区）
+            if (expanded)
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cfy-ps-body");
+
+                b.OpenElement(i++, "input");
+                b.AddAttribute(i++, "class", "cfy-ps-add-name");
+                b.AddAttribute(i++, "style", "width:100%;margin-bottom:8px;");
+                b.AddAttribute(i++, "value", preset.Name);
+                b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                {
+                    UpdatePresetCardName(presetIndex, e.Value?.ToString() ?? "");
+                }));
+                b.CloseElement();
+
+                b.OpenElement(i++, "textarea");
+                b.AddAttribute(i++, "class", "cfy-ps-textarea");
+                b.AddAttribute(i++, "value", preset.Content);
+                b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                {
+                    UpdatePresetCardContent(presetIndex, e.Value?.ToString() ?? "");
+                }));
+                b.CloseElement();
+
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cfy-ps-actions");
+                b.OpenElement(i++, "button");
+                b.AddAttribute(i++, "type", "button");
+                b.AddAttribute(i++, "class", "cfy-ps-btn danger");
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+                {
+                    RemovePresetCard(presetIndex);
+                }));
+                b.AddContent(i++, "删除");
+                b.CloseElement();
+                b.CloseElement(); // actions
+
+                b.CloseElement(); // body
+            }
+
+            b.CloseElement(); // card
+        }
+
+        b.CloseElement(); // ps-list
         b.CloseElement(); // panel
 
         // 提示词
@@ -2550,6 +2879,107 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     void ToggleWorkflowScan(int index)
     {
         _activeScanCardIndex = _activeScanCardIndex == index ? -1 : index;
+        StateHasChanged();
+    }
+
+    // ===================== 提示词预设卡片管理 =====================
+
+    void LoadPresetCards()
+    {
+        _presetCards = new();
+        var path = ComfyuiService.GetPresetFilePath();
+        if (!File.Exists(path)) return;
+        try
+        {
+            var json = System.IO.File.ReadAllText(path, System.Text.Encoding.UTF8);
+            var arr = System.Text.Json.Nodes.JsonNode.Parse(json) as System.Text.Json.Nodes.JsonArray;
+            if (arr != null)
+            {
+                foreach (var item in arr.OfType<System.Text.Json.Nodes.JsonObject>())
+                {
+                    _presetCards.Add(new PresetCard
+                    {
+                        Name = item["n"]?.GetValue<string>() ?? item["name"]?.GetValue<string>() ?? "",
+                        Content = item["c"]?.GetValue<string>() ?? item["content"]?.GetValue<string>() ?? ""
+                    });
+                }
+            }
+        }
+        catch { }
+    }
+
+    void SavePresetCards()
+    {
+        var path = ComfyuiService.GetPresetFilePath();
+        try
+        {
+            var dir = System.IO.Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir) && !System.IO.Directory.Exists(dir))
+                System.IO.Directory.CreateDirectory(dir);
+
+            var arr = new System.Text.Json.Nodes.JsonArray();
+            foreach (var card in _presetCards)
+            {
+                arr.Add(new System.Text.Json.Nodes.JsonObject
+                {
+                    ["n"] = card.Name,
+                    ["c"] = card.Content
+                });
+            }
+            System.IO.File.WriteAllText(path, arr.ToJsonString(), System.Text.Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    void AddPresetCard()
+    {
+        var name = _newPresetName?.Trim() ?? "";
+        var content = _newPresetContent?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            StateHasChanged();
+            return;
+        }
+        if (name.Length > 60) name = name[..60];
+        if (content.Length > 4000) content = content[..4000];
+
+        // 同名覆盖
+        _presetCards = _presetCards
+            .Where(c => !c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        _presetCards.Add(new PresetCard { Name = name, Content = content });
+        _newPresetName = "";
+        _newPresetContent = "";
+        SavePresetCards();
+        StateHasChanged();
+    }
+
+    void RemovePresetCard(int index)
+    {
+        if (index < 0 || index >= _presetCards.Count) return;
+        _presetCards.RemoveAt(index);
+        _activePresetIndex = -1;
+        SavePresetCards();
+        StateHasChanged();
+    }
+
+    void UpdatePresetCardName(int index, string name)
+    {
+        if (index < 0 || index >= _presetCards.Count) return;
+        _presetCards[index] = _presetCards[index] with { Name = name };
+        SavePresetCards();
+    }
+
+    void UpdatePresetCardContent(int index, string content)
+    {
+        if (index < 0 || index >= _presetCards.Count) return;
+        _presetCards[index] = _presetCards[index] with { Content = content };
+        SavePresetCards();
+    }
+
+    void TogglePresetExpand(int index)
+    {
+        _activePresetIndex = _activePresetIndex == index ? -1 : index;
         StateHasChanged();
     }
 }

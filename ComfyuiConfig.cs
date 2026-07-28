@@ -104,6 +104,9 @@ public class ComfyuiConfig
     [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"文生图\",\"p\":\"workflows/txt2img.json\",\"e\":true}]。n=名称 p=路径 e=启用")]
     public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":false},{\"n\":\"图生图\",\"p\":\"\",\"e\":false},{\"n\":\"其他\",\"p\":\"\",\"e\":false}]";
 
+    [Description("提示词预设列表（JSON 数组）。格式：[{\"n\":\"预设名\",\"c\":\"提示词内容\"}]。AI 可通过 getpromptpreset 按需检索复用")]
+    public string PromptPresets { get; set; } = "[]";
+
     [Description("默认工作流的图生图 LoadImage 节点 ID。留空则自动识别；命名工作流始终独立识别")]
     public string LoadImageNodeId { get; set; } = "";
 

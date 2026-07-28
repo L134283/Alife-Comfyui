@@ -24,7 +24,11 @@ public static class ComfyuiWorkflowConverter
             "Note", "Reroute", "PrimitiveNode",
             "Anything Everywhere", "Anything Everywhere3",
             "Anything Everywhere?", "Prompts Everywhere",
-            "Seed Everywhere", "Simple String"
+            "Seed Everywhere", "Simple String",
+            // GetNode/SetNode 是 KJNodes 的跨图引用辅助节点，
+            // 变量名在 widgets_values[0]；在 ToApiPrompt 中已把指向 GetNode 的
+            // 连接重定向到 SetNode 的源节点，故两者本身不进 API prompt。
+            "GetNode", "SetNode"
         };
 
     static readonly HashSet<string> ConnectionTypes =
@@ -91,6 +95,48 @@ public static class ComfyuiWorkflowConverter
                     continue;
                 ueMap[(down, downSlot)] = (up, upSlot);
             }
+        }
+
+        // GetNode/SetNode 跨图引用解析（KJNodes）
+        // SetNode: widgets_values[0]=变量名, inputs[0].link=源连接
+        // GetNode: widgets_values[0]=变量名, 输出连接需重定向到 SetNode 的源节点
+        var setVarMap = new Dictionary<string, int>(StringComparer.Ordinal);
+        var getRedirectMap = new Dictionary<int, int>();
+        foreach (var nodeNode in nodes.OfType<JsonObject>())
+        {
+            var classType = nodeNode["type"]?.GetValue<string>() ?? "";
+            var id = nodeNode["id"]?.GetValue<int>() ?? -1;
+            if (id < 0) continue;
+
+            if (classType.Equals("SetNode", StringComparison.OrdinalIgnoreCase))
+            {
+                var widgets = nodeNode["widgets_values"] as JsonArray;
+                var varName = widgets?[0]?.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(varName)) continue;
+                var inputs = nodeNode["inputs"] as JsonArray;
+                var firstInput = inputs?.FirstOrDefault();
+                int? link = firstInput?["link"]?.GetValue<int>();
+                if (link.HasValue && linkMap.TryGetValue(link.Value, out var src))
+                    setVarMap[varName] = src.srcNode;
+            }
+            else if (classType.Equals("GetNode", StringComparison.OrdinalIgnoreCase))
+            {
+                var widgets = nodeNode["widgets_values"] as JsonArray;
+                var varName = widgets?[0]?.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(varName)) continue;
+                if (setVarMap.TryGetValue(varName, out var srcNode))
+                    getRedirectMap[id] = srcNode;
+            }
+        }
+
+        // 重定向 linkMap 中指向 GetNode 的连接到 SetNode 的源节点
+        if (getRedirectMap.Count > 0)
+        {
+            var keysToUpdate = linkMap
+                .Where(kv => getRedirectMap.ContainsKey(kv.Value.srcNode))
+                .ToList();
+            foreach (var kv in keysToUpdate)
+                linkMap[kv.Key] = (getRedirectMap[kv.Value.srcNode], kv.Value.srcSlot);
         }
 
         var prompt = new JsonObject();
@@ -509,13 +555,16 @@ public static class ComfyuiWorkflowConverter
 
     /// <summary>
     /// 通过采样器 positive/negative 输入的连接关系识别正/负面提示词节点。
-    /// 对原生 ComfyUI 工作流（CLIPTextEncode）与第三方节点（WeiLinPromptUI 等）均通用。
+    /// 多采样器工作流（一采+二采+局部重绘）时收集全部启用采样器，
+    /// 正向取追溯到的提示词节点中文本最长者（主提示词通常最长），
+    /// 负向取文本最短者（负向通常较短）且排除已选正向节点。
     /// 连接关系未命中时回退到启发式。
     /// </summary>
     public static (string? positiveId, string? negativeId) FindPositiveAndNegativeIds(JsonObject prompt)
     {
-        string? posId = null, negId = null;
-
+        // 收集所有启用采样器的 positive/negative 源节点 ID
+        var posCandidates = new List<string>();
+        var negCandidates = new List<string>();
         foreach (var kv in prompt)
         {
             if (kv.Value is not JsonObject node) continue;
@@ -524,15 +573,36 @@ public static class ComfyuiWorkflowConverter
             var inputs = node["inputs"] as JsonObject;
             if (inputs == null) continue;
 
-            if (posId == null && inputs["positive"] is JsonArray pArr && pArr.Count > 0)
-                posId = pArr[0]?.GetValue<string>();
-            if (negId == null && inputs["negative"] is JsonArray nArr && nArr.Count > 0)
-                negId = nArr[0]?.GetValue<string>();
+            if (inputs["positive"] is JsonArray pArr && pArr.Count > 0
+                && pArr[0]?.GetValue<string>() is string pId)
+                posCandidates.Add(pId);
+            if (inputs["negative"] is JsonArray nArr && nArr.Count > 0
+                && nArr[0]?.GetValue<string>() is string nId)
+                negCandidates.Add(nId);
         }
 
-        // 采样器直连的节点可能不是文本节点（如 ConditionCombine），沿连接图递归追溯。
-        posId = TraceToPromptNode(prompt, posId, preferNegative: false);
-        negId = TraceToPromptNode(prompt, negId, preferNegative: true);
+        // 对每个候选追溯所有可达提示词节点，按文本长度择优
+        var posPromptNodes = new List<(string id, int textLen)>();
+        foreach (var pid in posCandidates.Distinct(StringComparer.Ordinal))
+        {
+            foreach (var found in TraceToPromptNodes(prompt, pid))
+                posPromptNodes.Add((found, GetPromptTextLen(prompt, found)));
+        }
+        var negPromptNodes = new List<(string id, int textLen)>();
+        foreach (var nid in negCandidates.Distinct(StringComparer.Ordinal))
+        {
+            foreach (var found in TraceToPromptNodes(prompt, nid))
+                negPromptNodes.Add((found, GetPromptTextLen(prompt, found)));
+        }
+
+        string? posId = null, negId = null;
+        if (posPromptNodes.Count > 0)
+            posId = posPromptNodes.OrderByDescending(n => n.textLen).First().id;
+        if (negPromptNodes.Count > 0)
+            negId = negPromptNodes
+                .Where(n => n.id != posId)
+                .OrderBy(n => n.textLen)
+                .FirstOrDefault().id;
 
         // 连接关系未命中，回退启发式
         posId ??= FindPositiveNodeId(prompt);
@@ -540,6 +610,66 @@ public static class ComfyuiWorkflowConverter
         return (posId, negId);
     }
 
+    /// <summary>获取提示词节点的文本长度（用于多采样器择优）。</summary>
+    static int GetPromptTextLen(JsonObject prompt, string nodeId)
+    {
+        if (prompt[nodeId] is not JsonObject node) return 0;
+        var inputs = node["inputs"] as JsonObject;
+        if (inputs == null) return 0;
+        var text = inputs["positive"]?.ToString() ?? inputs["text"]?.ToString() ?? "";
+        return text.Length;
+    }
+
+    /// <summary>
+    /// BFS 追溯连接图，返回所有可达的提示词文本节点 ID 列表（去重）。
+    /// 用于多采样器场景下收集全部候选，由调用方按文本长度择优。
+    /// </summary>
+    static List<string> TraceToPromptNodes(JsonObject prompt, string? startId)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(startId))
+            return result;
+
+        var queue = new Queue<string>();
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        queue.Enqueue(startId);
+
+        while (queue.Count > 0)
+        {
+            var currentId = queue.Dequeue();
+            if (!visited.Add(currentId) || prompt[currentId] is not JsonObject node)
+                continue;
+
+            var classType = node["class_type"]?.GetValue<string>() ?? "";
+            if (IsPromptTextNode(classType))
+                result.Add(currentId);
+
+            if (node["inputs"] is not JsonObject inputs)
+                continue;
+
+            // Conditioning 组合节点常同时包含 positive/negative，优先沿语义相符分支追溯
+            var linkedInputs = inputs
+                .Where(kv => kv.Value is JsonArray arr
+                             && arr.Count > 0
+                             && arr[0] is JsonValue)
+                .OrderByDescending(kv => IsPreferredConditioningInput(kv.Key, preferNegative: false));
+
+            foreach (var input in linkedInputs)
+            {
+                if (input.Value is not JsonArray arr || arr.Count == 0)
+                    continue;
+                string? linkedId = null;
+                try { linkedId = arr[0]?.GetValue<string>(); }
+                catch { }
+                if (!string.IsNullOrWhiteSpace(linkedId) && !visited.Contains(linkedId))
+                    queue.Enqueue(linkedId);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>兼容旧调用：返回第一个追溯到的提示词节点。</summary>
     static string? TraceToPromptNode(
         JsonObject prompt, string? startId, bool preferNegative)
     {

@@ -56,6 +56,8 @@ public class ComfyuiService(
     record WorkflowEntry(string Name, string Path, bool Enabled);
     CharacterPromptIndex? _characterPromptIndex;
 
+    record PromptPresetEntry(string Name, string Content);
+
     public override async Task AwakeAsync(AwakeContext context)
     {
         await base.AwakeAsync(context);
@@ -173,12 +175,20 @@ public class ComfyuiService(
             - 返回字段已按 XML 属性转义，组合进 generateimage 的 prompt 属性时保持 &amp; 等转义文本原样，不要还原或翻译。
             """;
 
+        var presetNote = """
+
+            【提示词预设】
+            - 可调用 getpromptpreset 检索已保存的提示词预设（角色人设/复杂动作/完整背景等），不传 name 返回列表，传 name 返回完整内容。
+            - 拿到预设内容后组合到 generateimage 的 prompt 中，不要原样塞入，需结合当前请求调整。
+            - 用户要求保存常用提示词时调用 savepromptpreset（name=名称, content=内容）。
+            """;
+
         Prompt($$"""
         【ComfyUI 生图】
         - 所有 prompt 使用英文，直接描述目标画面，不要把用户的中文命令原句塞进 prompt。
         - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}}，landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}}，square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}；默认 {{cfg.DefaultOrientation}}。
         - 提示词模式：{{styleLabel}}。{{styleGuide}}{{prefixNote}}{{workflowListDesc}}{{imageInputNote}}{{denoiseGuide}}{{nodeControlDesc}}{{autoOpenNote}}
-        - QQ 环境需要发图时使用 <qimage image="完整路径" />。{{characterLookupNote}}{{priorityNote}}
+        - QQ 环境需要发图时使用 <qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />。私聊 type=Private、群聊 type=Group，targetid 填当前会话的 QQ 号或群号。{{characterLookupNote}}{{presetNote}}{{priorityNote}}
         """);
     }
 
@@ -245,6 +255,20 @@ public class ComfyuiService(
                 controlsFunction,
                 "按需查看当前工作流允许 AI 调整的安全节点参数。",
                 hiddenParameters));
+        }
+
+        // 提示词预设：始终暴露，AI 按需调用检索/保存
+        if (functions.TryGetValue("getpromptpreset", out var getPresetFunction))
+        {
+            exposed.Add(CloneFunctionDocument(
+                getPresetFunction,
+                "检索提示词预设（角色人设/动作/背景等）。不传 name 返回列表；传 name 返回内容组合到 prompt"));
+        }
+        if (functions.TryGetValue("savepromptpreset", out var savePresetFunction))
+        {
+            exposed.Add(CloneFunctionDocument(
+                savePresetFunction,
+                "保存提示词预设（角色人设/动作/背景等），下次可按名称检索复用"));
         }
 
         functionService.RegisterHandler(new XmlHandler
@@ -402,6 +426,144 @@ public class ComfyuiService(
 
     static string XmlSafe(string value)
         => SecurityElement.Escape(value) ?? "";
+
+    // ===================== 提示词预设 =====================
+
+    /// <summary>预设文件路径：存在原始插件目录，UI 和 AI 共享读写。</summary>
+    public static string GetPresetFilePath()
+    {
+        // 优先原始插件目录（稳定，不被热编译覆盖）
+        var primary = Path.Combine(
+            AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui", "prompt-presets.json");
+        if (File.Exists(primary)) return primary;
+
+        // 回退：当前程序集目录（热编译副本）
+        try
+        {
+            var loc = typeof(ComfyuiService).Assembly.Location;
+            if (!string.IsNullOrWhiteSpace(loc))
+            {
+                var dir = Path.GetDirectoryName(loc);
+                if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
+                {
+                    var alt = Path.Combine(dir, "prompt-presets.json");
+                    if (File.Exists(alt)) return alt;
+                }
+            }
+        }
+        catch { }
+
+        // 默认写入原始插件目录
+        return primary;
+    }
+
+    List<PromptPresetEntry> LoadPromptPresets()
+    {
+        var list = new List<PromptPresetEntry>();
+        var path = GetPresetFilePath();
+        if (!File.Exists(path)) return list;
+        try
+        {
+            var json = File.ReadAllText(path, System.Text.Encoding.UTF8);
+            var arr = JsonNode.Parse(json) as JsonArray;
+            if (arr == null) return list;
+            foreach (var item in arr.OfType<JsonObject>())
+            {
+                var n = item["n"]?.GetValue<string>() ?? item["name"]?.GetValue<string>() ?? "";
+                var c = item["c"]?.GetValue<string>() ?? item["content"]?.GetValue<string>() ?? "";
+                if (!string.IsNullOrWhiteSpace(n))
+                    list.Add(new PromptPresetEntry(n, c));
+            }
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"提示词预设加载失败: {ex.Message}");
+        }
+        return list;
+    }
+
+    void SavePromptPresets(List<PromptPresetEntry> presets)
+    {
+        var path = GetPresetFilePath();
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            var arr = new JsonArray();
+            foreach (var p in presets)
+            {
+                arr.Add(new JsonObject { ["n"] = p.Name, ["c"] = p.Content });
+            }
+            File.WriteAllText(path, arr.ToJsonString(), System.Text.Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"提示词预设保存失败: {ex.Message}");
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("保存提示词预设。可保存角色人设、复杂动作、完整背景等常用提示词片段，下次通过 getpromptpreset 检索复用")]
+    public void SavePromptPreset(
+        [Description("预设名称（≤60字符）")] string name,
+        [Description("预设内容：tag 串或自然语言提示词（≤4000字符）")] string content)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            Poke("预设名称不能为空");
+            return;
+        }
+        name = name.Trim();
+        if (name.Length > 60) name = name[..60];
+        if (content == null) content = "";
+        if (content.Length > 4000) content = content[..4000];
+
+        var presets = LoadPromptPresets();
+        // 同名覆盖
+        presets = presets
+            .Where(p => !p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        presets.Add(new PromptPresetEntry(name, content));
+        SavePromptPresets(presets);
+
+        Poke($"status: saved\nname: {name}\naction: 下次可用 getpromptpreset name=\"{name}\" 检索复用");
+        Log($"保存提示词预设: {name}");
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("检索提示词预设。不传 name 返回所有预设名称列表；传 name 返回对应完整内容，组合到 generateimage 的 prompt 中")]
+    public void GetPromptPreset(
+        [Description("预设名称；不传则返回所有预设名称列表")] string? name = null)
+    {
+        var presets = LoadPromptPresets();
+        if (presets.Count == 0)
+        {
+            Poke("status: empty\naction: 暂无提示词预设，可调用 savepromptpreset 保存");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            var names = string.Join("\n", presets.Select((p, i) =>
+                $"{i + 1}. {p.Name}"));
+            Poke($"status: list\ncount: {presets.Count}\npresets:\n{names}");
+            return;
+        }
+
+        name = name.Trim();
+        var match = presets.FirstOrDefault(p =>
+            p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (match == null)
+        {
+            Poke($"status: not_found\nname: {name}\naction: 预设不存在，可调用 getpromptpreset 查看列表");
+            return;
+        }
+
+        Poke($"status: found\nname: {match.Name}\ncontent:\n{match.Content}");
+        Log($"检索提示词预设: {name}");
+    }
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("按需返回当前工作流中允许 AI 调整的安全节点参数。")]
@@ -676,7 +838,7 @@ public class ComfyuiService(
             }
 
             // 在提交前确定自定义输出目录；后续只认领本任务开始后新写入的文件。
-            var customDir = TryFindCustomSavePath(apiPrompt);
+            var customDirs = TryFindCustomSavePaths(apiPrompt);
 
             // 5.6) 图生图：注入已上传的图片文件名到 LoadImage 节点
             if (!string.IsNullOrWhiteSpace(uploadedImageName))
@@ -711,9 +873,9 @@ public class ComfyuiService(
             if (images.Count == 0)
             {
                 // 可能保存到自定义路径（ZML_SaveImageV2），history 无 images
-                if (!string.IsNullOrWhiteSpace(customDir) && Directory.Exists(customDir))
+                if (customDirs.Count > 0)
                 {
-                    var output = TryClaimCustomOutput(customDir, generationStartedUtc);
+                    var output = TryClaimCustomOutput(customDirs, generationStartedUtc);
                     if (output != null)
                     {
                         var ext = string.IsNullOrWhiteSpace(output.Extension) ? ".png" : output.Extension;
@@ -754,10 +916,10 @@ public class ComfyuiService(
 
                 // /view 失败 → 回退到 ZML 自定义保存目录按 filename 找
                 if ((bytes == null || bytes.Length == 0)
-                    && !string.IsNullOrWhiteSpace(customDir) && Directory.Exists(customDir))
+                    && customDirs.Count > 0)
                 {
                     var localFile = TryClaimCustomOutput(
-                        customDir, generationStartedUtc, img.Filename);
+                        customDirs, generationStartedUtc, img.Filename);
                     if (localFile != null)
                     {
                         try
@@ -1100,8 +1262,9 @@ public class ComfyuiService(
         return list;
     }
 
-    static string? TryFindCustomSavePath(JsonObject prompt)
+    static List<string> TryFindCustomSavePaths(JsonObject prompt)
     {
+        var dirs = new List<string>();
         foreach (var kv in prompt)
         {
             if (kv.Value is not JsonObject node) continue;
@@ -1112,18 +1275,38 @@ public class ComfyuiService(
             var inputs = node["inputs"] as JsonObject;
             var path = inputs?["保存路径"]?.GetValue<string>()
                        ?? inputs?["filename_prefix"]?.GetValue<string>();
-            if (!string.IsNullOrWhiteSpace(path))
+            if (string.IsNullOrWhiteSpace(path))
+                continue;
+
+            string? resolved = null;
+            if (Directory.Exists(path))
+                resolved = path;
+            else
             {
-                if (Directory.Exists(path))
-                    return path;
                 try
                 {
                     var dir = Path.GetDirectoryName(path);
                     if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
-                        return dir;
+                        resolved = dir;
                 }
                 catch { }
             }
+
+            if (resolved != null && !dirs.Contains(resolved, StringComparer.OrdinalIgnoreCase))
+                dirs.Add(resolved);
+        }
+        return dirs;
+    }
+
+    static FileInfo? TryClaimCustomOutput(
+        List<string> directories,
+        DateTime generationStartedUtc,
+        string? expectedFilename = null)
+    {
+        foreach (var dir in directories)
+        {
+            var file = TryClaimCustomOutput(dir, generationStartedUtc, expectedFilename);
+            if (file != null) return file;
         }
         return null;
     }
