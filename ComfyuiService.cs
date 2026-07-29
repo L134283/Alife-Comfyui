@@ -868,8 +868,8 @@ public class ComfyuiService(
             var interval = Math.Clamp(cfgConfig.PollIntervalMs, 500, 10000);
             var history = await WaitHistoryAsync(baseUrl, cfgConfig, promptId, timeout, interval, ct);
 
-            // 8) 取图
-            var images = ExtractImages(history, promptId);
+            // 8) 取图（只取 SaveImage 类节点，过滤预览节点）
+            var images = ExtractImages(history, promptId, apiPrompt);
             if (images.Count == 0)
             {
                 // 可能保存到自定义路径（ZML_SaveImageV2），history 无 images
@@ -878,6 +878,13 @@ public class ComfyuiService(
                     var output = TryClaimCustomOutput(customDirs, generationStartedUtc);
                     if (output != null)
                     {
+                        // ExtraSaveCopy 关闭时直接用工作流保存的路径，不额外复制
+                        if (!cfgConfig.ExtraSaveCopy)
+                        {
+                            Log($"使用工作流保存路径: {output.FullName}");
+                            Poke($"图片已生成\n{output.FullName}");
+                            return;
+                        }
                         var ext = string.IsNullOrWhiteSpace(output.Extension) ? ".png" : output.Extension;
                         var dest = Path.Combine(
                             saveDir,
@@ -899,6 +906,54 @@ public class ComfyuiService(
             var saved = new List<string>();
             foreach (var img in images)
             {
+                // ExtraSaveCopy 关闭 + 有自定义保存目录：直接用工作流保存的文件路径
+                if (!cfgConfig.ExtraSaveCopy && customDirs.Count > 0)
+                {
+                    var localFile = TryClaimCustomOutput(
+                        customDirs, generationStartedUtc, img.Filename);
+                    if (localFile != null)
+                    {
+                        saved.Add(localFile.FullName);
+                        Log($"使用工作流保存路径: {localFile.FullName}");
+                        continue;
+                    }
+                }
+
+                // 标准 SaveImage：如果配置了 ComfyUI output 目录，直接引用该目录下的文件
+                var comfyuiOutputDir = cfgConfig.ComfyuiOutputPath?.Trim() ?? "";
+                if (!string.IsNullOrWhiteSpace(comfyuiOutputDir))
+                {
+                    var directPath = string.IsNullOrWhiteSpace(img.Subfolder)
+                        ? Path.Combine(comfyuiOutputDir, img.Filename)
+                        : Path.Combine(comfyuiOutputDir, img.Subfolder, img.Filename);
+                    if (File.Exists(directPath))
+                    {
+                        // ExtraSaveCopy 关闭：直接用 ComfyUI output 路径，不下载不复制
+                        if (!cfgConfig.ExtraSaveCopy)
+                        {
+                            saved.Add(directPath);
+                            Log($"直接引用 ComfyUI output: {directPath}");
+                            continue;
+                        }
+                        // ExtraSaveCopy 开启：复制到 SaveDirectory（如果路径不同）
+                        if (!directPath.StartsWith(saveDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var ext0 = Path.GetExtension(img.Filename);
+                            if (string.IsNullOrWhiteSpace(ext0)) ext0 = ".png";
+                            var dest0 = Path.Combine(saveDir,
+                                $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext0}");
+                            File.Copy(directPath, dest0, false);
+                            saved.Add(dest0);
+                            Log($"从 ComfyUI output 复制: {directPath} -> {dest0}");
+                            continue;
+                        }
+                        // SaveDirectory 就是 ComfyUI output 目录，直接用
+                        saved.Add(directPath);
+                        Log($"SaveDirectory 即 ComfyUI output，直接引用: {directPath}");
+                        continue;
+                    }
+                }
+
                 byte[]? bytes = null;
                 try
                 {
@@ -940,6 +995,8 @@ public class ComfyuiService(
 
                 if (bytes == null || bytes.Length == 0) continue;
 
+                // ExtraSaveCopy 关闭时，标准 SaveImage 的图片仍需下载（ComfyUI output 目录无法直接引用）
+                // 但如果有 customDirs 且 /view 成功，说明图片在 ComfyUI output，仍需保存到 saveDir
                 var ext2 = Path.GetExtension(img.Filename);
                 if (string.IsNullOrWhiteSpace(ext2)) ext2 = ".png";
                 var fileName = $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext2}";
@@ -1240,7 +1297,7 @@ public class ComfyuiService(
 
     record ImageRef(string Filename, string Subfolder, string Type);
 
-    static List<ImageRef> ExtractImages(JsonNode history, string promptId)
+    static List<ImageRef> ExtractImages(JsonNode history, string promptId, JsonObject? apiPrompt = null)
     {
         var list = new List<ImageRef>();
         var outputs = history[promptId]?["outputs"] as JsonObject;
@@ -1248,6 +1305,16 @@ public class ComfyuiService(
 
         foreach (var kv in outputs)
         {
+            // 有 apiPrompt 时只取 SaveImage 类节点，过滤 PreviewImage 等预览节点
+            if (apiPrompt != null
+                && apiPrompt[kv.Key] is JsonObject node)
+            {
+                var ct = node["class_type"]?.GetValue<string>() ?? "";
+                if (!ct.Contains("SaveImage", StringComparison.OrdinalIgnoreCase)
+                    && !ct.Contains("保存", StringComparison.OrdinalIgnoreCase))
+                    continue;
+            }
+
             if (kv.Value is not JsonObject outNode) continue;
             if (outNode["images"] is not JsonArray imgs) continue;
             foreach (var img in imgs.OfType<JsonObject>())

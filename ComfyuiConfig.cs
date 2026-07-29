@@ -52,6 +52,12 @@ public class ComfyuiConfig
     [Description("图片保存目录。留空则使用 Alife 存储目录/Images/Comfyui")]
     public string SaveDirectory { get; set; } = "";
 
+    [Description("额外保存副本：开启时将工作流输出的图片额外复制到上方「图片保存目录」；关闭时直接使用工作流内保存节点的路径，不再额外复制")]
+    public bool ExtraSaveCopy { get; set; } = true;
+
+    [Description("ComfyUI output 目录绝对路径（如 D:\\AI\\ComfyUI-aki-v1.6\\ComfyUI\\output）。填写后标准 SaveImage 的图片直接引用该目录，不再重复下载")]
+    public string ComfyuiOutputPath { get; set; } = "";
+
     [Description("可选：ComfyUI API 鉴权 Token（部分反代需要）")]
     public string ApiToken { get; set; } = "";
 

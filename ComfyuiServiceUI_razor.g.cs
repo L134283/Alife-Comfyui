@@ -1774,11 +1774,43 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddInput(b, ref i, "ComfyUI 地址", Configuration.BaseUrl, v => Configuration.BaseUrl = v);
         AddHint(b, ref i, "例如 http://127.0.0.1:8188");
         AddInput(b, ref i, "API Token（可选）", Configuration.ApiToken, v => Configuration.ApiToken = v);
-        AddInput(b, ref i, "图片保存目录", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
-        var currentSave = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
-            ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
-            : Configuration.SaveDirectory;
-        AddHint(b, ref i, $"当前: {currentSave}（留空用默认）");
+
+        // 额外保存副本开关
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-top:4px;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.ExtraSaveCopy);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.ExtraSaveCopy = (bool)(e.Value ?? false);
+            StateHasChanged();
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
+        b.AddContent(i++, "额外保存副本：开启时复制到指定目录；关闭时直接用工作流保存路径");
+        b.CloseElement();
+        b.CloseElement();
+
+        // 开启时才显示图片保存目录
+        if (Configuration.ExtraSaveCopy)
+        {
+            AddInput(b, ref i, "图片保存目录", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
+            var currentSave = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
+                ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
+                : Configuration.SaveDirectory;
+            AddHint(b, ref i, $"当前: {currentSave}（留空用默认）");
+        }
+        else
+        {
+            AddHint(b, ref i, "已关闭：直接使用工作流内保存节点的路径，不再额外复制或下载");
+        }
+
+        // ComfyUI output 目录始终显示（独立于额外保存开关）
+        AddInput(b, ref i, "ComfyUI output 目录（可选）", Configuration.ComfyuiOutputPath, v => Configuration.ComfyuiOutputPath = v);
+        AddHint(b, ref i, "填写 ComfyUI 的 output 绝对路径后，标准 SaveImage 的图片直接引用该目录，不再重复下载");
         b.CloseElement();
 
         // 右栏 — 默认工作流 + 扫描
