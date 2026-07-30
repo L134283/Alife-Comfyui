@@ -11,6 +11,7 @@ using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -162,7 +163,7 @@ public class ComfyuiService(
             : "";
 
         var prefixNote = string.IsNullOrWhiteSpace(cfg.PositivePromptPrefix)
-            ? "" : "\n- 固定正向前缀由插件自动添加，不要重复写入 prompt。";
+            ? "" : "\n- 固定正向前缀由插件自动添加，并与 AI 提示词合并后自动去重（统一为「英文逗号+空格」）；不要把前缀里已有的 tag/短句再写进 prompt。";
         var characterLookupNote = _characterPromptIndex == null
             ? ""
             : """
@@ -488,32 +489,95 @@ public class ComfyuiService(
 
     // ===================== 提示词预设 =====================
 
-    /// <summary>预设文件路径：存在原始插件目录，UI 和 AI 共享读写。</summary>
+    /// <summary>
+    /// 用户数据目录（插件更新不会删除）：Storage/Config/Alife.Plugin.Comfyui/
+    /// 与图片目录 Images/Comfyui 同属 Storage 下用户数据，不进 Plugins 包。
+    /// </summary>
+    public static string GetUserDataDirectory()
+    {
+        var dir = Path.Combine(
+            AlifePath.StorageFolderPath, "Config", "Alife.Plugin.Comfyui");
+        try
+        {
+            if (!Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+        }
+        catch { }
+        return dir;
+    }
+
+    /// <summary>
+    /// 预设文件路径：固定在用户数据目录，插件升级/覆盖安装不会清空。
+    /// 首次若仅有旧版「插件目录内」文件，会自动迁移过来。
+    /// UI 与 AI 共享同一路径。
+    /// </summary>
     public static string GetPresetFilePath()
     {
-        // 优先原始插件目录（稳定，不被热编译覆盖）
-        var primary = Path.Combine(
-            AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui", "prompt-presets.json");
-        if (File.Exists(primary)) return primary;
+        var durable = Path.Combine(GetUserDataDirectory(), "prompt-presets.json");
 
-        // 回退：当前程序集目录（热编译副本）
+        // 已在用户数据目录：直接用
+        if (File.Exists(durable))
+            return durable;
+
+        // 旧位置：插件安装目录 / 热编译副本 —— 升级会整夹删除，需迁出
+        foreach (var legacy in EnumerateLegacyPresetPaths())
+        {
+            if (!File.Exists(legacy))
+                continue;
+            if (TryMigratePresetFile(legacy, durable))
+                return durable;
+        }
+
+        // 无旧数据：之后所有读写都落在 durable（Save 时建文件）
+        return durable;
+    }
+
+    static IEnumerable<string> EnumerateLegacyPresetPaths()
+    {
+        // 1) 原始插件目录（市场安装/更新会整目录替换）
+        yield return Path.Combine(
+            AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui", "prompt-presets.json");
+
+        // 2) 当前程序集目录（热编译副本）
+        string? asmDir = null;
         try
         {
             var loc = typeof(ComfyuiService).Assembly.Location;
             if (!string.IsNullOrWhiteSpace(loc))
-            {
-                var dir = Path.GetDirectoryName(loc);
-                if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
-                {
-                    var alt = Path.Combine(dir, "prompt-presets.json");
-                    if (File.Exists(alt)) return alt;
-                }
-            }
+                asmDir = Path.GetDirectoryName(loc);
         }
         catch { }
 
-        // 默认写入原始插件目录
-        return primary;
+        if (!string.IsNullOrWhiteSpace(asmDir))
+            yield return Path.Combine(asmDir, "prompt-presets.json");
+    }
+
+    static bool TryMigratePresetFile(string legacyPath, string durablePath)
+    {
+        try
+        {
+            if (PathsEqual(legacyPath, durablePath))
+                return File.Exists(durablePath);
+
+            var dir = Path.GetDirectoryName(durablePath);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            // 复制而非移动：旧路径若仍在包内可忽略；用户数据以 durable 为准
+            File.Copy(legacyPath, durablePath, overwrite: false);
+            Log($"提示词预设已迁移到用户数据目录: {durablePath}");
+            return true;
+        }
+        catch (IOException) when (File.Exists(durablePath))
+        {
+            // 目标已存在（并发/二次迁移）
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"提示词预设迁移失败 ({legacyPath} → {durablePath}): {ex.Message}");
+            return false;
+        }
     }
 
     List<PromptPresetEntry> LoadPromptPresets()
@@ -543,7 +607,8 @@ public class ComfyuiService(
 
     void SavePromptPresets(List<PromptPresetEntry> presets)
     {
-        var path = GetPresetFilePath();
+        // 始终写入用户数据目录，避免写回 Plugins 后被更新清掉
+        var path = Path.Combine(GetUserDataDirectory(), "prompt-presets.json");
         try
         {
             var dir = Path.GetDirectoryName(path);
@@ -848,8 +913,12 @@ public class ComfyuiService(
 
         var (w, h) = ResolveResolution(orientation, width, height, cfgConfig);
 
-        // 正向提示词 = 固定前缀（保留内部换行） + 换行 + 用户提示词
+        // 正向提示词 = 固定前缀 + AI 提示词，合并后自动去重；分隔符强制英文逗号+空格 ", "
         var finalPositive = BuildPositivePrompt(prompt, cfgConfig.PositivePromptPrefix);
+        // 固定负面：同样规范为英文逗号分隔（若配置了才覆盖工作流负面）
+        var finalNegative = string.IsNullOrWhiteSpace(cfgConfig.NegativePrompt)
+            ? cfgConfig.NegativePrompt
+            : DeduplicateAndJoinPromptSegments(new[] { cfgConfig.NegativePrompt });
 
         // 图生图：临时图片文件路径（用完清理）
         string? tempImageFile = null;
@@ -960,7 +1029,7 @@ public class ComfyuiService(
             ComfyuiWorkflowConverter.ApplyRuntimeOverrides(
                 apiPrompt,
                 finalPositive,
-                cfgConfig.NegativePrompt,
+                finalNegative,
                 w,
                 h,
                 cfgConfig.RandomizeSeed,
@@ -1653,16 +1722,146 @@ public class ComfyuiService(
     }
 
     /// <summary>
-    /// 拼接固定正向提示词前缀。前缀内部换行原样保留，前缀与用户提示词之间以换行分隔。
+    /// 拼接固定正向提示词前缀，并与 AI 提示词合并去重。
+    /// 最终格式：segment, segment, segment（仅英文逗号 ","，且逗号后一个空格）。
+    /// 前缀片段优先保留；AI 侧与前缀/自身重复的 tag 或短句会被去掉。
+    /// 无前缀时也会对 AI 提示词自身做去重与格式规范化。
     /// </summary>
     static string BuildPositivePrompt(string prompt, string? prefix)
     {
-        if (string.IsNullOrWhiteSpace(prefix))
-            return prompt;
-        var p = prefix.TrimEnd();
-        if (string.IsNullOrEmpty(p))
-            return prompt;
-        return p + "\n" + prompt;
+        var chunks = new List<string>(2);
+        if (!string.IsNullOrWhiteSpace(prefix))
+            chunks.Add(prefix);
+        if (!string.IsNullOrWhiteSpace(prompt))
+            chunks.Add(prompt);
+
+        if (chunks.Count == 0)
+            return "";
+
+        return DeduplicateAndJoinPromptSegments(chunks);
+    }
+
+    /// <summary>
+    /// 按逗号/换行拆段、忽略大小写与权重包装去重。
+    /// 输出只使用英文逗号，例如：
+    /// masterpiece, best quality, a girl on the bed, a man sit in the desk
+    /// </summary>
+    static string DeduplicateAndJoinPromptSegments(IEnumerable<string> chunks)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<string>();
+        var removed = 0;
+
+        foreach (var chunk in chunks)
+        {
+            if (string.IsNullOrWhiteSpace(chunk))
+                continue;
+
+            foreach (var raw in SplitPromptSegments(chunk))
+            {
+                var segment = CleanPromptSegment(raw);
+                if (segment.Length == 0)
+                    continue;
+
+                var key = NormalizePromptSegmentKey(segment);
+                if (key.Length == 0)
+                    continue;
+
+                if (!seen.Add(key))
+                {
+                    removed++;
+                    continue;
+                }
+
+                result.Add(segment);
+            }
+        }
+
+        if (removed > 0)
+            Log($"提示词去重: 移除 {removed} 个重复片段，保留 {result.Count} 个");
+
+        // 强制英文逗号 + 空格；绝不输出中文逗号
+        return string.Join(", ", result);
+    }
+
+    /// <summary>
+    /// 按英文逗号/中文逗号/顿号/换行/分号拆分。中文标点仅作输入兼容，最终全部换成英文逗号。
+    /// </summary>
+    static IEnumerable<string> SplitPromptSegments(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            yield break;
+
+        var normalized = text
+            .Replace('，', ',')
+            .Replace('\u3001', ',') // 顿号
+            .Replace('；', ';');
+
+        var sb = new StringBuilder(normalized.Length);
+        for (var i = 0; i < normalized.Length; i++)
+        {
+            var c = normalized[i];
+            if (c is ',' or ';' or '\r' or '\n')
+            {
+                if (sb.Length > 0)
+                {
+                    yield return sb.ToString();
+                    sb.Clear();
+                }
+                continue;
+            }
+            sb.Append(c);
+        }
+
+        if (sb.Length > 0)
+            yield return sb.ToString();
+    }
+
+    static string CleanPromptSegment(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return "";
+
+        // 片段内残留的中文/全角标点清掉，避免进工作流
+        var s = raw
+            .Replace('，', ' ')
+            .Replace('\u3001', ' ')
+            .Replace('；', ' ')
+            .Replace(';', ' ')
+            .Replace(',', ' ')
+            .Trim();
+
+        s = Regex.Replace(s, @"\s+", " ");
+        s = s.Trim().Trim(',', '，', ';', '；', '、');
+        s = Regex.Replace(s, @"\s+", " ").Trim();
+        return s;
+    }
+
+    /// <summary>
+    /// 去重键：忽略大小写、下划线/空格差异，并剥离简单权重括号如 (tag:1.2) / ((tag))。
+    /// 先出现的原文形式保留（通常是前缀里的写法）。
+    /// </summary>
+    static string NormalizePromptSegmentKey(string segment)
+    {
+        var s = segment.Trim();
+        if (s.Length == 0)
+            return "";
+
+        // 反复剥掉最外层权重/强调括号：(foo:1.2) / (foo) / ((foo))
+        // 不处理 <lora:...>，避免误伤
+        for (var guard = 0; guard < 8; guard++)
+        {
+            var m = Regex.Match(
+                s,
+                @"^\(\s*(.+?)\s*(?::\s*[\d.]+\s*)?\)$");
+            if (!m.Success)
+                break;
+            s = m.Groups[1].Value.Trim();
+        }
+
+        s = Regex.Replace(s, @"\s+", " ");
+        s = s.Replace('_', ' ');
+        return s.ToLowerInvariant();
     }
 
     static string NormalizeBaseUrl(string? url)

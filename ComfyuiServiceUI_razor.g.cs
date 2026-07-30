@@ -2005,7 +2005,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-panel");
 
-        AddHint(b, ref i, "保存常用提示词片段（角色人设/复杂动作/完整背景），AI 生图时按需调用复用。实时增删改即时生效；也可在聊天中发预设内容给 AI，让 AI 自主调用 savepromptpreset 存储。");
+        AddHint(b, ref i, "保存常用提示词片段（角色人设/复杂动作/完整背景），AI 生图时按需调用复用。数据存在 Storage/Config/Alife.Plugin.Comfyui/（插件更新不会清空）；也可聊天里让 AI 调用 savepromptpreset。");
 
         if (_presetCards.Count == 0) LoadPresetCards();
 
@@ -2136,10 +2136,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddSection(b, ref i, "提示词前缀与负面");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-panel");
-        AddTextArea(b, ref i, "固定正向提示词前缀（多行，换行会被保留）", Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
-        AddHint(b, ref i, "生图时自动拼到正向提示词最前面。前缀内空行原样保留。留空则不拼接");
+        AddTextArea(b, ref i, "固定正向提示词前缀（tag/短句，逗号或换行均可）", Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
+        AddHint(b, ref i, "与 AI 提示词合并后自动去重；最终注入统一为英文逗号+空格，如：masterpiece, best quality, a girl on the bed。留空则不拼接");
         AddTextArea(b, ref i, "固定负面提示词（可空=用工作流自带）", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
-        AddHint(b, ref i, "留空则使用工作流自带负面；填写则覆盖");
+        AddHint(b, ref i, "留空用工作流自带负面；填写则覆盖并规范为英文逗号分隔");
         AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
         {
             ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
@@ -3103,7 +3103,9 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
     void SavePresetCards()
     {
-        var path = ComfyuiService.GetPresetFilePath();
+        // 始终写入用户数据目录，避免写回 Plugins 后被市场更新清掉
+        var path = System.IO.Path.Combine(
+            ComfyuiService.GetUserDataDirectory(), "prompt-presets.json");
         try
         {
             var dir = System.IO.Path.GetDirectoryName(path);

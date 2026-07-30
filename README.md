@@ -7,11 +7,11 @@
 - 可配置 ComfyUI 地址（默认 `http://127.0.0.1:8188`）
 - 支持 **UI 工作流 JSON** 自动转 API 格式，也支持官方 **Export (API)** 导出的 API JSON
 - 三档常用分辨率预设（竖版 / 横版 / 正方形），AI 可智能选择，也可由用户指定宽高
-- **固定正向提示词前缀**：生图时自动拼到正向提示词最前面，内部换行原样保留
-- **固定负面提示词**：可选，留空则使用工作流自带负面
+- **固定正向提示词前缀**：与 AI 提示词合并后自动去重，统一为英文逗号+空格
+- **固定负面提示词**：可选；填写则覆盖工作流负面并规范为英文逗号分隔
 - **多工作流**：可配置多个命名工作流，AI 通过 `workflow` 参数切换
 - **角色提示词检索**：内置 8906 个角色的中文/英文/别名索引，支持错字、部分名称与作品名消歧
-- **提示词预设**：可保存常用提示词片段（角色人设/动作/背景），AI 按需调用 `getpromptpreset` 检索复用
+- **提示词预设**：可保存常用提示词片段（角色人设/动作/背景），AI 按需调用 `getpromptpreset` 检索复用；数据存于 `Storage/Config/Alife.Plugin.Comfyui/`，**插件更新不会清空**
 - **在线标签检索（可选，默认关）**：自然语言 → 标准 Danbooru 标签（`searchdanboorutags`）、关联标签、可选画师推荐；多源故障转移
 - **复杂工作流兼容**：支持 GetNode/SetNode 跨图引用、多采样器（一采+二采+局部重绘）、多保存节点目录
 - AI 调用参数：正向提示词（必填）、方向 / 宽高（可选）
@@ -67,18 +67,37 @@
 3. 都不传 → 用配置里的「默认方向」
 4. 默认方向也无效 → 用配置里的兜底宽高
 
-## 固定提示词前缀
+## 提示词预设存储位置
+
+用户预设**不再**放在插件安装目录（`Storage/Plugins/Alife.Plugin.Comfyui/`），以免 Alife 更新插件时整目录替换把文件冲掉。
+
+| 路径 | 说明 |
+|------|------|
+| `Storage/Config/Alife.Plugin.Comfyui/prompt-presets.json` | **正式位置**，升级保留 |
+| `Storage/Plugins/.../prompt-presets.json` | 旧位置；新版本首次加载若发现会自动迁到 Config |
+
+备份/换机时复制 `Config/Alife.Plugin.Comfyui/` 即可。
+
+## 固定提示词前缀与自动去重
 
 在插件配置 UI 的「提示词前缀与负面」区域填写。例如：
 
 ```
-masterpiece, best quality, score_9, score_8, newest, highres,
-
-(@buran buta), (@baonu de zhanshen caibuto),
+masterpiece, best quality, score_9, score_8, newest, highres
+(@buran buta), (@baonu de zhanshen caibuto)
 ```
 
-生图时实际发送给 ComfyUI 的正向提示词为：`前缀` + 换行 + `AI 传入的 prompt`。
-前缀内部的空行会被原样保留（分段作用不受影响）。
+生图注入工作流前会：
+
+1. 合并 **固定前缀** + **AI 的 prompt**
+2. 按逗号/换行拆成 tag 或小短句，**忽略大小写去重**（前缀优先保留）
+3. 统一输出为 **英文逗号 + 空格**，例如：
+
+```
+masterpiece, best quality, a girl on the bed, a man sit in the desk
+```
+
+中文逗号 `，`、顿号、多余换行仅作输入兼容，**最终不会进入工作流**。AI 提示词里与前缀重复的 `masterpiece` 等会被去掉。
 
 ## 提示词模式
 
@@ -177,6 +196,11 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v1.3.1（2026-07-31）
+
+- 正向提示词注入前自动去重（前缀 + AI prompt），统一为英文逗号+空格
+- 提示词预设改存 `Storage/Config/Alife.Plugin.Comfyui/`，插件更新不再清空；旧路径自动迁移
 
 ### v1.3.0（2026-07-30）
 

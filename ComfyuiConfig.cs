@@ -16,10 +16,10 @@ public class ComfyuiConfig
     [Description("正向提示词输入字段名，默认 positive；标准 CLIPTextEncode 用 text")]
     public string PositivePromptInput { get; set; } = "positive";
 
-    [Description("固定正向提示词前缀。生图时会自动拼到正向提示词最前面，内部换行会被原样保留。留空则不拼接")]
+    [Description("固定正向提示词前缀。生图时与 AI 提示词合并后自动去重，统一为「英文逗号+空格」分隔。留空则不拼接")]
     public string PositivePromptPrefix { get; set; } = "";
 
-    [Description("固定负面提示词。留空则使用工作流自带的负面提示词")]
+    [Description("固定负面提示词。填写后覆盖工作流负面，并规范为英文逗号分隔；留空则使用工作流自带负面")]
     public string NegativePrompt { get; set; } = "";
 
     [Description("默认工作流的负面提示词节点 ID。留空则自动识别；命名工作流始终按各自连接关系识别")]
