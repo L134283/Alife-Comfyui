@@ -12,6 +12,7 @@
 - **多工作流**：可配置多个命名工作流，AI 通过 `workflow` 参数切换
 - **角色提示词检索**：内置 8906 个角色的中文/英文/别名索引，支持错字、部分名称与作品名消歧
 - **提示词预设**：可保存常用提示词片段（角色人设/动作/背景），AI 按需调用 `getpromptpreset` 检索复用
+- **在线标签检索（可选，默认关）**：自然语言 → 标准 Danbooru 标签（`searchdanboorutags`）、关联标签、可选画师推荐；多源故障转移
 - **复杂工作流兼容**：支持 GetNode/SetNode 跨图引用、多采样器（一采+二采+局部重绘）、多保存节点目录
 - AI 调用参数：正向提示词（必填）、方向 / 宽高（可选）
 
@@ -87,6 +88,32 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 
 三种模式都使用英文提示词，不把用户中文命令原句直接塞进工作流。
 
+## 在线 Danbooru 语义标签检索（可选）
+
+默认**关闭**（零外网）。开启后，AI 在用户描述含服装/姿势/场景等细节时可调用在线检索，把自然语言转成更准的英文 Tag，再按当前「提示词种类」写入 `generateimage`。
+
+| 函数 | 作用 | 条件 |
+|------|------|------|
+| `searchdanboorutags` | 自然语言 → 标准 tag | 总开关开 |
+| `getrelateddanboorutags` | 已有英文 tag → 共现关联 | 总开关开 |
+| `getdanbooruartists` | 画师推荐 | 总开关 + 画师独立开关 |
+
+**优先级（防冲突）**：本地角色 `findcharacterprompt` > 用户预设 > 在线标签 > 画师（可选）> AI 自写。在线结果不得覆盖角色 trigger/appearance。
+
+**质量优先**：三种提示词模式调用积极性相同；差别只在落笔——`natural` 用短句消化检索语义，禁止把大段 tag 列表原样当整段 prompt。
+
+**源与大陆访问**：
+
+| 配置 | 默认 |
+|------|------|
+| 主源 | `https://sakizuki-danboorusearchonline.ms.show`（官方备份，通常更快） |
+| 备用 | `https://sakizuki-danboorusearch.hf.space`（HF Space，可能冷启 30–60s） |
+| 自建 | 填自定义主源后**只打自定义**，不自动回退 HF |
+
+失败 soft-fail：超时/熔断后 AI 应自写英文并仍可 `generateimage`，不阻塞生图。
+
+上游项目（MIT）：[DanbooruSearchOnline](https://github.com/SuzumiyaAkizuki/DanbooruSearchOnline)。使用公开服务时请友情链接：[Hugging Face Space](https://huggingface.co/spaces/SAkizuki/DanbooruSearch)。
+
 ## 使用
 
 1. 启动 ComfyUI
@@ -150,6 +177,12 @@ masterpiece, best quality, score_9, score_8, newest, highres,
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v1.3.0（2026-07-30）
+
+- 新增可选在线 Danbooru 语义标签检索（REST）：`searchdanboorutags` / `getrelateddanboorutags` / 独立开关画师推荐
+- 默认主源官方备份域、HF 回退、总超时预算、短时缓存与熔断；UI「测试连通」
+- 质量优先系统提示词：三种 PromptStyle 同等积极检索，落笔方式不同；默认关=零外网
 
 ### v1.2.1（2026-07-29）
 

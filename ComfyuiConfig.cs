@@ -118,4 +118,24 @@ public class ComfyuiConfig
 
     [Description("图生图 LoadImage 节点的图片输入字段名，默认 image")]
     public string LoadImageInput { get; set; } = "image";
+
+    // ---------- 在线 Danbooru 语义标签检索（默认关，避免外网依赖） ----------
+
+    [Description("启用在线 Danbooru 语义标签检索（search/related）。默认关；开启后 AI 有画面细节时可检索标准 tag 提升出图质量")]
+    public bool EnableDanbooruSearch { get; set; } = false;
+
+    [Description("启用画师推荐（依赖在线标签检索总开关）。默认关；开启后 AI 可在用户明确要画风/画师时查询")]
+    public bool EnableDanbooruArtistRecommend { get; set; } = false;
+
+    [Description("标签检索主源 BaseUrl。默认官方备份域（大陆通常更快）。可填自建地址")]
+    public string DanbooruSearchPrimaryUrl { get; set; } = "https://sakizuki-danboorusearchonline.ms.show";
+
+    [Description("标签检索备用 BaseUrl。主源失败时回退；主源为自定义非官方域时不自动回退。可空=不回退")]
+    public string DanbooruSearchFallbackUrl { get; set; } = "https://sakizuki-danboorusearch.hf.space";
+
+    [Description("单次在线检索总超时秒数（含主备源尝试预算）")]
+    public int DanbooruSearchTimeoutSeconds { get; set; } = 45;
+
+    [Description("在线检索是否返回/优先 NSFW 标签。默认关，使用 SFW 结果")]
+    public bool DanbooruSearchShowNsfw { get; set; } = false;
 }

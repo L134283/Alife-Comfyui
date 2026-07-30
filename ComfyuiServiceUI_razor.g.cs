@@ -32,6 +32,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     string _newPresetName = "";
     string _newPresetContent = "";
 
+    // 在线标签检索连通测试
+    string? _danbooruTestMessage;
+    bool _danbooruTesting;
+
     record WorkflowCard
     {
         public string Name { get; set; } = "";
@@ -1736,6 +1740,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddContent(i++,
             "【角色提示词检索】内置数千个动漫/游戏角色的中英文索引，AI 生图前可自动检索角色触发词、稳定外貌和默认服装，大幅提升角色还原度。原创角色和普通人物不检索。\n" +
             "【提示词预设】可在下方保存常用提示词片段（角色人设/动作/背景），AI 生图时按需调用复用。支持实时增删改；也可在聊天中直接发预设内容给 AI，让 AI 自主调用函数存储。\n" +
+            "【在线标签检索】可选：自然语言→标准 Danbooru 标签（默认关）。有画面细节时 AI 可检索以提升质量；三种提示词模式均适用。大陆建议保留默认主源备份域。\n" +
             "【使用步骤】1. 启动 ComfyUI → 2. 配置地址和工作流 → 3. AI 调用 GenerateImage 生图\n" +
             "【分辨率】portrait 竖版 / landscape 横版 / square 正方形，AI 智能选择或手动指定");
         b.CloseElement();
@@ -2144,6 +2149,120 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddHint(b, ref i, "控制 AI 生成提示词的格式风格，不影响已有前缀");
         b.CloseElement();
 
+        // 在线 Danbooru 语义标签检索
+        AddSection(b, ref i, "在线标签检索（可选）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.EnableDanbooruSearch);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.EnableDanbooruSearch = (bool)(e.Value ?? false);
+            if (!Configuration.EnableDanbooruSearch)
+                Configuration.EnableDanbooruArtistRecommend = false;
+            StateHasChanged();
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
+        b.AddContent(i++, "启用 Danbooru 语义标签检索（search / related）");
+        b.CloseElement();
+        b.CloseElement();
+
+        AddHint(b, ref i, "质量优先：有服装/姿势/场景等细节时 AI 可检索标准 tag。默认关=零外网。需重载模块/重启角色后函数才注册。");
+
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style",
+            $"display:inline-flex;align-items:center;gap:8px;cursor:{(Configuration.EnableDanbooruSearch ? "pointer" : "not-allowed")};margin:10px 0 8px;opacity:{(Configuration.EnableDanbooruSearch ? "1" : "0.45")};");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.EnableDanbooruArtistRecommend);
+        b.AddAttribute(i++, "disabled", !Configuration.EnableDanbooruSearch);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            if (!Configuration.EnableDanbooruSearch) return;
+            Configuration.EnableDanbooruArtistRecommend = (bool)(e.Value ?? false);
+            StateHasChanged();
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
+        b.AddContent(i++, "启用画师推荐（额外外网调用，默认关；依赖总开关）");
+        b.CloseElement();
+        b.CloseElement();
+
+        if (Configuration.EnableDanbooruSearch)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-grid-2");
+            b.AddAttribute(i++, "style", "margin-top:8px;");
+
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "主源 URL", Configuration.DanbooruSearchPrimaryUrl,
+                v => Configuration.DanbooruSearchPrimaryUrl = v);
+            AddHint(b, ref i, "默认官方备份域（大陆通常更快）。自建时填你的地址，将不再自动回退 HF");
+            AddInput(b, ref i, "超时秒数（总预算）", Configuration.DanbooruSearchTimeoutSeconds.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n))
+                    Configuration.DanbooruSearchTimeoutSeconds = Math.Clamp(n, 10, 120);
+            });
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "备用 URL（可空）", Configuration.DanbooruSearchFallbackUrl,
+                v => Configuration.DanbooruSearchFallbackUrl = v);
+            AddHint(b, ref i, "默认 HF Space；主源失败时回退。HF 可能冷启 30–60s，大陆常较慢");
+            b.OpenElement(i++, "label");
+            b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px;");
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "type", "checkbox");
+            b.AddAttribute(i++, "checked", Configuration.DanbooruSearchShowNsfw);
+            b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                Configuration.DanbooruSearchShowNsfw = (bool)(e.Value ?? false);
+            }));
+            b.CloseElement();
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
+            b.AddContent(i++, "包含 NSFW 标签（默认关，用 SFW）");
+            b.CloseElement();
+            b.CloseElement();
+            b.CloseElement();
+
+            b.CloseElement(); // grid-2
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;");
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cfy-btn");
+            b.AddAttribute(i++, "disabled", _danbooruTesting);
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestDanbooruConnectivity));
+            b.AddContent(i++, _danbooruTesting ? "测试中…" : "✦ 测试连通");
+            b.CloseElement();
+            if (!string.IsNullOrWhiteSpace(_danbooruTestMessage))
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cfy-detect");
+                b.AddAttribute(i++, "style", "margin:0;flex:1;");
+                b.AddContent(i++, _danbooruTestMessage);
+                b.CloseElement();
+            }
+            b.CloseElement();
+
+            AddHint(b, ref i,
+                "公开服务请友情链接上游：https://huggingface.co/spaces/SAkizuki/DanbooruSearch 。自建最稳；失败时 AI 会自写 tag 仍可生图。");
+        }
+
+        b.CloseElement(); // danbooru panel
+
         // 默认参数
         AddSection(b, ref i, "默认参数");
         b.OpenElement(i++, "div");
@@ -2456,6 +2575,48 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
         b.CloseElement();
+    }
+
+    async Task TestDanbooruConnectivity()
+    {
+        if (_danbooruTesting) return;
+        _danbooruTesting = true;
+        _danbooruTestMessage = "探测中…";
+        StateHasChanged();
+        try
+        {
+            var primary = Configuration.DanbooruSearchPrimaryUrl?.Trim() ?? "";
+            var fallback = Configuration.DanbooruSearchFallbackUrl?.Trim() ?? "";
+            var parts = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(primary))
+            {
+                var (ok, msg, ms) = await DanbooruSearchClient.HealthAsync(primary, 20);
+                parts.Add($"主源 {(ok ? "OK" : "FAIL")} {ms}ms — {msg}");
+            }
+            else
+            {
+                parts.Add("主源未填写");
+            }
+
+            if (!string.IsNullOrWhiteSpace(fallback)
+                && !string.Equals(primary?.TrimEnd('/'), fallback.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+            {
+                var (ok, msg, ms) = await DanbooruSearchClient.HealthAsync(fallback, 25);
+                parts.Add($"备用 {(ok ? "OK" : "FAIL")} {ms}ms — {msg}");
+            }
+
+            _danbooruTestMessage = string.Join(" | ", parts);
+        }
+        catch (Exception ex)
+        {
+            _danbooruTestMessage = "测试异常: " + ex.Message;
+        }
+        finally
+        {
+            _danbooruTesting = false;
+            StateHasChanged();
+        }
     }
 
     async Task AutoDetectNodes()

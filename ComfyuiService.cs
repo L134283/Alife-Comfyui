@@ -22,7 +22,7 @@ namespace Alife.Plugin.Comfyui;
 
 [Module(
     "ComfyUI 生图",
-    "连接 ComfyUI 执行工作流生图。支持 UI/API 工作流、角色 Tag 模糊检索、固定提示词前缀与三档常用分辨率。",
+    "连接 ComfyUI 执行工作流生图。支持 UI/API 工作流、角色 Tag 模糊检索、可选在线 Danbooru 语义标签检索、固定提示词前缀与三档常用分辨率。",
     defaultCategory: "Doro的妙妙工具",
     EditorUI = typeof(ComfyuiServiceUI))]
 public class ComfyuiService(
@@ -183,12 +183,42 @@ public class ComfyuiService(
             - 用户要求保存常用提示词时调用 savepromptpreset（name=名称, content=内容）。
             """;
 
+        var danbooruNote = "";
+        if (cfg.EnableDanbooruSearch)
+        {
+            var styleUseLine = cfg.PromptStyle switch
+            {
+                "natural" =>
+                    "- 自然语言模式同样积极 search（可用 full_scene 一次取概念）；落笔时角色 Tag 按规则放开头，其后用 2~4 个英文短句消化检索结果（可嵌入关键英文词），禁止把返回 tag 列表原样当作整段 prompt。",
+                "hybrid" =>
+                    "- 混合模式：检索 tag 进身份/外貌/服装/表情的 Tag 段；动作、关系、场景仍用短句。",
+                _ =>
+                    "- 纯 Tag 模式：充分吸收返回英文 tag（去重去矛盾）；复杂画面可用 full_scene。"
+            };
+
+            var artistLine = cfg.EnableDanbooruArtistRecommend
+                ? "\n- 仅当用户明确要画风/画师时，可再调用 getdanbooruartists（tags=已确定的英文 tag）；单次生图最多 1 次；未要求不要调用。"
+                : "";
+
+            danbooruNote = $"""
+
+            【在线标签检索】（质量增强：有画面细节时积极使用）
+            - 用户描述含服装/道具/姿势/场景/光影/风格等细节时，优先调用 searchdanboorutags 再 generateimage，以提升提示词准确度；三种提示词模式均适用，不要因为自然语言模式而少用。
+            - 极简且无额外画面细节时可直接 generateimage。
+            - 已有英文 tag 需补搭配时 getrelateddanboorutags。
+            - 优先级：findcharacterprompt（具名角色）> 用户预设 > 在线标签 > 自写。在线不得覆盖角色 trigger/appearance；用户新服装以用户为准。
+            - 单次生图 search≤1、related≤1；一次 query 写清关键画面即可；禁止中文原句当 prompt。
+            - 仅用 status: ok；unavailable/超时则按当前模式自写英文并 generateimage，勿声称已检索、勿反复重试检索。
+            {styleUseLine}{artistLine}
+            """;
+        }
+
         Prompt($$"""
         【ComfyUI 生图】
         - 所有 prompt 使用英文，直接描述目标画面，不要把用户的中文命令原句塞进 prompt。
         - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}}，landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}}，square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}；默认 {{cfg.DefaultOrientation}}。
         - 提示词模式：{{styleLabel}}。{{styleGuide}}{{prefixNote}}{{workflowListDesc}}{{imageInputNote}}{{denoiseGuide}}{{nodeControlDesc}}{{autoOpenNote}}
-        - QQ 环境需要发图时使用 <qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />。私聊 type=Private、群聊 type=Group，targetid 填当前会话的 QQ 号或群号。{{characterLookupNote}}{{presetNote}}{{priorityNote}}
+        - QQ 环境需要发图时使用 <qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />。私聊 type=Private、群聊 type=Group，targetid 填当前会话的 QQ 号或群号。{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}
         """);
     }
 
@@ -271,12 +301,41 @@ public class ComfyuiService(
                 "保存提示词预设（角色人设/动作/背景等），下次可按名称检索复用"));
         }
 
+        // 在线 Danbooru 语义检索：总开关开才暴露；画师另开
+        if (cfg.EnableDanbooruSearch)
+        {
+            if (functions.TryGetValue("searchdanboorutags", out var searchFn))
+            {
+                exposed.Add(CloneFunctionDocument(
+                    searchFn,
+                    "有画面细节时调用以提升质量：自然语言→标准 Danbooru 英文 tag。三种提示词模式均适用；结果按当前模式组织进 prompt，勿把中文原句当 prompt。"));
+            }
+            if (functions.TryGetValue("getrelateddanboorutags", out var relatedFn))
+            {
+                exposed.Add(CloneFunctionDocument(
+                    relatedFn,
+                    "已有英文 Danbooru tag 时补共现搭配；单次生图最多 1 次。"));
+            }
+            if (cfg.EnableDanbooruArtistRecommend
+                && functions.TryGetValue("getdanbooruartists", out var artistsFn))
+            {
+                exposed.Add(CloneFunctionDocument(
+                    artistsFn,
+                    "用户明确要画风/画师时，按已确定英文 tag 推荐画师；未要求不要调用。"));
+            }
+        }
+
+        var handlerDesc = "ComfyUI 生图";
+        if (_characterPromptIndex != null)
+            handlerDesc += "与具体二次元角色提示词检索";
+        if (cfg.EnableDanbooruSearch)
+            handlerDesc += "、在线标签检索";
+        handlerDesc += "。";
+
         functionService.RegisterHandler(new XmlHandler
         {
             Name = "ComfyuiImageGeneration",
-            Description = _characterPromptIndex == null
-                ? "ComfyUI 生图。"
-                : "ComfyUI 生图与具体二次元角色提示词检索。",
+            Description = handlerDesc,
             Instance = this,
             Functions = exposed
         });
@@ -501,6 +560,103 @@ public class ComfyuiService(
         catch (Exception ex)
         {
             LogWarn($"提示词预设保存失败: {ex.Message}");
+        }
+    }
+
+    // ===================== 在线 Danbooru 语义标签检索 =====================
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("有画面细节时调用以提升出图质量：自然语言描述→标准 Danbooru 英文 tag。三种提示词模式均适用；结果按当前模式组织，禁止中文原句当 prompt。")]
+    public async Task SearchDanbooruTags(
+        [Description("画面描述（中文或英文均可），写清服装/姿势/场景等关键内容")] string query,
+        [Description("模式：full_scene=完整画面（默认）；concept_explore=发散；subject_describe=单物；precise_lookup=近精确/拼写")] string? mode = "full_scene")
+    {
+        var cfg = Configuration ?? new ComfyuiConfig();
+        if (!cfg.EnableDanbooruSearch)
+        {
+            Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 请直接按当前提示词模式写英文并 generateimage");
+            return;
+        }
+
+        try
+        {
+            Log($"Danbooru 搜索: {(query?.Length > 80 ? query[..80] + "…" : query)} mode={mode}");
+            var text = await DanbooruSearchClient.SearchAsync(
+                query ?? "",
+                mode,
+                cfg.DanbooruSearchShowNsfw,
+                cfg.DanbooruSearchPrimaryUrl,
+                cfg.DanbooruSearchFallbackUrl,
+                cfg.DanbooruSearchTimeoutSeconds);
+            Poke(text);
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"Danbooru 搜索异常: {ex.Message}");
+            Poke("status: unavailable\nreason: " + ex.Message
+                 + "\naction: 直接按当前模式写英文并 generateimage，勿反复重试检索");
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("已有英文 Danbooru tag 时查询共现关联标签，用于补搭配；单次生图最多 1 次。")]
+    public async Task GetRelatedDanbooruTags(
+        [Description("逗号分隔的英文 Danbooru tag")] string tags)
+    {
+        var cfg = Configuration ?? new ComfyuiConfig();
+        if (!cfg.EnableDanbooruSearch)
+        {
+            Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 用已有 tag 直接生图");
+            return;
+        }
+
+        try
+        {
+            Log($"Danbooru 关联: {tags}");
+            var text = await DanbooruSearchClient.RelatedAsync(
+                tags ?? "",
+                cfg.DanbooruSearchShowNsfw,
+                cfg.DanbooruSearchPrimaryUrl,
+                cfg.DanbooruSearchFallbackUrl,
+                cfg.DanbooruSearchTimeoutSeconds);
+            Poke(text);
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"Danbooru 关联异常: {ex.Message}");
+            Poke("status: unavailable\nreason: " + ex.Message
+                 + "\naction: 用已有英文 tag 直接 generateimage");
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("用户明确要求画风/画师时，按已确定英文 tag 推荐画师；未要求不要调用。")]
+    public async Task GetDanbooruArtists(
+        [Description("逗号分隔的已确定英文 Danbooru tag")] string tags)
+    {
+        var cfg = Configuration ?? new ComfyuiConfig();
+        if (!cfg.EnableDanbooruSearch || !cfg.EnableDanbooruArtistRecommend)
+        {
+            Poke("status: unavailable\nreason: 画师推荐未开启\naction: 跳过画师，直接生图");
+            return;
+        }
+
+        try
+        {
+            Log($"Danbooru 画师: {tags}");
+            var text = await DanbooruSearchClient.ArtistsAsync(
+                tags ?? "",
+                cfg.DanbooruSearchShowNsfw,
+                cfg.DanbooruSearchPrimaryUrl,
+                cfg.DanbooruSearchFallbackUrl,
+                cfg.DanbooruSearchTimeoutSeconds);
+            Poke(text);
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"Danbooru 画师异常: {ex.Message}");
+            Poke("status: unavailable\nreason: " + ex.Message
+                 + "\naction: 跳过画师，直接 generateimage");
         }
     }
 
