@@ -57,7 +57,11 @@ public static class ComfyuiWorkflowConverter
         return false;
     }
 
-    public static JsonObject ToApiPrompt(JsonNode root, JsonObject? objectInfo = null)
+    /// <summary>
+    /// UI 工作流转 API prompt。
+    /// <paramref name="validate"/> 为 true 且提供 object_info 时，转换后做 required/combo 轻量校验。
+    /// </summary>
+    public static JsonObject ToApiPrompt(JsonNode root, JsonObject? objectInfo = null, bool validate = false)
     {
         if (IsApiFormat(root))
             return (JsonObject)root.DeepClone();
@@ -195,8 +199,16 @@ public static class ComfyuiWorkflowConverter
                 inputsObj[slotName] = new JsonArray { src.src.ToString(), src.srcSlot };
             }
 
-            ApplyWidgets(classType, widgetInputNames, widgets, inputsObj, objectInfo);
-            ApplySpecialNodeInputs(classType, nodeNode, widgets, inputsObj);
+            try
+            {
+                ApplyWidgets(classType, widgetInputNames, widgets, inputsObj, objectInfo);
+                ApplySpecialNodeInputs(classType, nodeNode, widgets, inputsObj);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(
+                    $"节点 {id} ({classType}) widget 映射失败: {ex.Message}", ex);
+            }
 
             prompt[id.ToString()] = new JsonObject
             {
@@ -205,7 +217,115 @@ public static class ComfyuiWorkflowConverter
             };
         }
 
+        if (validate && objectInfo != null)
+            ValidateConvertedPrompt(prompt, objectInfo);
+
         return prompt;
+    }
+
+    /// <summary>
+    /// 对照 object_info 做轻量完整性检查：对已写入的标量做 combo 选项与数值 min/max 校验。
+    /// 不因「缺省 required」失败（多数 UI 流依赖 Comfy 默认值）；错位映射常表现为 combo 非法值。
+    /// 失败时抛出带节点 id / class_type / 字段名的异常，避免只看到远端 Comfy 校验。
+    /// </summary>
+    public static void ValidateConvertedPrompt(JsonObject prompt, JsonObject objectInfo)
+    {
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            var classType = node["class_type"]?.GetValue<string>() ?? "";
+            if (string.IsNullOrWhiteSpace(classType)) continue;
+            if (objectInfo[classType] is not JsonObject info) continue;
+
+            var inputs = node["inputs"] as JsonObject ?? new JsonObject();
+            void CheckGroup(JsonObject? group)
+            {
+                if (group == null) return;
+                foreach (var entry in group)
+                {
+                    var field = entry.Key;
+                    if (string.IsNullOrWhiteSpace(field) || !inputs.ContainsKey(field))
+                        continue;
+                    if (IsConnectionOnlyInput(info, field))
+                        continue;
+                    ValidateFieldValue(kv.Key, classType, field, entry.Value, inputs[field]);
+                }
+            }
+
+            var inputRoot = info["input"] as JsonObject;
+            CheckGroup(inputRoot?["required"] as JsonObject);
+            CheckGroup(inputRoot?["optional"] as JsonObject);
+        }
+    }
+
+    static void ValidateFieldValue(
+        string nodeId, string classType, string field, JsonNode? schema, JsonNode? value)
+    {
+        if (schema is not JsonArray arr || arr.Count == 0 || value == null)
+            return;
+        if (value is JsonArray)
+            return; // 连线 [nodeId, slot]
+
+        // combo: 第一项是选项数组
+        if (arr[0] is JsonArray options)
+        {
+            if (value is not JsonValue jv || !jv.TryGetValue<string>(out var s))
+                return;
+            var allowed = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var opt in options)
+            {
+                if (opt is JsonValue ov && ov.TryGetValue<string>(out var os))
+                    allowed.Add(os);
+                else if (opt != null)
+                    allowed.Add(opt.ToString());
+            }
+            if (allowed.Count > 0 && !allowed.Contains(s))
+            {
+                throw new Exception(
+                    $"转换校验失败: 节点 {nodeId} ({classType}) 参数 '{field}' 值 '{s}' 不在可选列表中");
+            }
+            return;
+        }
+
+        if (arr[0] is not JsonValue typeVal || !typeVal.TryGetValue<string>(out var typeName))
+            return;
+
+        JsonObject? meta = arr.Count > 1 ? arr[1] as JsonObject : null;
+        if (typeName is "INT" or "FLOAT" && value is JsonValue numVal)
+        {
+            double d;
+            try
+            {
+                d = numVal.GetValueKind() switch
+                {
+                    JsonValueKind.Number => numVal.GetValue<double>(),
+                    JsonValueKind.String when double.TryParse(numVal.GetValue<string>(), out var parsed) => parsed,
+                    JsonValueKind.True => 1,
+                    JsonValueKind.False => 0,
+                    _ => double.NaN
+                };
+            }
+            catch
+            {
+                return;
+            }
+            if (double.IsNaN(d)) return;
+
+            if (meta?["min"] != null)
+            {
+                var min = meta["min"]!.GetValue<double>();
+                if (d < min)
+                    throw new Exception(
+                        $"转换校验失败: 节点 {nodeId} ({classType}) 参数 '{field}'={d} 小于最小值 {min}");
+            }
+            if (meta?["max"] != null)
+            {
+                var max = meta["max"]!.GetValue<double>();
+                if (d > max)
+                    throw new Exception(
+                        $"转换校验失败: 节点 {nodeId} ({classType}) 参数 '{field}'={d} 大于最大值 {max}");
+            }
+        }
     }
 
     static void ApplyWidgets(
@@ -215,8 +335,12 @@ public static class ComfyuiWorkflowConverter
         JsonObject inputsObj,
         JsonObject? objectInfo)
     {
+        var nodeInfo = objectInfo != null && objectInfo[classType] is JsonObject info
+            ? info
+            : null;
         var ordered = ResolveWidgetOrder(classType, widgetInputNames, objectInfo);
         int wi = 0;
+        string? previousWritten = null;
 
         foreach (var name in ordered)
         {
@@ -225,15 +349,18 @@ public static class ComfyuiWorkflowConverter
             if (wi >= widgets.Count)
                 break;
 
-            var val = widgets[wi];
-            if (val is JsonValue jvCtrl && jvCtrl.TryGetValue<string>(out var ctrl)
-                && ControlAfterGenerate.Contains(ctrl))
+            // 仅在 seed 控件上下文跳过 control_after_generate；
+            // 禁止把 combo 合法值（如 threshold_schedule="fixed"）全局跳过。
+            while (wi < widgets.Count
+                   && ShouldSkipControlAfterGenerate(name, previousWritten, widgets[wi], nodeInfo))
             {
                 wi++;
-                if (wi >= widgets.Count) break;
-                val = widgets[wi];
             }
 
+            if (wi >= widgets.Count)
+                break;
+
+            var val = widgets[wi];
             wi++;
 
             if (val == null || (val is JsonValue jn && jn.GetValueKind() == JsonValueKind.Null))
@@ -242,7 +369,132 @@ public static class ComfyuiWorkflowConverter
                 continue;
 
             inputsObj[name] = val.DeepClone();
+            previousWritten = name;
         }
+    }
+
+    /// <summary>
+    /// 判断 widgets_values 中的 token 是否应作为 UI-only 的 control_after_generate 跳过。
+    /// 仅当：上一写入字段是 seed 类，或（极少见）当前目标字段是 seed 类却读到 control 字符串。
+    /// 有 object_info 时：当前字段若是 combo/STRING 且选项含该值，绝不跳过。
+    /// </summary>
+    static bool ShouldSkipControlAfterGenerate(
+        string currentInputName,
+        string? previousWrittenInputName,
+        JsonNode? token,
+        JsonObject? nodeObjectInfo)
+    {
+        if (token is not JsonValue jv || !jv.TryGetValue<string>(out var ctrl))
+            return false;
+        if (string.IsNullOrWhiteSpace(ctrl) || !ControlAfterGenerate.Contains(ctrl))
+            return false;
+
+        // 当前字段 schema 表明这是合法 combo/STRING 值（含 fixed 等）→ 必须保留
+        if (nodeObjectInfo != null)
+        {
+            var schema = GetInputSchema(nodeObjectInfo, currentInputName);
+            if (IsWidgetScalarSchema(schema) && SchemaAcceptsStringOption(schema, ctrl))
+                return false;
+
+            // 上一字段是 INT seed，当前 token 是 control → 跳过 UI 控件
+            if (IsSeedLikeField(previousWrittenInputName, nodeObjectInfo))
+                return true;
+
+            // 当前字段是 seed 类 INT，却读到 control 字符串：跳过以免把 randomize 写入 seed
+            if (IsSeedLikeField(currentInputName, nodeObjectInfo))
+                return true;
+
+            return false;
+        }
+
+        // 无 object_info：仅靠字段名启发式 + seed 上下文
+        if (IsSeedLikeFieldName(previousWrittenInputName))
+            return true;
+        if (IsSeedLikeFieldName(currentInputName))
+            return true;
+        return false;
+    }
+
+    static bool IsSeedLikeField(string? name, JsonObject? nodeInfo)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+        if (IsSeedLikeFieldName(name))
+            return true;
+        if (nodeInfo == null)
+            return false;
+        // 名称以 seed 结尾且类型为 INT
+        if (name.EndsWith("seed", StringComparison.OrdinalIgnoreCase))
+        {
+            var schema = GetInputSchema(nodeInfo, name);
+            return IsIntSchema(schema);
+        }
+        return false;
+    }
+
+    static bool IsSeedLikeFieldName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+        return name.Equals("seed", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("noise_seed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static JsonNode? GetInputSchema(JsonObject nodeInfo, string name)
+    {
+        var input = nodeInfo["input"] as JsonObject;
+        if (input?["required"] is JsonObject req && req[name] != null)
+            return req[name];
+        if (input?["optional"] is JsonObject opt && opt[name] != null)
+            return opt[name];
+        if (input?["hidden"] is JsonObject hid && hid[name] != null)
+            return hid[name];
+        return null;
+    }
+
+    static bool IsWidgetScalarSchema(JsonNode? schema)
+    {
+        if (schema is not JsonArray arr || arr.Count == 0)
+            return false;
+        if (arr[0] is JsonArray)
+            return true; // combo
+        if (arr[0] is JsonValue tv && tv.TryGetValue<string>(out var t))
+            return t is "INT" or "FLOAT" or "STRING" or "BOOLEAN";
+        return false;
+    }
+
+    static bool IsIntSchema(JsonNode? schema)
+    {
+        if (schema is not JsonArray arr || arr.Count == 0)
+            return false;
+        return arr[0] is JsonValue tv
+               && tv.TryGetValue<string>(out var t)
+               && t.Equals("INT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// combo 选项含该字符串，或字段类型为 STRING（可接受任意含 fixed 的合法值）。
+    /// </summary>
+    static bool SchemaAcceptsStringOption(JsonNode? schema, string value)
+    {
+        if (schema is not JsonArray arr || arr.Count == 0)
+            return false;
+        if (arr[0] is JsonArray options)
+        {
+            foreach (var opt in options)
+            {
+                if (opt is JsonValue ov && ov.TryGetValue<string>(out var os)
+                    && os.Equals(value, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (opt != null && opt.ToString().Equals(value, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+        if (arr[0] is JsonValue tv && tv.TryGetValue<string>(out var t)
+            && t.Equals("STRING", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return false;
     }
 
     static List<string> ResolveWidgetOrder(string classType, List<string> fallback, JsonObject? objectInfo)
@@ -1149,5 +1401,187 @@ public static class ComfyuiWorkflowConverter
                 return kv.Key;
         }
         return null;
+    }
+
+    /// <summary>
+    /// 最小回归：ApplyFBCacheOnModel 的 threshold_schedule=fixed 不得被跳过；
+    /// KSampler 的 seed 后 control_after_generate 不得写入 API inputs。
+    /// 返回 null 表示通过，否则为失败说明（不抛异常，便于 Awake 自检）。
+    /// </summary>
+    public static string? RunWidgetMappingSelfCheck()
+    {
+        try
+        {
+            // 1) FBCache：widgets 含合法 "fixed" combo，无 object_info 也应保留
+            var fbCacheUi = JsonNode.Parse("""
+            {
+              "nodes": [
+                {
+                  "id": 45,
+                  "type": "ApplyFBCacheOnModel",
+                  "mode": 0,
+                  "inputs": [
+                    { "name": "model", "type": "MODEL", "link": null },
+                    { "name": "object_to_patch", "type": "COMBO", "widget": { "name": "object_to_patch" }, "link": null },
+                    { "name": "residual_diff_threshold", "type": "FLOAT", "widget": { "name": "residual_diff_threshold" }, "link": null },
+                    { "name": "start", "type": "FLOAT", "widget": { "name": "start" }, "link": null },
+                    { "name": "end", "type": "FLOAT", "widget": { "name": "end" }, "link": null },
+                    { "name": "max_consecutive_cache_hits", "type": "INT", "widget": { "name": "max_consecutive_cache_hits" }, "link": null },
+                    { "name": "threshold_step", "type": "INT", "widget": { "name": "threshold_step" }, "link": null },
+                    { "name": "threshold_schedule", "type": "COMBO", "widget": { "name": "threshold_schedule" }, "link": null },
+                    { "name": "num_always_run_blocks", "type": "INT", "widget": { "name": "num_always_run_blocks" }, "link": null },
+                    { "name": "enable_diagnostics", "type": "BOOLEAN", "widget": { "name": "enable_diagnostics" }, "link": null }
+                  ],
+                  "widgets_values": ["diffusion_model", 0.12, 0, 1, -1, 0, "fixed", 1, false]
+                }
+              ],
+              "links": []
+            }
+            """)!;
+
+            var fbPrompt = ToApiPrompt(fbCacheUi);
+            if (fbPrompt["45"] is not JsonObject fbNode
+                || fbNode["inputs"] is not JsonObject fbIn)
+                return "FBCache: 节点 45 未进入 prompt";
+
+            var schedule = fbIn["threshold_schedule"]?.ToString();
+            if (!string.Equals(schedule, "fixed", StringComparison.Ordinal))
+                return $"FBCache: threshold_schedule 应为 fixed，实际为 '{schedule}'（疑似 control token 误跳）";
+
+            var alwaysBlocks = fbIn["num_always_run_blocks"];
+            if (alwaysBlocks is not JsonValue ab
+                || !(ab.GetValueKind() == JsonValueKind.Number && ab.GetValue<int>() == 1
+                     || ab.GetValueKind() == JsonValueKind.String && ab.GetValue<string>() == "1"))
+                return $"FBCache: num_always_run_blocks 应为 1，实际为 '{alwaysBlocks}'";
+
+            if (fbIn["enable_diagnostics"] is not JsonValue diag
+                || diag.GetValueKind() != JsonValueKind.False)
+                return $"FBCache: enable_diagnostics 应为 false，实际为 '{fbIn["enable_diagnostics"]}'";
+
+            // 2) KSampler：seed 后 randomize 必须跳过，seed 数值保留
+            var samplerUi = JsonNode.Parse("""
+            {
+              "nodes": [
+                {
+                  "id": 3,
+                  "type": "KSampler",
+                  "mode": 0,
+                  "inputs": [
+                    { "name": "model", "type": "MODEL", "link": null },
+                    { "name": "positive", "type": "CONDITIONING", "link": null },
+                    { "name": "negative", "type": "CONDITIONING", "link": null },
+                    { "name": "latent_image", "type": "LATENT", "link": null },
+                    { "name": "seed", "type": "INT", "widget": { "name": "seed" }, "link": null },
+                    { "name": "steps", "type": "INT", "widget": { "name": "steps" }, "link": null },
+                    { "name": "cfg", "type": "FLOAT", "widget": { "name": "cfg" }, "link": null },
+                    { "name": "sampler_name", "type": "COMBO", "widget": { "name": "sampler_name" }, "link": null },
+                    { "name": "scheduler", "type": "COMBO", "widget": { "name": "scheduler" }, "link": null },
+                    { "name": "denoise", "type": "FLOAT", "widget": { "name": "denoise" }, "link": null }
+                  ],
+                  "widgets_values": [12345, "randomize", 20, 7.5, "euler", "normal", 1.0]
+                }
+              ],
+              "links": []
+            }
+            """)!;
+
+            var sp = ToApiPrompt(samplerUi);
+            if (sp["3"] is not JsonObject sNode || sNode["inputs"] is not JsonObject sIn)
+                return "KSampler: 节点 3 未进入 prompt";
+
+            if (sIn["seed"] is not JsonValue seedVal
+                || seedVal.GetValueKind() != JsonValueKind.Number
+                || seedVal.GetValue<long>() != 12345L)
+                return $"KSampler: seed 应为 12345，实际为 '{sIn["seed"]}'";
+
+            // control token 不得作为任何 input 值
+            foreach (var input in sIn)
+            {
+                if (input.Value is JsonValue jv
+                    && jv.TryGetValue<string>(out var str)
+                    && ControlAfterGenerate.Contains(str))
+                    return $"KSampler: inputs['{input.Key}'] 不应写入 control token '{str}'";
+            }
+
+            if (sIn["steps"] is not JsonValue stepsVal
+                || stepsVal.GetValueKind() != JsonValueKind.Number
+                || stepsVal.GetValue<int>() != 20)
+                return $"KSampler: steps 应为 20（seed 后跳过 randomize），实际为 '{sIn["steps"]}'";
+
+            // 3) 有 object_info 时：combo 含 fixed 不得跳过；seed 后 control 仍跳过
+            var objectInfo = JsonNode.Parse("""
+            {
+              "ApplyFBCacheOnModel": {
+                "input": {
+                  "required": {
+                    "model": ["MODEL", {}],
+                    "object_to_patch": [["diffusion_model"], {}],
+                    "residual_diff_threshold": ["FLOAT", {"default": 0.12}],
+                    "start": ["FLOAT", {"default": 0}],
+                    "end": ["FLOAT", {"default": 1}],
+                    "max_consecutive_cache_hits": ["INT", {"default": -1}],
+                    "threshold_step": ["INT", {"default": 0}],
+                    "threshold_schedule": [["fixed", "linear"], {}],
+                    "num_always_run_blocks": ["INT", {"default": 1}],
+                    "enable_diagnostics": ["BOOLEAN", {"default": false}]
+                  }
+                },
+                "input_order": {
+                  "required": [
+                    "model", "object_to_patch", "residual_diff_threshold", "start", "end",
+                    "max_consecutive_cache_hits", "threshold_step", "threshold_schedule",
+                    "num_always_run_blocks", "enable_diagnostics"
+                  ]
+                }
+              },
+              "KSampler": {
+                "input": {
+                  "required": {
+                    "model": ["MODEL", {}],
+                    "seed": ["INT", {"default": 0}],
+                    "steps": ["INT", {"default": 20}],
+                    "cfg": ["FLOAT", {"default": 8}],
+                    "sampler_name": [["euler", "dpmpp_2m"], {}],
+                    "scheduler": [["normal", "karras"], {}],
+                    "positive": ["CONDITIONING", {}],
+                    "negative": ["CONDITIONING", {}],
+                    "latent_image": ["LATENT", {}],
+                    "denoise": ["FLOAT", {"default": 1.0}]
+                  }
+                },
+                "input_order": {
+                  "required": [
+                    "model", "seed", "steps", "cfg", "sampler_name", "scheduler",
+                    "positive", "negative", "latent_image", "denoise"
+                  ]
+                }
+              }
+            }
+            """) as JsonObject;
+
+            var fb2 = ToApiPrompt(fbCacheUi, objectInfo, validate: true);
+            var sched2 = fb2["45"]?["inputs"]?["threshold_schedule"]?.ToString();
+            if (!string.Equals(sched2, "fixed", StringComparison.Ordinal))
+                return $"FBCache+object_info: threshold_schedule 应为 fixed，实际 '{sched2}'";
+
+            var sp2 = ToApiPrompt(samplerUi, objectInfo, validate: false);
+            var seed2 = sp2["3"]?["inputs"]?["seed"];
+            if (seed2 is not JsonValue sv2
+                || sv2.GetValueKind() != JsonValueKind.Number
+                || sv2.GetValue<long>() != 12345L)
+                return $"KSampler+object_info: seed 应为 12345，实际 '{seed2}'";
+
+            var steps2 = sp2["3"]?["inputs"]?["steps"];
+            if (steps2 is not JsonValue st2
+                || st2.GetValueKind() != JsonValueKind.Number
+                || st2.GetValue<int>() != 20)
+                return $"KSampler+object_info: steps 应为 20，实际 '{steps2}'";
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"自检异常: {ex.Message}";
+        }
     }
 }

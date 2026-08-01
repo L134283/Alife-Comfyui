@@ -114,6 +114,11 @@ public class ComfyuiService(
 
         RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput);
 
+        // UI→API widget 映射回归（FBCache fixed / KSampler seed control）；仅失败时打日志
+        var mappingCheck = ComfyuiWorkflowConverter.RunWidgetMappingSelfCheck();
+        if (mappingCheck != null)
+            LogWarn($"UI转API 自检未通过: {mappingCheck}");
+
         var styleLabel = cfg.PromptStyle switch
         {
             "natural" => "自然语言",
@@ -1021,8 +1026,9 @@ public class ComfyuiService(
                 }
             }
 
-            // 4) 转 API
-            var apiPrompt = ComfyuiWorkflowConverter.ToApiPrompt(root, objectInfo);
+            // 4) 转 API（有 object_info 时做 required/combo 轻量校验，错误更可读）
+            var apiPrompt = ComfyuiWorkflowConverter.ToApiPrompt(
+                root, objectInfo, validate: objectInfo != null);
             Log($"工作流节点数: {apiPrompt.Count} ({(ComfyuiWorkflowConverter.IsApiFormat(root) ? "API格式" : "UI转API")})");
 
             // 5) 注入基本参数（原有简单模式不变）
@@ -1446,13 +1452,80 @@ public class ComfyuiService(
         var node = JsonNode.Parse(raw) as JsonObject
             ?? throw new Exception($"ComfyUI 提交响应格式异常: {raw}");
         if (node["error"] != null)
-            throw new Exception($"ComfyUI 拒绝工作流: {node["error"]}");
+            throw new Exception($"ComfyUI 拒绝工作流: {FormatComfyError(node["error"])}");
         if (node["node_errors"] is JsonObject ne && ne.Count > 0)
-            throw new Exception($"节点错误: {ne.ToJsonString()}");
+            throw new Exception($"节点错误: {FormatNodeErrors(ne)}");
         var promptId = node["prompt_id"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(promptId))
             throw new Exception($"ComfyUI 提交响应缺少 prompt_id: {raw}");
         return promptId;
+    }
+
+    /// <summary>把 Comfy 的 error 字段整理成短可读文本（不 dump 整份 prompt）。</summary>
+    static string FormatComfyError(JsonNode? error)
+    {
+        if (error == null) return "(无详情)";
+        if (error is JsonValue jv && jv.TryGetValue<string>(out var s))
+            return s;
+        if (error is JsonObject obj)
+        {
+            var type = obj["type"]?.ToString();
+            var msg = obj["message"]?.ToString() ?? obj["details"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(type) && !string.IsNullOrWhiteSpace(msg))
+                return $"{type}: {msg}";
+            if (!string.IsNullOrWhiteSpace(msg))
+                return msg;
+        }
+        var raw = error.ToJsonString();
+        return raw.Length > 300 ? raw[..300] + "..." : raw;
+    }
+
+    /// <summary>按节点汇总 node_errors，便于定位 class/字段问题。</summary>
+    static string FormatNodeErrors(JsonObject nodeErrors)
+    {
+        var parts = new List<string>();
+        foreach (var kv in nodeErrors)
+        {
+            var nodeId = kv.Key;
+            if (kv.Value is not JsonObject detail)
+            {
+                parts.Add($"节点{nodeId}: {kv.Value}");
+                continue;
+            }
+
+            var classType = detail["class_type"]?.ToString();
+            var errors = detail["errors"] as JsonArray;
+            if (errors == null || errors.Count == 0)
+            {
+                var one = detail.ToJsonString();
+                if (one.Length > 200) one = one[..200] + "...";
+                parts.Add(string.IsNullOrWhiteSpace(classType)
+                    ? $"节点{nodeId}: {one}"
+                    : $"节点{nodeId}({classType}): {one}");
+                continue;
+            }
+
+            foreach (var err in errors)
+            {
+                if (err is not JsonObject e)
+                {
+                    parts.Add($"节点{nodeId}: {err}");
+                    continue;
+                }
+                var et = e["type"]?.ToString() ?? "error";
+                var msg = e["message"]?.ToString() ?? e["details"]?.ToString() ?? e.ToJsonString();
+                var extra = e["extra_info"] as JsonObject;
+                var inputName = extra?["input_name"]?.ToString();
+                var loc = string.IsNullOrWhiteSpace(classType) ? $"节点{nodeId}" : $"节点{nodeId}({classType})";
+                if (!string.IsNullOrWhiteSpace(inputName))
+                    parts.Add($"{loc} 字段'{inputName}' {et}: {msg}");
+                else
+                    parts.Add($"{loc} {et}: {msg}");
+            }
+        }
+
+        var joined = string.Join("; ", parts);
+        return joined.Length > 800 ? joined[..800] + "..." : joined;
     }
 
     async Task<JsonNode> WaitHistoryAsync(

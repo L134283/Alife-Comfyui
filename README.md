@@ -5,7 +5,7 @@
 ## 功能
 
 - 可配置 ComfyUI 地址（默认 `http://127.0.0.1:8188`）
-- 支持 **UI 工作流 JSON** 自动转 API 格式，也支持官方 **Export (API)** 导出的 API JSON
+- 支持 **UI 工作流 JSON** 自动转 API 格式，也支持官方 **Export (API)** 导出的 API JSON（seed 的 control 与 combo 合法值 `fixed` 等可区分，避免 FBCache 等节点参数错位）
 - 三档常用分辨率预设（竖版 / 横版 / 正方形），AI 可智能选择，也可由用户指定宽高
 - **固定正向提示词前缀**：与 AI 提示词合并后自动去重，统一为英文逗号+空格
 - **固定负面提示词**：可选；填写则覆盖工作流负面并规范为英文逗号分隔
@@ -172,6 +172,7 @@ masterpiece, best quality, a girl on the bed, a man sit in the desk
 
 - 自定义节点（WeiLin / ZML / LoRA 等）必须在 ComfyUI 侧已安装
 - UI 工作流中的 **Anything Everywhere** 会尽量通过 `ue_links` 还原；若失败，请改用 API 导出或显式连线
+- UI→API 时：KSampler 等节点 seed 后的 `fixed` / `randomize` 等是前端控件，**不会**写入 API；若自定义节点（如 `ApplyFBCacheOnModel`）的 combo 选项本身就是 `fixed`，会作为真实参数保留。含此类节点的复杂流建议在网页与插件各验证一次
 - 若 history 无图但 ZML 保存到了自定义目录，插件只会认领本次任务开始后新写入且尚未被其他任务认领的图片
 - `workflows/艾芙.json` 仅作为示例工作流，可替换为任意你自己的工作流
 
@@ -196,6 +197,12 @@ masterpiece, best quality, a girl on the bed, a man sit in the desk
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v1.3.2（2026-08-01）
+
+- 修复 UI→API：将 combo 合法值 `fixed`（如 ApplyFBCacheOnModel 的 `threshold_schedule`）误当作 seed 的 `control_after_generate` 跳过，导致参数错位
+- 仅在 seed 上下文跳过 control token；有 object_info 时按类型/选项判断
+- 生图转换后轻量校验 + `/prompt` 节点错误更可读；模块启动自检 FBCache/KSampler 映射
 
 ### v1.3.1（2026-07-31）
 
