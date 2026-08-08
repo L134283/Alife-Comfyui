@@ -41,6 +41,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         public string Name { get; set; } = "";
         public string Path { get; set; } = "";
         public bool Enabled { get; set; } = true;
+        public string Prefix { get; set; } = "";
     }
 
     record PresetCard
@@ -1248,6 +1249,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 }
 .cfy-wf-card {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 10px;
     padding: 10px 14px;
@@ -1353,6 +1355,39 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     min-width: 0;
 }
 .cfy-wf-path:hover, .cfy-wf-path:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
+}
+.cfy-wf-prefix-row {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.cfy-wf-prefix-row::before {
+    content: '前缀';
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 700;
+    color: #be185d;
+    opacity: 0.85;
+}
+.cfy-wf-prefix {
+    flex: 1;
+    border: 1.5px dashed rgba(244,114,182,0.3);
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #5b2145;
+    background: rgba(255,255,255,0.7);
+    font-family: inherit;
+    outline: none;
+    transition: all 0.3s ease;
+    box-sizing: border-box;
+    min-width: 0;
+}
+.cfy-wf-prefix:hover, .cfy-wf-prefix:focus {
     border-color: #ec4899;
     box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
 }
@@ -1946,6 +1981,20 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
             b.CloseElement(); // path-row
 
+            // 固定正向前缀输入
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-wf-prefix-row");
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "class", "cfy-wf-prefix");
+            b.AddAttribute(i++, "value", card.Prefix);
+            b.AddAttribute(i++, "placeholder", "固定正向前缀（tag/短句；留空沿用全局前缀）");
+            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                UpdateWorkflowCardPrefix(cardIndex, e.Value?.ToString() ?? "");
+            }));
+            b.CloseElement();
+            b.CloseElement(); // prefix-row
+
             // 删除按钮
             b.OpenElement(i++, "button");
             b.AddAttribute(i++, "type", "button");
@@ -2137,14 +2186,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-panel");
         AddTextArea(b, ref i, "固定正向提示词前缀（tag/短句，逗号或换行均可）", Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
-        AddHint(b, ref i, "与 AI 提示词合并后自动去重；最终注入统一为英文逗号+空格，如：masterpiece, best quality, a girl on the bed。留空则不拼接");
+        AddHint(b, ref i, "与 AI 提示词合并后自动去重；最终注入统一为英文逗号+空格，如：masterpiece, best quality。命名工作流可在各自卡片里单独设前缀（留空则沿用这里）；默认工作流始终用这里。留空则不拼接");
         AddTextArea(b, ref i, "固定负面提示词（可空=用工作流自带）", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
         AddHint(b, ref i, "留空用工作流自带负面；填写则覆盖并规范为英文逗号分隔");
         AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
         {
             ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
             ("natural", "自然语言 — 角色 Tag 置前 + 英文短句"),
-            ("hybrid", "混合模式 — 外貌/服饰用标签，动作/场景用自然语言")
+            ("hybrid", "混合模式 — 静态用标签，动作/关系用短句；多人每角色独立描述")
         });
         AddHint(b, ref i, "控制 AI 生成提示词的格式风格，不影响已有前缀");
         b.CloseElement();
@@ -2460,6 +2509,28 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
         b.CloseElement();
         AddHint(b, ref i, "开启后，AI 可直接操控工作流节点参数（更换模型、调整步数/CFG/采样器等）。不开启则保持原有简单模式不受影响。");
+
+        // 隐式注入开关（4.0 新特性：DocumentMode.Implicit / Explicit 切换）
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            Configuration.ImplicitInjection = !Configuration.ImplicitInjection;
+            StateHasChanged();
+        }));
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-advanced-label");
+        b.AddContent(i++, "隐式注入（省 token）");
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", "cfy-advanced-badge");
+        b.AddContent(i++, "4.0");
+        b.CloseElement();
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.ImplicitInjection ? " active" : "")}");
+        b.CloseElement();
+        b.CloseElement();
+        AddHint(b, ref i, "开启后函数文档不直接注入系统提示词，AI 需先调用 <comfyuiimagegeneration/> 按需加载（省 token，渐进式）；关闭则为显式注入（默认，功能说明直接可用）。改动需重载模块后生效。");
 
         if (Configuration.AdvancedMode)
         {
@@ -2991,6 +3062,22 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
     // ===================== 命名工作流卡片管理 =====================
 
+    static string? WfJsonString(System.Text.Json.Nodes.JsonObject o, string key)
+    {
+        if (o.TryGetPropertyValue(key, out var node) && node is System.Text.Json.Nodes.JsonValue value
+            && value.TryGetValue<string>(out var s))
+            return s;
+        return null;
+    }
+
+    static bool? WfJsonBool(System.Text.Json.Nodes.JsonObject o, string key)
+    {
+        if (o.TryGetPropertyValue(key, out var node) && node is System.Text.Json.Nodes.JsonValue value
+            && value.TryGetValue<bool>(out var b))
+            return b;
+        return null;
+    }
+
     void LoadWorkflowCards()
     {
         _workflowCards = new();
@@ -3006,9 +3093,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 {
                     _workflowCards.Add(new WorkflowCard
                     {
-                        Name = item["n"]?.GetValue<string>() ?? item["name"]?.GetValue<string>() ?? "",
-                        Path = item["p"]?.GetValue<string>() ?? item["path"]?.GetValue<string>() ?? "",
-                        Enabled = item["e"]?.GetValue<bool>() ?? true
+                        Name = WfJsonString(item, "n") ?? WfJsonString(item, "name") ?? "",
+                        Path = WfJsonString(item, "p") ?? WfJsonString(item, "path") ?? "",
+                        Enabled = WfJsonBool(item, "e") ?? true,
+                        Prefix = WfJsonString(item, "f") ?? WfJsonString(item, "prefix") ?? ""
                     });
                 }
             }
@@ -3025,7 +3113,8 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             {
                 ["n"] = card.Name,
                 ["p"] = card.Path,
-                ["e"] = card.Enabled
+                ["e"] = card.Enabled,
+                ["f"] = card.Prefix
             });
         }
         Configuration.NamedWorkflows = arr.ToJsonString();
@@ -3058,6 +3147,13 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     {
         if (index < 0 || index >= _workflowCards.Count) return;
         _workflowCards[index] = _workflowCards[index] with { Path = path };
+        SaveWorkflowCards();
+    }
+
+    void UpdateWorkflowCardPrefix(int index, string prefix)
+    {
+        if (index < 0 || index >= _workflowCards.Count) return;
+        _workflowCards[index] = _workflowCards[index] with { Prefix = prefix };
         SaveWorkflowCards();
     }
 

@@ -27,8 +27,9 @@ namespace Alife.Plugin.Comfyui;
     defaultCategory: "Doro的妙妙工具",
     EditorUI = typeof(ComfyuiServiceUI))]
 public class ComfyuiService(
-    XmlFunctionCaller functionService
-) : InteractiveModule<ComfyuiService>, IConfigurable<ComfyuiConfig>
+    XmlFunctionCaller functionService,
+    IInteractor<ComfyuiService> interactor
+) : ChatBehaviour, IConfigurable<ComfyuiConfig>
 {
     static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(10) };
 
@@ -54,14 +55,17 @@ public class ComfyuiService(
     static readonly SemaphoreSlim PriorityGate = new(1, 1);
     static readonly ConcurrentDictionary<string, long> ClaimedCustomOutputs = new(StringComparer.OrdinalIgnoreCase);
 
-    record WorkflowEntry(string Name, string Path, bool Enabled);
+    record WorkflowEntry(string Name, string Path, bool Enabled, string Prefix = "");
     CharacterPromptIndex? _characterPromptIndex;
+    // 注册到 XmlFunctionCaller 的处理器（热重载/销毁时注销，避免旧 handler 累积）
+    XmlHandler? _registeredHandler;
+    // status 处理器（无文档模式）：热重载/销毁时一并注销，避免函数表累积
+    XmlHandler? _statusHandler;
 
     record PromptPresetEntry(string Name, string Content);
 
-    public override async Task AwakeAsync(AwakeContext context)
+    protected override async Task OnAwake()
     {
-        await base.AwakeAsync(context);
         var cfg = Configuration ?? new ComfyuiConfig();
         var wf = ResolveWorkflowPath(cfg);
 
@@ -112,8 +116,6 @@ public class ComfyuiService(
         var workflowPaths = new[] { wf }.Concat(namedWorkflows.Select(w => w.Path));
         var supportsImageInput = await AnyWorkflowSupportsImageInputAsync(workflowPaths);
 
-        RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput);
-
         // UI→API widget 映射回归（FBCache fixed / KSampler seed control）；仅失败时打日志
         var mappingCheck = ComfyuiWorkflowConverter.RunWidgetMappingSelfCheck();
         if (mappingCheck != null)
@@ -129,13 +131,18 @@ public class ComfyuiService(
         {
             "natural" =>
                 "检索得到的角色 Tag 必须原样放在开头；其后用 2~4 个简洁英文短句依次写服装、动作、构图、场景与光线。" +
+                "多人时每个角色各用一句完整短句描述其外貌/服装/表情，人物关系与互动单独一句。" +
                 "避免故事叙述、否定句和互相冲突的描述。",
 
             "hybrid" =>
-                "角色身份、外貌、服装和表情使用逗号分隔的英文 Tag；复杂动作、人物关系、构图和场景用 1~2 个简洁英文短句追加在末尾。",
+                "静态元素（身份、外貌、服装、表情、光线）用精准英文 Tag；动态内容（动作、互动、人物关系、构图、氛围）用简洁自然短句。" +
+                "单人：先写该角色特征 Tag，再用 1~2 个短句写动作、构图、场景与光线。" +
+                "多人：先写人数（如 1girl, 1boy），每个角色各自一个独立短语单元，用自然语言串联其外貌/服装/表情（如 a silver-haired girl in a white maid outfit, smiling），角色间逗号分隔；最后用 1 个短句写人物关系、互动与场景。" +
+                "表情/姿势归属所在角色；禁止把多个角色的特征混在同一串 Tag 里；去重并避免矛盾。",
 
             _ =>
-                "使用具体的 Danbooru 风格英文 Tag，半角逗号分隔。顺序为主体身份、人数、外貌、服装、表情动作、构图、背景与光线；去重并避免矛盾。"
+                "使用具体的 Danbooru 风格英文 Tag，半角逗号分隔。顺序为主体身份、人数、外貌、服装、表情动作、构图、背景与光线。" +
+                "多人时先写人数（1girl, 1boy 等），每个角色的特征 Tag 各自连续排列、角色间用逗号分隔，禁止混写；去重并避免矛盾。"
         };
 
         var autoOpenNote = cfg.AutoOpenImage
@@ -152,41 +159,35 @@ public class ComfyuiService(
             """;
         }
 
+        // 4.0 隐式注入：函数文档按需加载，需提示 AI 先打开入口
+        var implicitNote = cfg.ImplicitInjection
+            ? "\n- 隐式注入已开启：使用生图/检索功能前，先调用 <comfyuiimagegeneration/> 加载完整函数说明与调用方式，再按文档调用对应函数。"
+            : "";
+
         var workflowListDesc = hasNamedWorkflows
-            ? $"\n- 可选 workflow：{string.Join("、", namedWorkflows.Select(w => $"\"{w.Name}\""))}；不传则使用默认工作流。"
+            ? $"\n- 可选 workflow：{string.Join("、", namedWorkflows.Select(w => $"\"{w.Name}\""))}。"
             : "";
 
         var nodeControlDesc = cfg.EnableNodeControl
             ? "\n- 高级节点控制已开启；仅在用户明确要求时修改。需要节点信息时先调用 getcomfyuicontrols。"
             : "";
 
-        var denoiseGuide = supportsImageInput
-            ? "\n- 图生图 denoise：微调 0.30~0.45，换装/姿势 0.55~0.70，大改 0.70~0.85；文生图不要传。"
-            : "";
         var imageInputNote = supportsImageInput
-            ? "\n- imagepath 仅在图生图时传本地路径或图片 URL；文生图不要传。"
+            ? "\n- 图生图 denoise 档位：微调 0.30~0.45、换装/姿势 0.55~0.70、大改 0.70~0.85；文生图不传。"
             : "";
 
-        var prefixNote = string.IsNullOrWhiteSpace(cfg.PositivePromptPrefix)
-            ? "" : "\n- 固定正向前缀由插件自动添加，并与 AI 提示词合并后自动去重（统一为「英文逗号+空格」）；不要把前缀里已有的 tag/短句再写进 prompt。";
         var characterLookupNote = _characterPromptIndex == null
             ? ""
             : """
 
-            【具体角色检索】
-            - 仅当主体是有明确名字的既有动漫、游戏、漫画或虚拟主播角色时，先调用 findcharacterprompt；作品已知时同时传 work。
-            - 画你自己的人设、原创角色、普通人物、真人，或只指定服装/动作/画风时，直接组织提示词，不要检索。
-            - 仅使用 status: matched 的结果。prompt 必须保留 trigger_tags_xml 与 appearance_tags_xml；动作、构图和场景按当前请求自由组合。
-            - 用户指定了新服装时舍弃 default_outfit_tags_xml，只写新服装；未指定服装时可使用默认服装。
-            - 返回字段已按 XML 属性转义，组合进 generateimage 的 prompt 属性时保持 &amp; 等转义文本原样，不要还原或翻译。
+            【角色检索】
+            - findcharacterprompt 只认 status: matched；ambiguous 返回候选时带作品名重查，禁止直接猜 tag；组合时保持 &amp; 等转义原文。
             """;
 
         var presetNote = """
 
             【提示词预设】
-            - 可调用 getpromptpreset 检索已保存的提示词预设（角色人设/复杂动作/完整背景等），不传 name 返回列表，传 name 返回完整内容。
-            - 拿到预设内容后组合到 generateimage 的 prompt 中，不要原样塞入，需结合当前请求调整。
-            - 用户要求保存常用提示词时调用 savepromptpreset（name=名称, content=内容）。
+            - 预设内容按请求调整后组合进 prompt，勿原样塞入；用户要保存时调 savepromptpreset。
             """;
 
         var danbooruNote = "";
@@ -195,7 +196,7 @@ public class ComfyuiService(
             var styleUseLine = cfg.PromptStyle switch
             {
                 "natural" =>
-                    "- 自然语言模式同样积极 search（可用 full_scene 一次取概念）；落笔时角色 Tag 按规则放开头，其后用 2~4 个英文短句消化检索结果（可嵌入关键英文词），禁止把返回 tag 列表原样当作整段 prompt。",
+                    "- 自然语言模式同样积极 search（可用 full_scene 一次取概念）；禁止把返回 tag 列表原样当作整段 prompt。",
                 "hybrid" =>
                     "- 混合模式：检索 tag 进身份/外貌/服装/表情的 Tag 段；动作、关系、场景仍用短句。",
                 _ =>
@@ -208,28 +209,58 @@ public class ComfyuiService(
 
             danbooruNote = $"""
 
-            【在线标签检索】（质量增强：有画面细节时积极使用）
-            - 用户描述含服装/道具/姿势/场景/光影/风格等细节时，优先调用 searchdanboorutags 再 generateimage，以提升提示词准确度；三种提示词模式均适用，不要因为自然语言模式而少用。
-            - 极简且无额外画面细节时可直接 generateimage。
-            - 已有英文 tag 需补搭配时 getrelateddanboorutags。
-            - 优先级：findcharacterprompt（具名角色）> 用户预设 > 在线标签 > 自写。在线不得覆盖角色 trigger/appearance；用户新服装以用户为准。
-            - 单次生图 search≤1、related≤1；一次 query 写清关键画面即可；禁止中文原句当 prompt。
-            - 仅用 status: ok；unavailable/超时则按当前模式自写英文并 generateimage，勿声称已检索、勿反复重试检索。
+            【在线标签检索】
+            - 单次生图 search≤1、related≤1；unavailable 就自写英文直接生成，勿反复重试。
+            - 优先级：角色 > 预设 > 在线 > 自写；在线不得覆盖角色身份/服装。
             {styleUseLine}{artistLine}
             """;
         }
 
-        Prompt($$"""
+        // 常时注入的硬规则：不依赖函数文档，AI 任何时候都需要（英文、质量词、方向、提示词模式、发图格式）。
+        var hardRules = $$"""
         【ComfyUI 生图】
         - 所有 prompt 使用英文，直接描述目标画面，不要把用户的中文命令原句塞进 prompt。
-        - 尺寸：portrait={{cfg.PortraitWidth}}×{{cfg.PortraitHeight}}，landscape={{cfg.LandscapeWidth}}×{{cfg.LandscapeHeight}}，square={{cfg.SquareWidth}}×{{cfg.SquareHeight}}；默认 {{cfg.DefaultOrientation}}。
-        - 提示词模式：{{styleLabel}}。{{styleGuide}}{{prefixNote}}{{workflowListDesc}}{{imageInputNote}}{{denoiseGuide}}{{nodeControlDesc}}{{autoOpenNote}}
-        - QQ 环境需要发图时使用 <qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />。私聊 type=Private、群聊 type=Group，targetid 填当前会话的 QQ 号或群号。{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}
-        """);
+        - 不要写画风/质量类提示词（如 masterpiece、best quality、score、style、画师名等）：画风与质量由插件固定前缀或工作流决定，AI 只写主体、动作、服装、构图、场景与氛围；用户明确指定画风/画师时例外。
+        - 方向：portrait=竖版、landscape=横版、square=正方形；默认 {{cfg.DefaultOrientation}}，也可直接传 width/height。
+        - 提示词模式：{{styleLabel}}。{{styleGuide}}
+        - QQ 发图：<qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />（私聊 Private / 群聊 Group）。
+        """;
+
+        // 详细规则：与各函数的使用时机/约束相关。显式模式直接注入（现状不变）；
+        // 隐式模式放进 handler.Explanation，AI 调用 <comfyuiimagegeneration/> 后随文档一并加载，
+        // 避免这些规则在开启隐式注入时仍常时占用 token。
+        var detailedRules = $$"""
+        {{workflowListDesc}}{{imageInputNote}}{{nodeControlDesc}}{{autoOpenNote}}{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}
+        """;
+
+        RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput,
+            cfg.ImplicitInjection ? detailedRules : null);
+
+        if (cfg.ImplicitInjection)
+            interactor.Prompt(hardRules + implicitNote);
+        else
+            interactor.Prompt(hardRules + detailedRules + implicitNote);
+    }
+
+    /// <summary>热重载/活动销毁时注销本模块注册的 XmlHandler，避免旧 handler 残留在函数表中。</summary>
+    protected override Task OnDestroy()
+    {
+        if (_registeredHandler != null)
+        {
+            functionService.UnregisterHandler(_registeredHandler);
+            _registeredHandler = null;
+        }
+        if (_statusHandler != null)
+        {
+            functionService.UnregisterHandler(_statusHandler);
+            _statusHandler = null;
+        }
+        return Task.CompletedTask;
     }
 
     void RegisterFunctionHandlers(
-        ComfyuiConfig cfg, bool hasNamedWorkflows, bool supportsImageInput)
+        ComfyuiConfig cfg, bool hasNamedWorkflows, bool supportsImageInput,
+        string? explanation = null)
     {
         var discovered = new XmlHandler(this);
         var functions = discovered.Functions.ToDictionary(
@@ -237,12 +268,13 @@ public class ComfyuiService(
 
         if (functions.TryGetValue("checkcomfyuistatus", out var statusFunction))
         {
-            functionService.RegisterHandlerWithoutDocument(new XmlHandler
+            _statusHandler = new XmlHandler
             {
                 Name = "ComfyuiStatusInternal",
                 Instance = this,
                 Functions = new List<XmlFunction> { statusFunction }
-            });
+            };
+            functionService.RegisterHandlerWithoutDocument(_statusHandler);
         }
 
         var exposed = new List<XmlFunction>();
@@ -338,13 +370,25 @@ public class ComfyuiService(
             handlerDesc += "、在线标签检索";
         handlerDesc += "。";
 
-        functionService.RegisterHandler(new XmlHandler
+        // 4.0：DocumentMode 控制函数文档的注入方式。
+        // 显式（默认）：完整函数文档直接注入系统提示词，AI 开箱即用；
+        // 隐式：只暴露触发标签 <comfyuiimagegeneration/>，AI 需先调用它按需加载文档（省 token，渐进式）。
+        var documentMode = cfg.ImplicitInjection
+            ? DocumentMode.Implicit
+            : DocumentMode.Explicit;
+        var handler = new XmlHandler
         {
             Name = "ComfyuiImageGeneration",
             Description = handlerDesc,
+            // 隐式模式：详细规则随 <comfyuiimagegeneration/> 加载的文档一并输出；显式模式保持 null 避免重复注入
+            Explanation = explanation,
             Instance = this,
             Functions = exposed
-        });
+        };
+        _registeredHandler = handler;
+        if (documentMode == DocumentMode.Implicit)
+            Log("隐式注入已开启：AI 需先调用 <comfyuiimagegeneration/> 按需加载函数文档");
+        functionService.RegisterHandler(handler, documentMode);
     }
 
     static XmlFunction CloneFunctionDocument(
@@ -368,7 +412,7 @@ public class ComfyuiService(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("使用 ComfyUI 工作流生成图片。传入正向提示词（必填）；可选 orientation(portrait/landscape/square) 或 width/height；可选 imagePath 进行图生图。配置多个工作流后可传 workflow 切换；AI 节点控制开启后可传 model/steps/cfg 等高级参数。开启「优先生图」时会等待出图结束再返回。")]
+    [Description("使用 ComfyUI 工作流生成图片（生图主入口）。正向提示词必填；其余方向/尺寸/图生图/切换工作流/采样参数等均为可选，见各参数说明。")]
     public async Task GenerateImage(
         [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
         [Description("图片方向：portrait=竖版、landscape=横版、square=正方形；实际尺寸取当前配置")] string? orientation = null,
@@ -386,6 +430,8 @@ public class ComfyuiService(
         [Description("【高级】安全节点覆盖，格式 {\"节点ID\":{\"参数名\":标量值}}")] string? nodeOverrides = null)
     {
         var cfgConfig = Configuration ?? new ComfyuiConfig();
+        if (!cfgConfig.PriorityImageGen)
+            LogWarn($"优先生图未生效：运行时 PriorityImageGen=false（Configuration={(Configuration is null ? "null" : "已注入")}）。请确认 UI 已开启并保存（注意区分「应用到角色/应用到全局」，角色级旧配置会覆盖全局新值），必要时重启活动。");
         if (cfgConfig.PriorityImageGen)
         {
             // 阻塞到出图结束：同轮 Speak 等函数返回后再执行，避免 TTS 与 Comfy 抢 GPU
@@ -397,7 +443,7 @@ public class ComfyuiService(
                 entered = await PriorityGate.WaitAsync(TimeSpan.FromSeconds(3));
                 if (!entered)
                 {
-                    Poke("已有生图任务进行中，请稍后再试（优先生图模式不叠任务）");
+                    interactor.Poke("已有生图任务进行中，请稍后再试（优先生图模式不叠任务）");
                     return;
                 }
 
@@ -414,7 +460,7 @@ public class ComfyuiService(
         }
         else
         {
-            Poke("生图请求已发出，可以继续聊天");
+            interactor.Poke("生图请求已发出，可以继续聊天");
             _ = RunGenerationSafelyAsync(
                 prompt, orientation, imagePath, width, height,
                 workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
@@ -437,14 +483,14 @@ public class ComfyuiService(
     {
         if (_characterPromptIndex == null)
         {
-            Poke("角色提示词索引未加载，请检查 character-prompts.json 是否位于插件目录");
+            interactor.Poke("角色提示词索引未加载，请检查 character-prompts.json 是否位于插件目录");
             return;
         }
 
         var matches = _characterPromptIndex.Search(name, work, 3);
         if (matches.Count == 0)
         {
-            Poke("status: not_found\nquery: " + name
+            interactor.Poke("status: not_found\nquery: " + name
                  + (string.IsNullOrWhiteSpace(work) ? "" : $"\nwork: {work}")
                  + "\naction: 不要编造角色 Tag；检查角色名或作品名后再查询");
             return;
@@ -462,7 +508,7 @@ public class ComfyuiService(
             var candidates = string.Join("\n", matches.Select((match, index) =>
                 $"{index + 1}. {match.Entry.ChineseName} [{match.Entry.EnglishName}] | " +
                 $"{DisplayWork(match.Entry)} | match_score: {(int)Math.Round(match.Score * 100)}/100"));
-            Poke($"status: ambiguous\nquery: {name}\ncandidates:\n{candidates}\n" +
+            interactor.Poke($"status: ambiguous\nquery: {name}\ncandidates:\n{candidates}\n" +
                  "action: 不要使用任何角色 Tag；请结合上下文选定角色后，带作品名 work 重新查询");
             Log($"角色检索存在歧义: {name}");
             return;
@@ -480,7 +526,7 @@ public class ComfyuiService(
             .Append("default_outfit_tags_xml: ").AppendLine(XmlSafe(best.Entry.DefaultOutfitTags))
             .Append("usage: 必须保留前两项；指定新服装时不要使用默认服装，动作、构图和场景按请求自由组合");
 
-        Poke(result.ToString());
+        interactor.Poke(result.ToString());
         Log($"角色检索: {name} -> {best.Entry.EnglishName} ({matchScore}/100)");
     }
 
@@ -644,7 +690,7 @@ public class ComfyuiService(
         var cfg = Configuration ?? new ComfyuiConfig();
         if (!cfg.EnableDanbooruSearch)
         {
-            Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 请直接按当前提示词模式写英文并 generateimage");
+            interactor.Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 请直接按当前提示词模式写英文并 generateimage");
             return;
         }
 
@@ -658,12 +704,12 @@ public class ComfyuiService(
                 cfg.DanbooruSearchPrimaryUrl,
                 cfg.DanbooruSearchFallbackUrl,
                 cfg.DanbooruSearchTimeoutSeconds);
-            Poke(text);
+            interactor.Poke(text);
         }
         catch (Exception ex)
         {
             LogWarn($"Danbooru 搜索异常: {ex.Message}");
-            Poke("status: unavailable\nreason: " + ex.Message
+            interactor.Poke("status: unavailable\nreason: " + ex.Message
                  + "\naction: 直接按当前模式写英文并 generateimage，勿反复重试检索");
         }
     }
@@ -676,7 +722,7 @@ public class ComfyuiService(
         var cfg = Configuration ?? new ComfyuiConfig();
         if (!cfg.EnableDanbooruSearch)
         {
-            Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 用已有 tag 直接生图");
+            interactor.Poke("status: unavailable\nreason: 在线标签检索未开启\naction: 用已有 tag 直接生图");
             return;
         }
 
@@ -689,12 +735,12 @@ public class ComfyuiService(
                 cfg.DanbooruSearchPrimaryUrl,
                 cfg.DanbooruSearchFallbackUrl,
                 cfg.DanbooruSearchTimeoutSeconds);
-            Poke(text);
+            interactor.Poke(text);
         }
         catch (Exception ex)
         {
             LogWarn($"Danbooru 关联异常: {ex.Message}");
-            Poke("status: unavailable\nreason: " + ex.Message
+            interactor.Poke("status: unavailable\nreason: " + ex.Message
                  + "\naction: 用已有英文 tag 直接 generateimage");
         }
     }
@@ -707,7 +753,7 @@ public class ComfyuiService(
         var cfg = Configuration ?? new ComfyuiConfig();
         if (!cfg.EnableDanbooruSearch || !cfg.EnableDanbooruArtistRecommend)
         {
-            Poke("status: unavailable\nreason: 画师推荐未开启\naction: 跳过画师，直接生图");
+            interactor.Poke("status: unavailable\nreason: 画师推荐未开启\naction: 跳过画师，直接生图");
             return;
         }
 
@@ -720,12 +766,12 @@ public class ComfyuiService(
                 cfg.DanbooruSearchPrimaryUrl,
                 cfg.DanbooruSearchFallbackUrl,
                 cfg.DanbooruSearchTimeoutSeconds);
-            Poke(text);
+            interactor.Poke(text);
         }
         catch (Exception ex)
         {
             LogWarn($"Danbooru 画师异常: {ex.Message}");
-            Poke("status: unavailable\nreason: " + ex.Message
+            interactor.Poke("status: unavailable\nreason: " + ex.Message
                  + "\naction: 跳过画师，直接 generateimage");
         }
     }
@@ -738,7 +784,7 @@ public class ComfyuiService(
     {
         if (string.IsNullOrWhiteSpace(name))
         {
-            Poke("预设名称不能为空");
+            interactor.Poke("预设名称不能为空");
             return;
         }
         name = name.Trim();
@@ -754,7 +800,7 @@ public class ComfyuiService(
         presets.Add(new PromptPresetEntry(name, content));
         SavePromptPresets(presets);
 
-        Poke($"status: saved\nname: {name}\naction: 下次可用 getpromptpreset name=\"{name}\" 检索复用");
+        interactor.Poke($"status: saved\nname: {name}\naction: 下次可用 getpromptpreset name=\"{name}\" 检索复用");
         Log($"保存提示词预设: {name}");
     }
 
@@ -766,7 +812,7 @@ public class ComfyuiService(
         var presets = LoadPromptPresets();
         if (presets.Count == 0)
         {
-            Poke("status: empty\naction: 暂无提示词预设，可调用 savepromptpreset 保存");
+            interactor.Poke("status: empty\naction: 暂无提示词预设，可调用 savepromptpreset 保存");
             return;
         }
 
@@ -774,7 +820,7 @@ public class ComfyuiService(
         {
             var names = string.Join("\n", presets.Select((p, i) =>
                 $"{i + 1}. {p.Name}"));
-            Poke($"status: list\ncount: {presets.Count}\npresets:\n{names}");
+            interactor.Poke($"status: list\ncount: {presets.Count}\npresets:\n{names}");
             return;
         }
 
@@ -783,11 +829,11 @@ public class ComfyuiService(
             p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
         if (match == null)
         {
-            Poke($"status: not_found\nname: {name}\naction: 预设不存在，可调用 getpromptpreset 查看列表");
+            interactor.Poke($"status: not_found\nname: {name}\naction: 预设不存在，可调用 getpromptpreset 查看列表");
             return;
         }
 
-        Poke($"status: found\nname: {match.Name}\ncontent:\n{match.Content}");
+        interactor.Poke($"status: found\nname: {match.Name}\ncontent:\n{match.Content}");
         Log($"检索提示词预设: {name}");
     }
 
@@ -801,7 +847,7 @@ public class ComfyuiService(
             var cfg = Configuration ?? new ComfyuiConfig();
             if (!cfg.EnableNodeControl)
             {
-                Poke("AI 节点控制未开启");
+                interactor.Poke("AI 节点控制未开启");
                 return;
             }
 
@@ -813,12 +859,12 @@ public class ComfyuiService(
             var root = JsonNode.Parse(raw) ?? throw new InvalidDataException("工作流 JSON 为空");
             var prompt = ComfyuiWorkflowConverter.ToApiPrompt(root);
             var label = string.IsNullOrWhiteSpace(workflow) ? "默认工作流" : workflow.Trim();
-            Poke($"workflow: {label}\n{ComfyuiWorkflowConverter.BuildNodeControlDescription(prompt)}");
+            interactor.Poke($"workflow: {label}\n{ComfyuiWorkflowConverter.BuildNodeControlDescription(prompt)}");
         }
         catch (Exception ex)
         {
             LogWarn($"读取节点控制信息失败: {ex.Message}");
-            Poke($"读取节点控制信息失败: {ex.Message}");
+            interactor.Poke($"读取节点控制信息失败: {ex.Message}");
         }
     }
 
@@ -833,19 +879,19 @@ public class ComfyuiService(
             var raw = await resp.Content.ReadAsStringAsync();
             if (!resp.IsSuccessStatusCode)
             {
-                Poke($"ComfyUI 不可用 (HTTP {(int)resp.StatusCode})");
+                interactor.Poke($"ComfyUI 不可用 (HTTP {(int)resp.StatusCode})");
                 return;
             }
             var node = JsonNode.Parse(raw);
             var ver = node?["system"]?["comfyui_version"]?.ToString() ?? "?";
             var device = node?["devices"]?[0]?["name"]?.ToString() ?? "未知设备";
-            Poke($"ComfyUI 在线\n版本: {ver}\n设备: {device}");
+            interactor.Poke($"ComfyUI 在线\n版本: {ver}\n设备: {device}");
             Log($"状态正常 {ver} / {device}");
         }
         catch (Exception ex)
         {
             LogError($"状态检查失败: {ex.Message}");
-            Poke($"ComfyUI 连接失败: {ex.Message}");
+            interactor.Poke($"ComfyUI 连接失败: {ex.Message}");
         }
     }
 
@@ -866,7 +912,7 @@ public class ComfyuiService(
         catch (Exception ex)
         {
             LogError($"生图任务启动失败: {ex.Message}");
-            Poke($"生图失败: {ex.Message}");
+            interactor.Poke($"生图失败: {ex.Message}");
         }
     }
 
@@ -906,7 +952,7 @@ public class ComfyuiService(
     {
         if (string.IsNullOrWhiteSpace(prompt))
         {
-            Poke("提示词不能为空");
+            interactor.Poke("提示词不能为空");
             return;
         }
 
@@ -919,7 +965,7 @@ public class ComfyuiService(
         var (w, h) = ResolveResolution(orientation, width, height, cfgConfig);
 
         // 正向提示词 = 固定前缀 + AI 提示词，合并后自动去重；分隔符强制英文逗号+空格 ", "
-        var finalPositive = BuildPositivePrompt(prompt, cfgConfig.PositivePromptPrefix);
+        var finalPositive = BuildPositivePrompt(prompt, ResolvePositivePromptPrefix(cfgConfig, workflow));
         // 固定负面：同样规范为英文逗号分隔（若配置了才覆盖工作流负面）
         var finalNegative = string.IsNullOrWhiteSpace(cfgConfig.NegativePrompt)
             ? cfgConfig.NegativePrompt
@@ -944,7 +990,7 @@ public class ComfyuiService(
         try
         {
             if (priorityMode)
-                Poke($"优先生图进行中（最长约 {pollTimeoutSec} 秒），请稍候，期间不要语音…");
+                interactor.Poke($"优先生图进行中（最长约 {pollTimeoutSec} 秒），请稍候，期间不要语音…");
             Log($"{(priorityMode ? "[优先] " : "")}开始生图: {Truncate(finalPositive, 80)}");
             if (w.HasValue || h.HasValue)
                 Log($"分辨率: {w ?? 0}x{h ?? 0}");
@@ -970,7 +1016,7 @@ public class ComfyuiService(
                 }
                 else
                 {
-                    Poke($"输入图片不存在: {imagePath}");
+                    interactor.Poke($"输入图片不存在: {imagePath}");
                     return;
                 }
 
@@ -984,13 +1030,13 @@ public class ComfyuiService(
             var workflowPath = ResolveWorkflowPath(cfgConfig, workflow);
             if (string.IsNullOrWhiteSpace(workflowPath))
             {
-                Poke("请先在配置中填写工作流 JSON 路径");
+                interactor.Poke("请先在配置中填写工作流 JSON 路径");
                 LogError("工作流路径为空，请在配置 UI 中设置 WorkflowPath");
                 return;
             }
             if (!File.Exists(workflowPath))
             {
-                Poke($"工作流文件不存在: {workflowPath}");
+                interactor.Poke($"工作流文件不存在: {workflowPath}");
                 LogError($"工作流不存在: {workflowPath}");
                 return;
             }
@@ -1113,7 +1159,7 @@ public class ComfyuiService(
                         if (!cfgConfig.ExtraSaveCopy)
                         {
                             Log($"使用工作流保存路径: {output.FullName}");
-                            Poke($"图片已生成\n{output.FullName}");
+                            interactor.Poke($"图片已生成\n{output.FullName}");
                             return;
                         }
                         var ext = string.IsNullOrWhiteSpace(output.Extension) ? ".png" : output.Extension;
@@ -1122,13 +1168,13 @@ public class ComfyuiService(
                             $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext}");
                         File.Copy(output.FullName, dest, false);
                         Log($"从自定义目录复制: {output.FullName} -> {dest}");
-                        Poke($"图片已生成\n{dest}");
+                        interactor.Poke($"图片已生成\n{dest}");
                         return;
                     }
                 }
 
                 LogError("history 中未找到图片输出");
-                Poke("生图完成但未找到输出图片，请检查工作流是否包含 SaveImage 节点，或查看 ComfyUI 控制台错误");
+                interactor.Poke("生图完成但未找到输出图片，请检查工作流是否包含 SaveImage 节点，或查看 ComfyUI 控制台错误");
                 return;
             }
 
@@ -1239,7 +1285,7 @@ public class ComfyuiService(
 
             if (saved.Count == 0)
             {
-                Poke("图片下载失败");
+                interactor.Poke("图片下载失败");
                 return;
             }
 
@@ -1260,25 +1306,25 @@ public class ComfyuiService(
                 }
             }
 
-            Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
+            interactor.Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
         }
         catch (OperationCanceledException)
         {
             // 含 TaskCanceledException：硬超时 / 轮询超时，必须明确结束，避免桌宠一直等
             LogWarn($"生图超时（{pollTimeoutSec}s{(priorityMode ? "，优先生图硬上限" : "")}）");
-            Poke(priorityMode
+            interactor.Poke(priorityMode
                 ? $"优先生图超时（{pollTimeoutSec} 秒），已结束等待。可稍后重试或检查 ComfyUI；现在可以正常说话。"
                 : "生图超时，请检查 ComfyUI 是否在跑图，或增大 TimeoutSeconds。若同机开了语音优先，进程也可能被 TTS 结束，请重启 ComfyUI");
         }
         catch (HttpRequestException ex)
         {
             LogError($"网络错误: {ex.Message}");
-            Poke($"无法连接 ComfyUI: {ex.Message}\n请确认地址 {cfgConfig.BaseUrl} 可访问；若同机语音优先曾腾 GPU，请重启 ComfyUI");
+            interactor.Poke($"无法连接 ComfyUI: {ex.Message}\n请确认地址 {cfgConfig.BaseUrl} 可访问；若同机语音优先曾腾 GPU，请重启 ComfyUI");
         }
         catch (Exception ex)
         {
             LogError($"生图失败: {ex.Message}");
-            Poke($"生图失败: {ex.Message}");
+            interactor.Poke($"生图失败: {ex.Message}");
         }
         finally
         {
@@ -2037,6 +2083,36 @@ public class ComfyuiService(
         return candidate;
     }
 
+    string ResolvePositivePromptPrefix(ComfyuiConfig cfg, string? workflowName)
+    {
+        if (!string.IsNullOrWhiteSpace(workflowName))
+        {
+            var match = ParseNamedWorkflows(cfg.NamedWorkflows)
+                .Where(w => w.Enabled
+                            && w.Name.Equals(workflowName.Trim(), StringComparison.OrdinalIgnoreCase))
+                .FirstOrDefault();
+            if (match != null && !string.IsNullOrWhiteSpace(match.Prefix))
+                return match.Prefix;
+        }
+        return cfg.PositivePromptPrefix;
+    }
+
+    static string? WfJsonString(JsonObject o, string key)
+    {
+        if (o.TryGetPropertyValue(key, out var node) && node is JsonValue value
+            && value.TryGetValue<string>(out var s))
+            return s;
+        return null;
+    }
+
+    static bool? WfJsonBool(JsonObject o, string key)
+    {
+        if (o.TryGetPropertyValue(key, out var node) && node is JsonValue value
+            && value.TryGetValue<bool>(out var b))
+            return b;
+        return null;
+    }
+
     static List<WorkflowEntry> ParseNamedWorkflows(string json)
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -2050,9 +2126,10 @@ public class ComfyuiService(
             return arr
                 .OfType<JsonObject>()
                 .Select(o => new WorkflowEntry(
-                    o["n"]?.GetValue<string>() ?? o["name"]?.GetValue<string>() ?? "",
-                    o["p"]?.GetValue<string>() ?? o["path"]?.GetValue<string>() ?? "",
-                    o["e"]?.GetValue<bool>() ?? true))
+                    WfJsonString(o, "n") ?? WfJsonString(o, "name") ?? "",
+                    WfJsonString(o, "p") ?? WfJsonString(o, "path") ?? "",
+                    WfJsonBool(o, "e") ?? true,
+                    WfJsonString(o, "f") ?? WfJsonString(o, "prefix") ?? ""))
                 .ToList();
         }
         catch
@@ -2094,3 +2171,8 @@ public class ComfyuiService(
     static string Truncate(string s, int max)
         => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "...");
 }
+
+
+
+
+

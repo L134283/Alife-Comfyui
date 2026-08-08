@@ -16,7 +16,7 @@ public class ComfyuiConfig
     [Description("正向提示词输入字段名，默认 positive；标准 CLIPTextEncode 用 text")]
     public string PositivePromptInput { get; set; } = "positive";
 
-    [Description("固定正向提示词前缀。生图时与 AI 提示词合并后自动去重，统一为「英文逗号+空格」分隔。留空则不拼接")]
+    [Description("固定正向提示词前缀（默认工作流用）。命名工作流可在各自卡片里单独设置前缀，留空则沿用此项。生图时与 AI 提示词合并后自动去重，统一为「英文逗号+空格」分隔；此项留空则不拼接")]
     public string PositivePromptPrefix { get; set; } = "";
 
     [Description("固定负面提示词。填写后覆盖工作流负面，并规范为英文逗号分隔；留空则使用工作流自带负面")]
@@ -107,7 +107,10 @@ public class ComfyuiConfig
     [Description("AI 节点控制开关：开启后 AI 可操控模型/步数/采样器等节点参数。不影响原有简单模式")]
     public bool EnableNodeControl { get; set; } = false;
 
-    [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"文生图\",\"p\":\"workflows/txt2img.json\",\"e\":true}]。n=名称 p=路径 e=启用")]
+    [Description("隐式注入（4.0 新特性）：开启后函数文档不直接注入系统提示词，AI 需先调用 <comfyuiimagegeneration/> 按需加载（省 token，渐进式）；关闭则显式注入，功能说明直接可用")]
+    public bool ImplicitInjection { get; set; } = false;
+
+    [Description("命名工作流列表（JSON 数组）。格式：[{\"n\":\"名称\",\"p\":\"路径\",\"e\":true,\"f\":\"前缀(可空)\"}]。n=名称 p=路径 e=启用 f=固定正向提示词前缀(留空沿用全局前缀)")]
     public string NamedWorkflows { get; set; } = "[{\"n\":\"文生图\",\"p\":\"\",\"e\":false},{\"n\":\"图生图\",\"p\":\"\",\"e\":false},{\"n\":\"其他\",\"p\":\"\",\"e\":false}]";
 
     [Description("提示词预设列表（JSON 数组）。格式：[{\"n\":\"预设名\",\"c\":\"提示词内容\"}]。AI 可通过 getpromptpreset 按需检索复用")]
