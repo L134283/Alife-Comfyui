@@ -203,6 +203,10 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 
 ## 版本历史
 
+### v4.2.0（2026-08-10）
+
+- **适配 Alife 4.2.0 框架**：`XmlHandler` API 变更（`Name` 改为只读、无 0 参构造函数），主 handler 与 status handler 改用 `new XmlHandler("ComfyuiImageGeneration"){...}` / `new XmlHandler("ComfyuiStatusInternal"){...}` 初始化器写法，修复插件重载编译失败
+
 ### v4.0.0（2026-08-08）
 
 - **适配 Alife 4.0.0 框架**：模块基类从 `InteractiveModule` 迁移到 `ChatBehaviour`，`Prompt`/`Poke` 改为 `IInteractor` 注入，消除 4.0 废弃警告；新增插件清单 `manifest.json`（Version 4.0.0）

@@ -268,10 +268,8 @@ public class ComfyuiService(
 
         if (functions.TryGetValue("checkcomfyuistatus", out var statusFunction))
         {
-            _statusHandler = new XmlHandler
+            _statusHandler = new XmlHandler("ComfyuiStatusInternal")
             {
-                Name = "ComfyuiStatusInternal",
-                Instance = this,
                 Functions = new List<XmlFunction> { statusFunction }
             };
             functionService.RegisterHandlerWithoutDocument(_statusHandler);
@@ -376,13 +374,11 @@ public class ComfyuiService(
         var documentMode = cfg.ImplicitInjection
             ? DocumentMode.Implicit
             : DocumentMode.Explicit;
-        var handler = new XmlHandler
+        var handler = new XmlHandler("ComfyuiImageGeneration")
         {
-            Name = "ComfyuiImageGeneration",
             Description = handlerDesc,
             // 隐式模式：详细规则随 <comfyuiimagegeneration/> 加载的文档一并输出；显式模式保持 null 避免重复注入
             Explanation = explanation,
-            Instance = this,
             Functions = exposed
         };
         _registeredHandler = handler;
