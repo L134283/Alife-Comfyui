@@ -36,6 +36,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     string? _danbooruTestMessage;
     bool _danbooruTesting;
 
+    // 模型卸载与空闲自动释放
+    bool _unloadingModel;
+    string? _unloadMessage;
+
     record WorkflowCard
     {
         public string Name { get; set; } = "";
@@ -1914,6 +1918,78 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
 
+        // ========== 模型卸载与显存释放 ==========
+        AddSection(b, ref i, "模型卸载与显存释放");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cfy-btn");
+        b.AddAttribute(i++, "disabled", _unloadingModel);
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, UnloadModels));
+        b.AddContent(i++, _unloadingModel ? "卸载中…" : "✦ 立即卸载模型（释放显存）");
+        b.CloseElement();
+        if (!string.IsNullOrWhiteSpace(_unloadMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-detect");
+            b.AddAttribute(i++, "style", "margin:0;flex:1;");
+            b.AddContent(i++, _unloadMessage);
+            b.CloseElement();
+        }
+        b.CloseElement();
+
+        // 空闲自动卸载开关
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.EnableAutoUnload);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.EnableAutoUnload = (bool)(e.Value ?? false);
+            StateHasChanged();
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
+        b.AddContent(i++, "空闲自动卸载：距上次生图空闲超时自动卸载模型释放显存");
+        b.CloseElement();
+        b.CloseElement();
+
+        if (Configuration.EnableAutoUnload)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap;");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "width:160px;flex-shrink:0;");
+            AddInput(b, ref i, "空闲小时数", Configuration.AutoUnloadIdleHours.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n))
+                    Configuration.AutoUnloadIdleHours = Math.Clamp(n, 0, 720);
+            });
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "width:160px;flex-shrink:0;");
+            AddInput(b, ref i, "空闲分钟数", Configuration.AutoUnloadIdleMinutes.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n))
+                    Configuration.AutoUnloadIdleMinutes = Math.Clamp(n, 0, 59);
+            });
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;");
+            b.AddContent(i++, $"合计空闲 {Configuration.AutoUnloadIdleHours} 小时 {Configuration.AutoUnloadIdleMinutes} 分钟后自动卸载（需保存配置后生效）");
+            b.CloseElement();
+            b.CloseElement();
+        }
+
+        b.CloseElement(); // panel
+
         // ========== 多工作流（可选） ==========
         AddSection(b, ref i, "多工作流（可选）");
         b.OpenElement(i++, "div");
@@ -2646,6 +2722,27 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
         b.CloseElement();
+    }
+
+    async Task UnloadModels()
+    {
+        if (_unloadingModel) return;
+        _unloadingModel = true;
+        _unloadMessage = "正在请求 ComfyUI 卸载模型…";
+        StateHasChanged();
+        try
+        {
+            _unloadMessage = await ComfyuiService.UnloadModelsNowAsync(Configuration);
+        }
+        catch (Exception ex)
+        {
+            _unloadMessage = "卸载异常: " + ex.Message;
+        }
+        finally
+        {
+            _unloadingModel = false;
+            StateHasChanged();
+        }
     }
 
     async Task TestDanbooruConnectivity()

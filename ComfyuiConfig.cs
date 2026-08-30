@@ -141,4 +141,15 @@ public class ComfyuiConfig
 
     [Description("在线检索是否返回/优先 NSFW 标签。默认关，使用 SFW 结果")]
     public bool DanbooruSearchShowNsfw { get; set; } = false;
+
+    // ---------- 模型卸载与空闲自动释放 ----------
+
+    [Description("空闲自动卸载总开关：开启后距最近一次生图结束空闲超过设定时长，自动卸载已加载模型释放显存/内存。默认关")]
+    public bool EnableAutoUnload { get; set; } = false;
+
+    [Description("空闲自动卸载时长-小时部分（0~720），与分钟部分相加为总空闲时长")]
+    public int AutoUnloadIdleHours { get; set; } = 0;
+
+    [Description("空闲自动卸载时长-分钟部分（0~59），与小时部分相加为总空闲时长。默认 30 分钟")]
+    public int AutoUnloadIdleMinutes { get; set; } = 30;
 }

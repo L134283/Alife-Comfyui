@@ -28,7 +28,8 @@ namespace Alife.Plugin.Comfyui;
     EditorUI = typeof(ComfyuiServiceUI))]
 public class ComfyuiService(
     XmlFunctionCaller functionService,
-    IInteractor<ComfyuiService> interactor
+    IInteractor<ComfyuiService> interactor,
+    ConfigurationSystem configurationSystem
 ) : ChatBehaviour, IConfigurable<ComfyuiConfig>
 {
     static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(10) };
@@ -51,6 +52,9 @@ public class ComfyuiService(
     /// <summary>当前是否有生图任务在跑（优先生图 / 普通模式共用）。</summary>
     public static bool IsGenerating => Volatile.Read(ref _activeGens) > 0;
     static int _activeGens;
+    // 模型占用跟踪：本次会话是否已加载过模型（1=有，0=已卸载/未加载），以及最近一次生图活动时间
+    static int _modelsLoadedFlag;
+    static long _lastActivityUtc;
     // 优先生图串行，避免叠多个阻塞任务拖死对话
     static readonly SemaphoreSlim PriorityGate = new(1, 1);
     static readonly ConcurrentDictionary<string, long> ClaimedCustomOutputs = new(StringComparer.OrdinalIgnoreCase);
@@ -61,6 +65,9 @@ public class ComfyuiService(
     XmlHandler? _registeredHandler;
     // status 处理器（无文档模式）：热重载/销毁时一并注销，避免函数表累积
     XmlHandler? _statusHandler;
+    // 空闲自动卸载后台循环（OnDestroy 取消，热重载不泄漏）
+    CancellationTokenSource? _unloadLoopCts;
+    Task? _unloadLoopTask;
 
     record PromptPresetEntry(string Name, string Content);
 
@@ -190,6 +197,18 @@ public class ComfyuiService(
             - 预设内容按请求调整后组合进 prompt，勿原样塞入；用户要保存时调 savepromptpreset。
             """;
 
+        var modelUnloadNote = cfg.EnableAutoUnload
+            ? $"""
+
+            【显存释放】
+            - 空闲自动卸载已开启：距上次生图空闲超过 {cfg.AutoUnloadIdleHours} 小时 {cfg.AutoUnloadIdleMinutes} 分钟会自动卸载模型。用户要求立即腾显存/给其他程序让 GPU/长期不用生图时，仍可调 unloadcomfyuimodels 立即卸载；用 setcomfyuiidleunload 可查看或调整空闲时长。
+            """
+            : """
+
+            【显存释放】
+            - 用户要求释放显存/给其他程序腾 GPU/长时间不用生图时，调 unloadcomfyuimodels 立即卸载已加载模型；也可用 setcomfyuiidleunload 开启并设置空闲超时后自动卸载（当前空闲自动卸载为关闭）。
+            """;
+
         var danbooruNote = "";
         if (cfg.EnableDanbooruSearch)
         {
@@ -230,7 +249,7 @@ public class ComfyuiService(
         // 隐式模式放进 handler.Explanation，AI 调用 <comfyuiimagegeneration/> 后随文档一并加载，
         // 避免这些规则在开启隐式注入时仍常时占用 token。
         var detailedRules = $$"""
-        {{workflowListDesc}}{{imageInputNote}}{{nodeControlDesc}}{{autoOpenNote}}{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}
+        {{workflowListDesc}}{{imageInputNote}}{{nodeControlDesc}}{{autoOpenNote}}{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}{{modelUnloadNote}}
         """;
 
         RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput,
@@ -240,6 +259,9 @@ public class ComfyuiService(
             interactor.Prompt(hardRules + implicitNote);
         else
             interactor.Prompt(hardRules + detailedRules + implicitNote);
+
+        // 空闲自动卸载后台循环（热重载/销毁时随 OnDestroy 取消）
+        StartUnloadLoop();
     }
 
     /// <summary>热重载/活动销毁时注销本模块注册的 XmlHandler，避免旧 handler 残留在函数表中。</summary>
@@ -254,6 +276,13 @@ public class ComfyuiService(
         {
             functionService.UnregisterHandler(_statusHandler);
             _statusHandler = null;
+        }
+        if (_unloadLoopCts != null)
+        {
+            _unloadLoopCts.Cancel();
+            _unloadLoopCts.Dispose();
+            _unloadLoopCts = null;
+            _unloadLoopTask = null;
         }
         return Task.CompletedTask;
     }
@@ -359,6 +388,20 @@ public class ComfyuiService(
                     artistsFn,
                     "用户明确要画风/画师时，按已确定英文 tag 推荐画师；未要求不要调用。"));
             }
+        }
+
+        // 模型卸载与空闲自动释放：始终暴露，AI 按需调用
+        if (functions.TryGetValue("unloadcomfyuimodels", out var unloadFn))
+        {
+            exposed.Add(CloneFunctionDocument(
+                unloadFn,
+                "立即卸载 ComfyUI 已加载的模型并释放显存/内存，让出 GPU 给其他程序。用户要求腾显存/提速/长期不用生图时调用。"));
+        }
+        if (functions.TryGetValue("setcomfyuiidleunload", out var idleFn))
+        {
+            exposed.Add(CloneFunctionDocument(
+                idleFn,
+                "查看或设置 ComfyUI 空闲自动卸载：距最近一次生图结束空闲超过设定时长后自动卸载模型释放显存。用户想自动释放显存时调用；不传参可查看当前设置。"));
         }
 
         var handlerDesc = "ComfyUI 生图";
@@ -469,6 +512,192 @@ public class ComfyuiService(
     public void CheckComfyuiStatus()
     {
         _ = CheckStatusAsync();
+    }
+
+    // ===================== 模型卸载与空闲自动释放 =====================
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("立即卸载 ComfyUI 已加载的模型并释放显存/内存，让出 GPU 给其他程序。正在生图时不可用")]
+    public async Task UnloadComfyuiModels()
+    {
+        var msg = await UnloadModelsNowAsync(Configuration);
+        interactor.Poke(msg);
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("查看或设置 ComfyUI 空闲自动卸载：距最近一次生图结束空闲超过设定时长后，自动卸载模型释放显存/内存。不传任何参数返回当前设置；enable 开/关；hours+minutes 设定空闲时长（合计最少 1 分钟）")]
+    public void SetComfyuiIdleUnload(
+        [Description("是否启用空闲自动卸载；不传则不改变当前启用状态")] bool? enable = null,
+        [Description("空闲小时数 0~720，与 minutes 相加为总空闲时长")] int? hours = null,
+        [Description("空闲分钟数 0~59，与 hours 相加为总空闲时长")] int? minutes = null)
+    {
+        var cfg = Configuration ?? new ComfyuiConfig();
+        var changed = false;
+        if (enable.HasValue && cfg.EnableAutoUnload != enable.Value)
+        {
+            cfg.EnableAutoUnload = enable.Value;
+            changed = true;
+        }
+        if (hours.HasValue && cfg.AutoUnloadIdleHours != hours.Value)
+        {
+            cfg.AutoUnloadIdleHours = Math.Clamp(hours.Value, 0, 720);
+            changed = true;
+        }
+        if (minutes.HasValue && cfg.AutoUnloadIdleMinutes != minutes.Value)
+        {
+            cfg.AutoUnloadIdleMinutes = Math.Clamp(minutes.Value, 0, 59);
+            changed = true;
+        }
+
+        var total = cfg.AutoUnloadIdleHours * 60 + cfg.AutoUnloadIdleMinutes;
+        if (cfg.EnableAutoUnload && total < 1)
+        {
+            cfg.AutoUnloadIdleMinutes = 1;
+            total = 1;
+            changed = true;
+        }
+
+        // 仅在实际修改时落盘并打日志；纯查询（未传参数或值与现值相同）不写配置
+        if (changed)
+        {
+            SaveConfig();
+            Log($"设置空闲自动卸载: {(cfg.EnableAutoUnload ? "开" : "关")} 空闲 {cfg.AutoUnloadIdleHours}h{cfg.AutoUnloadIdleMinutes}m");
+        }
+
+        interactor.Poke(
+            $"status: {(cfg.EnableAutoUnload ? "enabled" : "disabled")}\n" +
+            $"idle_hours: {cfg.AutoUnloadIdleHours}\n" +
+            $"idle_minutes: {cfg.AutoUnloadIdleMinutes}\n" +
+            $"idle_total_minutes: {total}\n" +
+            $"action: {(cfg.EnableAutoUnload
+                ? $"空闲超过 {total} 分钟将自动卸载模型释放显存；也可随时调用 unloadcomfyuimodels 立即卸载"
+                : "空闲自动卸载已关闭；如需立即释放显存可调用 unloadcomfyuimodels")}");
+    }
+
+    /// <summary>
+    /// 立即卸载 ComfyUI 已加载模型并释放显存/内存（UI 按钮与 AI 函数共用入口）。
+    /// 正在生图时拒绝，避免打断出图。
+    /// </summary>
+    public static async Task<string> UnloadModelsNowAsync(ComfyuiConfig? cfg)
+    {
+        var config = cfg ?? new ComfyuiConfig();
+        if (IsGenerating)
+            return "正在生图中，为避免打断出图，暂不能卸载模型";
+
+        try
+        {
+            var baseUrl = NormalizeBaseUrl(config.BaseUrl);
+            using var req = CreateRequest(HttpMethod.Post, $"{baseUrl}/free", config);
+            req.Content = new StringContent(
+                "{\"unload_models\": true, \"free_memory\": true}",
+                Encoding.UTF8, "application/json");
+            using var resp = await Http.SendAsync(req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var raw = await resp.Content.ReadAsStringAsync();
+                var preview = string.IsNullOrWhiteSpace(raw) ? "" : (raw.Length > 200 ? raw[..200] + "..." : raw);
+                LogWarn($"卸载模型失败 (HTTP {(int)resp.StatusCode}) {preview}");
+                return $"卸载失败 (HTTP {(int)resp.StatusCode})";
+            }
+
+            Volatile.Write(ref _modelsLoadedFlag, 0);
+            Volatile.Write(ref _lastActivityUtc, DateTime.UtcNow.Ticks);
+            Log("已卸载模型并释放显存/内存");
+            return "已卸载 ComfyUI 已加载的模型并释放显存/内存";
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"卸载模型失败: {ex.Message}");
+            return $"卸载模型失败: {ex.Message}";
+        }
+    }
+
+    void StartUnloadLoop()
+    {
+        if (_unloadLoopTask != null)
+            return;
+        _unloadLoopCts = new CancellationTokenSource();
+        _unloadLoopTask = RunUnloadLoopAsync(_unloadLoopCts.Token);
+    }
+
+    async Task RunUnloadLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                await TryAutoUnloadAsync(ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常退出（OnDestroy）
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"空闲自动卸载循环异常: {ex.Message}");
+        }
+    }
+
+    async Task TryAutoUnloadAsync(CancellationToken ct)
+    {
+        var cfg = Configuration;
+        if (cfg == null || !cfg.EnableAutoUnload)
+            return;
+        // 正在生图不卸，避免打断出图
+        if (IsGenerating)
+            return;
+        // 本次会话没加载过模型就不空跑
+        if (Volatile.Read(ref _modelsLoadedFlag) == 0)
+            return;
+
+        var totalMinutes = Math.Max(1, cfg.AutoUnloadIdleHours * 60 + cfg.AutoUnloadIdleMinutes);
+        var lastTicks = Volatile.Read(ref _lastActivityUtc);
+        if (lastTicks == 0)
+            return;
+        var idle = DateTime.UtcNow - new DateTime(lastTicks, DateTimeKind.Utc);
+        if (idle < TimeSpan.FromMinutes(totalMinutes))
+            return;
+
+        // 发请求前再确认一次没有正在生图的任务
+        if (IsGenerating)
+            return;
+
+        Log($"空闲已超过 {totalMinutes} 分钟，自动卸载模型释放显存…");
+        try
+        {
+            var msg = await UnloadModelsNowAsync(cfg);
+            interactor.Poke(msg);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"自动卸载模型失败: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 将当前 Configuration 落盘（角色级配置优先，回退全局）。
+    /// AI 通过 setcomfyuiidleunload 修改的运行时配置若不主动保存，重载/重启后会丢失。
+    /// </summary>
+    void SaveConfig()
+    {
+        try
+        {
+            if (Configuration == null)
+                return;
+            configurationSystem.SetConfiguration(
+                typeof(ComfyuiService),
+                Configuration,
+                Character?.StorageKey ?? "");
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"配置保存失败: {ex.Message}");
+        }
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -979,6 +1208,9 @@ public class ComfyuiService(
         }
 
         Interlocked.Increment(ref _activeGens);
+        // 生图即视为模型已加载；同时刷新空闲计时起点
+        Volatile.Write(ref _modelsLoadedFlag, 1);
+        Volatile.Write(ref _lastActivityUtc, DateTime.UtcNow.Ticks);
         using var hardCts = new CancellationTokenSource(
             TimeSpan.FromSeconds(pollTimeoutSec + 30)); // 比轮询多 30s 余量（上传/下载）
         var ct = hardCts.Token;
@@ -1325,6 +1557,8 @@ public class ComfyuiService(
         finally
         {
             Interlocked.Decrement(ref _activeGens);
+            // 生图结束即视为最近一次活动，空闲计时从此刻重新累计
+            Volatile.Write(ref _lastActivityUtc, DateTime.UtcNow.Ticks);
             // 清理图生图下载的临时文件
             if (tempImageFile != null && tempImageFile != imagePath && File.Exists(tempImageFile))
             {
