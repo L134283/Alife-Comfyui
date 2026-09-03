@@ -19,6 +19,9 @@ sealed class CharacterPromptIndex
 
     public int Count => _entries.Count;
 
+    /// <summary>全部条目（仅用于启动时构建 AnimaDex 中→英查询映射，避免重复解析大 JSON）。</summary>
+    public IReadOnlyList<CharacterPromptEntry> Entries => _entries.Select(entry => entry.Entry).ToArray();
+
     public static CharacterPromptIndex Load(string path)
     {
         using var stream = File.OpenRead(path);

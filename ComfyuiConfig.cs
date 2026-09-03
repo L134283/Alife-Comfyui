@@ -142,6 +142,17 @@ public class ComfyuiConfig
     [Description("在线检索是否返回/优先 NSFW 标签。默认关，使用 SFW 结果")]
     public bool DanbooruSearchShowNsfw { get; set; } = false;
 
+    // ---------- 在线角色检索扩充（AnimaDex，默认关，保持零外网） ----------
+
+    [Description("启用在线角色检索扩充：本地角色索引（character-prompts.json）未命中或带作品名仍歧义时，自动联网查 AnimaDex 在线角色库（约 3.6 万角色）。仅扩充不替换：本地命中/歧义处理仍优先")]
+    public bool EnableAnimadexCharacterSearch { get; set; } = false;
+
+    [Description("AnimaDex 在线角色库服务地址。默认官方站点（大陆直连通常约 1s）；可填本地自建地址")]
+    public string AnimadexBaseUrl { get; set; } = "https://animadex.net";
+
+    [Description("单次 AnimaDex 在线查询超时秒数。失败会自动降级回纯本地行为，不阻塞生图")]
+    public int AnimadexTimeoutSeconds { get; set; } = 15;
+
     // ---------- 模型卸载与空闲自动释放 ----------
 
     [Description("空闲自动卸载总开关：开启后距最近一次生图结束空闲超过设定时长，自动卸载已加载模型释放显存/内存。默认关")]

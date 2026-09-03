@@ -39,7 +39,7 @@ public static class ComfyuiWorkflowConverter
             "UPSCALE_MODEL", "AUDIO", "WEBCAM", "PHOTOMAKER", "*"
         };
 
-    public static bool IsApiFormat(JsonNode root)
+    public     static bool IsApiFormat(JsonNode root)
     {
         if (root is not JsonObject obj)
             return false;
@@ -55,6 +55,32 @@ public static class ComfyuiWorkflowConverter
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 从 JsonNode 安全读取 int。部分新版本 ComfyUI / UE 插件导出的 UI 工作流会把
+    /// 本应是数字的字段（如 extra.ue_links 的 downstream/downstream_slot）序列化成字符串，
+    /// 直接 GetValue&lt;int&gt; 会抛「String 无法转换为 Int32」导致生图失败。
+    /// 这里兼容数字、布尔与数字字符串；解析不了返回 false。
+    /// </summary>
+    static bool TryGetNodeInt(JsonNode? node, out int value)
+    {
+        value = 0;
+        if (node is not JsonValue jv)
+            return false;
+        try
+        {
+            if (jv.GetValueKind() is JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False)
+            {
+                value = jv.GetValue<int>();
+                return true;
+            }
+        }
+        catch
+        {
+            // 非整型数字等，走字符串解析
+        }
+        return jv.TryGetValue<string>(out var s) && int.TryParse(s.Trim(), out value);
     }
 
     /// <summary>
@@ -78,9 +104,11 @@ public static class ComfyuiWorkflowConverter
         {
             if (linkNode is not JsonArray link || link.Count < 5)
                 continue;
-            var linkId = link[0]!.GetValue<int>();
-            var srcNode = link[1]!.GetValue<int>();
-            var srcSlot = link[2]!.GetValue<int>();
+            var linkId = TryGetNodeInt(link[0], out var lid) ? lid : -1;
+            var srcNode = TryGetNodeInt(link[1], out var sn) ? sn : -1;
+            var srcSlot = TryGetNodeInt(link[2], out var ss) ? ss : -1;
+            if (linkId < 0 || srcNode < 0 || srcSlot < 0)
+                continue;
             linkMap[linkId] = (srcNode, srcSlot);
         }
 
@@ -89,10 +117,10 @@ public static class ComfyuiWorkflowConverter
         {
             foreach (var ue in ueLinks.OfType<JsonObject>())
             {
-                var down = ue["downstream"]?.GetValue<int>() ?? -1;
-                var downSlot = ue["downstream_slot"]?.GetValue<int>() ?? -1;
+                var down = TryGetNodeInt(ue["downstream"], out var d) ? d : -1;
+                var downSlot = TryGetNodeInt(ue["downstream_slot"], out var ds) ? ds : -1;
                 var upStr = ue["upstream"]?.ToString();
-                var upSlot = ue["upstream_slot"]?.GetValue<int>() ?? 0;
+                var upSlot = TryGetNodeInt(ue["upstream_slot"], out var us) ? us : 0;
                 if (down < 0 || downSlot < 0 || string.IsNullOrWhiteSpace(upStr))
                     continue;
                 if (!int.TryParse(upStr, out var up))
@@ -109,7 +137,7 @@ public static class ComfyuiWorkflowConverter
         foreach (var nodeNode in nodes.OfType<JsonObject>())
         {
             var classType = nodeNode["type"]?.GetValue<string>() ?? "";
-            var id = nodeNode["id"]?.GetValue<int>() ?? -1;
+            var id = TryGetNodeInt(nodeNode["id"], out var nid) ? nid : -1;
             if (id < 0) continue;
 
             if (classType.Equals("SetNode", StringComparison.OrdinalIgnoreCase))
@@ -119,7 +147,9 @@ public static class ComfyuiWorkflowConverter
                 if (string.IsNullOrWhiteSpace(varName)) continue;
                 var inputs = nodeNode["inputs"] as JsonArray;
                 var firstInput = inputs?.FirstOrDefault();
-                int? link = firstInput?["link"]?.GetValue<int>();
+                int? link = null;
+                if (firstInput is JsonObject fi && TryGetNodeInt(fi["link"], out var linkVal))
+                    link = linkVal;
                 if (link.HasValue && linkMap.TryGetValue(link.Value, out var src))
                     setVarMap[varName] = src.srcNode;
             }
@@ -147,10 +177,10 @@ public static class ComfyuiWorkflowConverter
 
         foreach (var nodeNode in nodes.OfType<JsonObject>())
         {
-            var id = nodeNode["id"]?.GetValue<int>() ?? -1;
+            var id = TryGetNodeInt(nodeNode["id"], out var nid) ? nid : -1;
             if (id < 0) continue;
 
-            var mode = nodeNode["mode"]?.GetValue<int>() ?? 0;
+            var mode = TryGetNodeInt(nodeNode["mode"], out var nmode) ? nmode : 0;
             if (mode is 2 or 4) continue;
 
             var classType = nodeNode["type"]?.GetValue<string>() ?? "";

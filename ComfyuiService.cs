@@ -61,6 +61,9 @@ public class ComfyuiService(
 
     record WorkflowEntry(string Name, string Path, bool Enabled, string Prefix = "");
     CharacterPromptIndex? _characterPromptIndex;
+    // AnimaDex 在线角色扩充：由本地索引构建的「中文名/别名 → 英文名」「中文作品 → 英文作品」映射（键已小写去标点）
+    Dictionary<string, string>? _animadexCnNameToEn;
+    Dictionary<string, string>? _animadexCnWorkToEn;
     // 注册到 XmlFunctionCaller 的处理器（热重载/销毁时注销，避免旧 handler 累积）
     XmlHandler? _registeredHandler;
     // status 处理器（无文档模式）：热重载/销毁时一并注销，避免函数表累积
@@ -83,6 +86,7 @@ public class ComfyuiService(
             {
                 _characterPromptIndex = CharacterPromptIndex.Load(catalogPath);
                 Log($"已加载角色提示词索引: {_characterPromptIndex.Count} 个角色");
+                BuildAnimadexLookup(_characterPromptIndex);
             }
             else
             {
@@ -183,13 +187,14 @@ public class ComfyuiService(
             ? "\n- 图生图 denoise 档位：微调 0.30~0.45、换装/姿势 0.55~0.70、大改 0.70~0.85；文生图不传。"
             : "";
 
-        var characterLookupNote = _characterPromptIndex == null
-            ? ""
-            : """
-
-            【角色检索】
-            - findcharacterprompt 只认 status: matched；ambiguous 返回候选时带作品名重查，禁止直接猜 tag；组合时保持 &amp; 等转义原文。
-            """;
+        var characterLookupAvailable = _characterPromptIndex != null || cfg.EnableAnimadexCharacterSearch;
+        var characterLookupNote = characterLookupAvailable
+            ? "\n【角色检索】\n"
+              + "- findcharacterprompt 只认 status: matched；ambiguous 返回候选时带作品名重查，禁止直接猜 tag；组合时保持 &amp; 等转义原文。\n"
+              + (cfg.EnableAnimadexCharacterSearch
+                  ? "- 已开在线扩充：本地未收录时该函数会自动联网查 AnimaDex；返回 source: animadex 时无默认服装段，服装按请求自写；在线查询失败会自动回到纯本地提示。\n"
+                  : "")
+            : "";
 
         var presetNote = """
 
@@ -332,12 +337,14 @@ public class ComfyuiService(
                 generateFunction, description, hiddenParameters));
         }
 
-        if (_characterPromptIndex != null
+        if ((_characterPromptIndex != null || cfg.EnableAnimadexCharacterSearch)
             && functions.TryGetValue("findcharacterprompt", out var characterFunction))
         {
+            var characterDesc = _characterPromptIndex == null
+                ? "仅在明确生成某个既有动漫、游戏、漫画或虚拟主播角色时调用（当前无本地索引，将联网检索；建议传英文/罗马字角色名与作品名）。"
+                : "仅在明确生成某个既有动漫、游戏、漫画或虚拟主播角色时调用；返回身份、稳定外貌和默认服装 Tag。";
             exposed.Add(CloneFunctionDocument(
-                characterFunction,
-                "仅在明确生成某个既有动漫、游戏、漫画或虚拟主播角色时调用；返回身份、稳定外貌和默认服装 Tag。"));
+                characterFunction, characterDesc));
         }
 
         if (cfg.EnableNodeControl
@@ -405,7 +412,7 @@ public class ComfyuiService(
         }
 
         var handlerDesc = "ComfyUI 生图";
-        if (_characterPromptIndex != null)
+        if (_characterPromptIndex != null || cfg.EnableAnimadexCharacterSearch)
             handlerDesc += "与具体二次元角色提示词检索";
         if (cfg.EnableDanbooruSearch)
             handlerDesc += "、在线标签检索";
@@ -702,43 +709,74 @@ public class ComfyuiService(
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("仅检索明确指定的既有二次元角色；支持中文、英文、别名、部分名称和少量错字。")]
-    public void FindCharacterPrompt(
+    public async Task FindCharacterPrompt(
         [Description("角色名，支持中文、英文、别名或不完整名称")] string name,
         [Description("可选作品名；同名角色或短名称时建议填写")] string? work = null)
     {
-        if (_characterPromptIndex == null)
+        var cfg = Configuration ?? new ComfyuiConfig();
+        var onlineEnabled = cfg.EnableAnimadexCharacterSearch
+            && !string.IsNullOrWhiteSpace(cfg.AnimadexBaseUrl);
+
+        // 本地检索（优先）：中文/别名/错字消歧质量高且离线
+        IReadOnlyList<CharacterPromptMatch> localMatches = Array.Empty<CharacterPromptMatch>();
+        if (_characterPromptIndex != null)
         {
-            interactor.Poke("角色提示词索引未加载，请检查 character-prompts.json 是否位于插件目录");
+            localMatches = _characterPromptIndex.Search(name, work, 3);
+        }
+        else if (!onlineEnabled)
+        {
+            interactor.Poke("角色提示词索引未加载，请检查 character-prompts.json 是否位于插件目录，或在插件 UI 开启「在线角色检索扩充」");
             return;
         }
 
-        var matches = _characterPromptIndex.Search(name, work, 3);
-        if (matches.Count == 0)
+        var localAmbiguous = false;
+        if (localMatches.Count > 0)
         {
-            interactor.Poke("status: not_found\nquery: " + name
-                 + (string.IsNullOrWhiteSpace(work) ? "" : $"\nwork: {work}")
-                 + "\naction: 不要编造角色 Tag；检查角色名或作品名后再查询");
+            var best = localMatches[0];
+            var strongWorkMatch = !string.IsNullOrWhiteSpace(work) && best.WorkScore >= 0.85;
+            localAmbiguous = best.Score < 0.80
+                || localMatches.Count > 1
+                   && best.Score - localMatches[1].Score < 0.04
+                   && !strongWorkMatch;
+
+            if (!localAmbiguous)
+            {
+                PokeLocalMatched(name, best);
+                return;
+            }
+            // 歧义且带 work：本地细分版本分不开，先尝试在线；否则保持候选提示
+            if (!onlineEnabled || string.IsNullOrWhiteSpace(work))
+            {
+                PokeLocalAmbiguous(name, localMatches);
+                return;
+            }
+        }
+
+        // 在线扩充（默认关）：本地无命中，或带 work 仍歧义
+        if (onlineEnabled)
+        {
+            var onlineText = await TryAnimadexLookupAsync(cfg, name, work);
+            if (onlineText != null)
+            {
+                interactor.Poke(onlineText);
+                return;
+            }
+        }
+
+        if (localMatches.Count > 0)
+        {
+            PokeLocalAmbiguous(name, localMatches);
             return;
         }
 
-        var best = matches[0];
-        var strongWorkMatch = !string.IsNullOrWhiteSpace(work) && best.WorkScore >= 0.85;
-        var ambiguous = best.Score < 0.80
-            || matches.Count > 1
-               && best.Score - matches[1].Score < 0.04
-               && !strongWorkMatch;
+        interactor.Poke("status: not_found\nquery: " + name
+             + (string.IsNullOrWhiteSpace(work) ? "" : $"\nwork: {work}")
+             + "\naction: 不要编造角色 Tag；检查角色名或作品名后再查询"
+             + (onlineEnabled ? "；在线库也未命中，可尝试英文/罗马字角色名与作品名（AnimaDex 不支持中文检索）" : ""));
+    }
 
-        if (ambiguous)
-        {
-            var candidates = string.Join("\n", matches.Select((match, index) =>
-                $"{index + 1}. {match.Entry.ChineseName} [{match.Entry.EnglishName}] | " +
-                $"{DisplayWork(match.Entry)} | match_score: {(int)Math.Round(match.Score * 100)}/100"));
-            interactor.Poke($"status: ambiguous\nquery: {name}\ncandidates:\n{candidates}\n" +
-                 "action: 不要使用任何角色 Tag；请结合上下文选定角色后，带作品名 work 重新查询");
-            Log($"角色检索存在歧义: {name}");
-            return;
-        }
-
+    void PokeLocalMatched(string name, CharacterPromptMatch best)
+    {
         var matchScore = (int)Math.Round(best.Score * 100);
         var result = new StringBuilder()
             .AppendLine("status: matched")
@@ -753,6 +791,187 @@ public class ComfyuiService(
 
         interactor.Poke(result.ToString());
         Log($"角色检索: {name} -> {best.Entry.EnglishName} ({matchScore}/100)");
+    }
+
+    void PokeLocalAmbiguous(string name, IReadOnlyList<CharacterPromptMatch> matches)
+    {
+        var candidates = string.Join("\n", matches.Select((match, index) =>
+            $"{index + 1}. {match.Entry.ChineseName} [{match.Entry.EnglishName}] | " +
+            $"{DisplayWork(match.Entry)} | match_score: {(int)Math.Round(match.Score * 100)}/100"));
+        interactor.Poke($"status: ambiguous\nquery: {name}\ncandidates:\n{candidates}\n" +
+             "action: 不要使用任何角色 Tag；请结合上下文选定角色后，带作品名 work 重新查询");
+        Log($"角色检索存在歧义: {name}");
+    }
+
+    /// <summary>
+    /// AnimaDex 在线角色扩充查询。返回可 Poke 文本；null 表示在线未能给出结果（服务不可用或未找到），由调用方走原本地提示。
+    /// </summary>
+    async Task<string?> TryAnimadexLookupAsync(ComfyuiConfig cfg, string name, string? work)
+    {
+        var enName = ResolveEnCandidate(name, _animadexCnNameToEn);
+        if (string.IsNullOrEmpty(enName))
+            return null;
+        var enWork = string.IsNullOrWhiteSpace(work)
+            ? null
+            : ResolveEnCandidate(work, _animadexCnWorkToEn);
+
+        var res = await AnimadexClient.SearchCharactersAsync(
+            enName, enWork,
+            cfg.AnimadexBaseUrl?.Trim() ?? AnimadexClient.DefaultBaseUrl,
+            cfg.AnimadexTimeoutSeconds);
+
+        if (res.Unavailable)
+        {
+            LogWarn($"AnimaDex 在线角色检索不可用({enName}): {res.Error}");
+            return null;
+        }
+        if (res.Matches.Count == 0)
+            return null;
+
+        // 明确给了作品名但在线结果里该作品完全未命中：判定为该作品下未收录，避免拿同名异作品角色冒充
+        if (!string.IsNullOrEmpty(enWork) && !res.WorkMatched)
+        {
+            Log($"角色检索(在线 AnimaDex): {name} 名称命中但作品「{enWork}」下未收录，判定未找到");
+            return null;
+        }
+
+        var hit = res.Matches[0];
+        var appearance = string.Join(", ", hit.Tags.Take(40));
+        var sb = new StringBuilder()
+            .AppendLine("status: matched")
+            .AppendLine("source: animadex")
+            .Append("character: ").Append(hit.Name)
+            .Append(" [").Append(hit.Slug).Append("] | 作品: ")
+            .AppendLine(string.IsNullOrWhiteSpace(hit.CopyrightName) ? "-" : hit.CopyrightName)
+            .Append("images: ").AppendLine(hit.Count.ToString("N0", System.Globalization.CultureInfo.InvariantCulture))
+            .Append("trigger_tags_xml: ").AppendLine(XmlSafe(hit.Trigger))
+            .Append("appearance_tags_xml: ").AppendLine(XmlSafe(appearance))
+            .AppendLine("default_outfit_tags_xml: ")
+            .Append("usage: 在线库结果无默认服装段；必须保留 trigger 与外观 Tag，服装按请求自写；同名多版本已选图片数最高/与你所给作品一致的版本");
+        Log($"角色检索(在线 AnimaDex): {name} -> {hit.Name} ({hit.Count} 图)");
+        return sb.ToString();
+    }
+
+    /// <summary>把角色/作品名转成 AnimaDex 能查的英文：纯 ASCII 直接用；中文查本地索引构建的映射。</summary>
+    string? ResolveEnCandidate(string text, Dictionary<string, string>? map)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        var ascii = true;
+        foreach (var ch in text)
+        {
+            if (ch >= 128)
+            {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii)
+            return text.Trim();
+
+        if (map == null)
+            return null;
+        var key = NormalizeCnKey(text);
+        if (key.Length == 0)
+            return null;
+        if (map.TryGetValue(key, out var exact))
+            return exact;
+
+        string? best = null;
+        var bestLen = int.MaxValue;
+        foreach (var kv in map)
+        {
+            if (kv.Key.Length == 0)
+                continue;
+            if (kv.Key.Contains(key, StringComparison.Ordinal)
+                || key.Contains(kv.Key, StringComparison.Ordinal))
+            {
+                var overlap = Math.Min(kv.Key.Length, key.Length);
+                if (best == null || overlap < bestLen)
+                {
+                    best = kv.Value;
+                    bestLen = overlap;
+                }
+            }
+        }
+        return best;
+    }
+
+    static string NormalizeCnKey(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        foreach (var ch in value.Normalize(NormalizationForm.FormKC).ToLowerInvariant())
+            if (char.IsLetterOrDigit(ch))
+                sb.Append(ch);
+        return sb.ToString();
+    }
+
+    /// <summary>启动时用本地角色索引构建「中文名/别名 → 英文名」「中文作品 → 英文作品」映射（供 AnimaDex 在线扩充中→英转换）。</summary>
+    void BuildAnimadexLookup(CharacterPromptIndex index)
+    {
+        try
+        {
+            var nameMap = new Dictionary<string, string>(StringComparer.Ordinal);
+            var workMap = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var entry in index.Entries)
+            {
+                var enName = BaseEnglishName(entry.EnglishName);
+                var enWork = BaseEnglishName(entry.EnglishWork);
+                if (enName.Length == 0) enName = entry.EnglishName;
+                if (enWork.Length == 0) enWork = entry.EnglishWork;
+
+                AddCnMapping(nameMap, entry.ChineseName, enName);
+                foreach (var alias in entry.Aliases) AddCnMapping(nameMap, alias, enName);
+                AddCnMapping(workMap, entry.ChineseWork, enWork);
+                foreach (var alias in entry.WorkAliases) AddCnMapping(workMap, alias, enWork);
+            }
+            _animadexCnNameToEn = nameMap.Count > 0 ? nameMap : null;
+            _animadexCnWorkToEn = workMap.Count > 0 ? workMap : null;
+            Log($"AnimaDex 中→英映射已构建: 角色 {nameMap.Count} 键 / 作品 {workMap.Count} 键");
+        }
+        catch (Exception ex)
+        {
+            _animadexCnNameToEn = null;
+            _animadexCnWorkToEn = null;
+            LogWarn($"AnimaDex 映射构建失败(不影响本地检索): {ex.Message}");
+        }
+    }
+
+    static void AddCnMapping(Dictionary<string, string> map, string? chinese, string english)
+    {
+        if (string.IsNullOrWhiteSpace(chinese) || string.IsNullOrWhiteSpace(english))
+            return;
+
+        AddKey(chinese);
+        var stripped = StripCnQualifier(chinese);
+        if (!string.Equals(stripped, chinese, StringComparison.Ordinal))
+            AddKey(stripped);
+
+        void AddKey(string value)
+        {
+            var key = NormalizeCnKey(value);
+            if (key.Length > 0 && !map.ContainsKey(key))
+                map[key] = english;
+        }
+    }
+
+    static string StripCnQualifier(string value)
+    {
+        var ascii = value.IndexOf('(');
+        var fullWidth = value.IndexOf('（');
+        var index = ascii < 0 ? fullWidth
+            : fullWidth < 0 ? ascii
+            : Math.Min(ascii, fullWidth);
+        return index <= 0 ? value : value[..index].Trim();
+    }
+
+    static string BaseEnglishName(string english)
+    {
+        var without = StripCnQualifier(english);
+        if (string.IsNullOrWhiteSpace(without))
+            without = english;
+        return without.Replace('_', ' ').Trim();
     }
 
     static string DisplayWork(CharacterPromptEntry entry)
@@ -1884,8 +2103,7 @@ public class ComfyuiService(
                 && apiPrompt[kv.Key] is JsonObject node)
             {
                 var ct = node["class_type"]?.GetValue<string>() ?? "";
-                if (!ct.Contains("SaveImage", StringComparison.OrdinalIgnoreCase)
-                    && !ct.Contains("保存", StringComparison.OrdinalIgnoreCase))
+                if (!IsSaveNode(ct))
                     continue;
             }
 
@@ -1903,6 +2121,24 @@ public class ComfyuiService(
         return list;
     }
 
+    /// <summary>
+    /// 判断节点是否为「保存图片」类（会向 history.outputs 上报图片）：
+    /// 原生 SaveImage / ZML_SaveImageV2 / 含「保存」的节点，以及
+    /// Crystools 的 "Save image with extra metadata [Crystools]" 等带空格变体。
+    /// PreviewImage、rgthree Image Comparer 等纯预览/画廊节点不算，避免中间预览被当成出图。
+    /// </summary>
+    static bool IsSaveNode(string classType)
+    {
+        if (string.IsNullOrEmpty(classType))
+            return false;
+        if (classType.Contains("SaveImage", StringComparison.OrdinalIgnoreCase)
+            || classType.Contains("保存", StringComparison.OrdinalIgnoreCase))
+            return true;
+        // 兼容 "Save image with extra metadata [Crystools]"：去标点后仍含 saveimage
+        var compact = new string(classType.Where(char.IsLetterOrDigit).ToArray());
+        return compact.Contains("saveimage", StringComparison.OrdinalIgnoreCase);
+    }
+
     static List<string> TryFindCustomSavePaths(JsonObject prompt)
     {
         var dirs = new List<string>();
@@ -1910,8 +2146,7 @@ public class ComfyuiService(
         {
             if (kv.Value is not JsonObject node) continue;
             var ct = node["class_type"]?.GetValue<string>() ?? "";
-            if (!ct.Contains("SaveImage", StringComparison.OrdinalIgnoreCase)
-                && !ct.Contains("保存", StringComparison.OrdinalIgnoreCase))
+            if (!IsSaveNode(ct))
                 continue;
             var inputs = node["inputs"] as JsonObject;
             var path = inputs?["保存路径"]?.GetValue<string>()

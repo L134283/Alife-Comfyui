@@ -36,6 +36,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     string? _danbooruTestMessage;
     bool _danbooruTesting;
 
+    // 在线角色检索（AnimaDex）连通测试
+    string? _animadexTestMessage;
+    bool _animadexTesting;
+
     // 模型卸载与空闲自动释放
     bool _unloadingModel;
     string? _unloadMessage;
@@ -2388,6 +2392,75 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
         b.CloseElement(); // danbooru panel
 
+        // 在线角色检索扩充（AnimaDex）：本地角色索引未命中/歧义时自动联网补查
+        AddSection(b, ref i, "在线角色检索扩充（可选）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cfy-panel");
+
+        b.OpenElement(i++, "label");
+        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;");
+        b.OpenElement(i++, "input");
+        b.AddAttribute(i++, "type", "checkbox");
+        b.AddAttribute(i++, "checked", Configuration.EnableAnimadexCharacterSearch);
+        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
+        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            Configuration.EnableAnimadexCharacterSearch = (bool)(e.Value ?? false);
+            StateHasChanged();
+        }));
+        b.CloseElement();
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
+        b.AddContent(i++, "启用 AnimaDex 在线角色检索");
+        b.CloseElement();
+        b.CloseElement();
+
+        AddHint(b, ref i, "仅作为本地角色索引（character-prompts.json）的补充：本地未命中、或带作品名仍歧义时，自动联网查约 3.6 万角色在线库。本地命中/歧义处理仍优先，不影响离线质量。默认关=零外网。需重载模块/重启角色后生效");
+
+        if (Configuration.EnableAnimadexCharacterSearch)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cfy-grid-2");
+            b.AddAttribute(i++, "style", "margin-top:8px;");
+
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "服务地址", Configuration.AnimadexBaseUrl,
+                v => Configuration.AnimadexBaseUrl = v);
+            AddHint(b, ref i, "默认官方站点 animadex.net（大陆直连通常约 1s）。中文角色名本地未收录时，返回会提示改用英文/罗马字名");
+            AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n))
+                    Configuration.AnimadexTimeoutSeconds = Math.Clamp(n, 5, 60);
+            });
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;");
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cfy-btn");
+            b.AddAttribute(i++, "disabled", _animadexTesting);
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAnimadexConnectivity));
+            b.AddContent(i++, _animadexTesting ? "测试中…" : "✦ 测试连通");
+            b.CloseElement();
+            if (!string.IsNullOrWhiteSpace(_animadexTestMessage))
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cfy-detect");
+                b.AddAttribute(i++, "style", "margin:0;flex:1;");
+                b.AddContent(i++, _animadexTestMessage);
+                b.CloseElement();
+            }
+            b.CloseElement();
+            b.CloseElement();
+
+            AddHint(b, ref i, "上游：animadex.net（Danbooru 角色标签聚合，MIT 客户端）。在线失败时 findcharacterprompt 自动回到纯本地提示，不阻塞生图");
+            b.CloseElement(); // grid-2
+        }
+
+        b.CloseElement(); // animadex panel
+
         // 默认参数
         AddSection(b, ref i, "默认参数");
         b.OpenElement(i++, "div");
@@ -2783,6 +2856,36 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         finally
         {
             _danbooruTesting = false;
+            StateHasChanged();
+        }
+    }
+
+    async Task TestAnimadexConnectivity()
+    {
+        if (_animadexTesting) return;
+        _animadexTesting = true;
+        _animadexTestMessage = "探测中…";
+        StateHasChanged();
+        try
+        {
+            var baseUrl = Configuration.AnimadexBaseUrl?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                _animadexTestMessage = "未填写服务地址";
+            }
+            else
+            {
+                var (ok, msg, ms) = await AnimadexClient.HealthAsync(baseUrl, 20);
+                _animadexTestMessage = $"{(ok ? "OK" : "FAIL")} {ms}ms — {msg}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _animadexTestMessage = "测试异常: " + ex.Message;
+        }
+        finally
+        {
+            _animadexTesting = false;
             StateHasChanged();
         }
     }
