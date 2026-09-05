@@ -296,8 +296,9 @@ public static class ComfyuiWorkflowConverter
         if (value is JsonArray)
             return; // 连线 [nodeId, slot]
 
-        // combo: 第一项是选项数组
-        if (arr[0] is JsonArray options)
+        // combo：旧式第一项为选项数组；新式类型名为 "COMBO"、选项在 meta.options
+        var options = GetSchemaOptions(schema);
+        if (options != null)
         {
             if (value is not JsonValue jv || !jv.TryGetValue<string>(out var s))
                 return;
@@ -482,14 +483,31 @@ public static class ComfyuiWorkflowConverter
         return null;
     }
 
+    /// <summary>
+    /// 取 combo 选项数组。兼容旧式 [["opt", ...], {...}] 与新式 ["COMBO", {options:[...]}]。
+    /// 不是 combo 或取不到选项时返回 null。
+    /// </summary>
+    static JsonArray? GetSchemaOptions(JsonNode? schema)
+    {
+        if (schema is not JsonArray arr || arr.Count == 0)
+            return null;
+        if (arr[0] is JsonArray options)
+            return options;
+        if (arr[0] is JsonValue tv && tv.TryGetValue<string>(out var t)
+            && t.Equals("COMBO", StringComparison.OrdinalIgnoreCase)
+            && arr.Count > 1 && arr[1] is JsonObject meta)
+            return meta["options"] as JsonArray;
+        return null;
+    }
+
     static bool IsWidgetScalarSchema(JsonNode? schema)
     {
         if (schema is not JsonArray arr || arr.Count == 0)
             return false;
-        if (arr[0] is JsonArray)
-            return true; // combo
+        if (GetSchemaOptions(schema) != null)
+            return true; // combo（旧式选项数组 / 新式 COMBO）
         if (arr[0] is JsonValue tv && tv.TryGetValue<string>(out var t))
-            return t is "INT" or "FLOAT" or "STRING" or "BOOLEAN";
+            return t is "INT" or "FLOAT" or "STRING" or "BOOLEAN" or "COMBO";
         return false;
     }
 
@@ -509,7 +527,8 @@ public static class ComfyuiWorkflowConverter
     {
         if (schema is not JsonArray arr || arr.Count == 0)
             return false;
-        if (arr[0] is JsonArray options)
+        var options = GetSchemaOptions(schema);
+        if (options != null)
         {
             foreach (var opt in options)
             {
@@ -532,11 +551,20 @@ public static class ComfyuiWorkflowConverter
         if (objectInfo == null || objectInfo[classType] is not JsonObject info)
             return fallback;
 
+        // widgets_values 始终按 UI 保存时的 widget 槽位顺序排列（= fallback/widgetInputNames 顺序），
+        // 这是唯一与取值对齐的可靠顺序。object_info 的 input_order 只反映“当前节点定义”，
+        // 节点升级换序、漏掉动态 combo 子控件（如 resize_type.scale）时会造成位置错位
+        // （DLSS5Settings scene_change_threshold 错拿 1.5、RTXVideoSuperResolution quality 错拿缩放值）。
+        // 因此顺序以 UI 的 fallback 为主；object_info 仅用于补齐 UI 中缺失的当前新增 widget 字段。
         var order = new List<string>();
-        var inputOrder = info["input_order"] as JsonObject;
-        var required = inputOrder?["required"] as JsonArray;
-        var optional = inputOrder?["optional"] as JsonArray;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var f in fallback)
+        {
+            if (seen.Add(f))
+                order.Add(f);
+        }
 
+        var inputOrder = info["input_order"] as JsonObject;
         void AddFrom(JsonArray? arr)
         {
             if (arr == null) return;
@@ -545,22 +573,14 @@ public static class ComfyuiWorkflowConverter
                 var name = n?.GetValue<string>();
                 if (string.IsNullOrWhiteSpace(name)) continue;
                 if (IsConnectionOnlyInput(info, name)) continue;
-                order.Add(name);
+                if (seen.Add(name))
+                    order.Add(name);
             }
         }
 
-        AddFrom(required);
-        AddFrom(optional);
+        AddFrom(inputOrder?["required"] as JsonArray);
+        AddFrom(inputOrder?["optional"] as JsonArray);
 
-        if (order.Count == 0)
-            return fallback;
-
-        var set = new HashSet<string>(order, StringComparer.Ordinal);
-        foreach (var f in fallback)
-        {
-            if (!set.Contains(f) && !IsConnectionOnlyInput(info, f))
-                order.Add(f);
-        }
         return order;
     }
 
@@ -584,7 +604,10 @@ public static class ComfyuiWorkflowConverter
 
         if (arr[0] is JsonValue typeVal && typeVal.TryGetValue<string>(out var typeName))
         {
-            if (typeName is "INT" or "FLOAT" or "STRING" or "BOOLEAN")
+            // 新式自定义节点把下拉声明为 ["COMBO", {options:[...]}] 或 ["COMFY_DYNAMICCOMBO_V3", {...}]，
+            // 等价旧式选项数组，是 widget 不是连线；若被误判为连线，widget 顺序会错位。
+            if (typeName is "INT" or "FLOAT" or "STRING" or "BOOLEAN"
+                || typeName.Contains("COMBO", StringComparison.OrdinalIgnoreCase))
                 return false;
             if (ConnectionTypes.Contains(typeName))
                 return true;
@@ -1606,6 +1629,65 @@ public static class ComfyuiWorkflowConverter
                 || st2.GetValueKind() != JsonValueKind.Number
                 || st2.GetValue<int>() != 20)
                 return $"KSampler+object_info: steps 应为 20，实际 '{steps2}'";
+
+            // 4) 新式 COMBO 声明 ["COMBO", {options:[...]}] 不得被当作连线输入丢弃，
+            //    否则 ResolveWidgetOrder 漏字段、widget 位置整体左移（DLSS5Settings 回归）
+            var comboUi = JsonNode.Parse("""
+            {
+              "nodes": [
+                {
+                  "id": 20,
+                  "type": "DLSS5Settings",
+                  "mode": 0,
+                  "inputs": [
+                    { "name": "upscaling_mode", "type": "COMBO", "widget": { "name": "upscaling_mode" }, "link": null },
+                    { "name": "nr_intensity", "type": "FLOAT", "widget": { "name": "nr_intensity" }, "link": null },
+                    { "name": "scene_change_threshold", "type": "FLOAT", "widget": { "name": "scene_change_threshold" }, "link": null },
+                    { "name": "warmup_frames", "type": "INT", "widget": { "name": "warmup_frames" }, "link": null },
+                    { "name": "runtime_dir", "type": "STRING", "widget": { "name": "runtime_dir" }, "link": null }
+                  ],
+                  "widgets_values": ["1x (DLAA / native)", 1, 0.24, 0, ""]
+                }
+              ],
+              "links": []
+            }
+            """)!;
+            var comboObjectInfo = JsonNode.Parse("""
+            {
+              "DLSS5Settings": {
+                "input": {
+                  "required": {
+                    "upscaling_mode": ["COMBO", {"options": ["1x (DLAA / native)", "2x (Performance)"]}],
+                    "nr_intensity": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0}],
+                    "scene_change_threshold": ["FLOAT", {"default": 0.24, "min": 0.01, "max": 1.0}],
+                    "warmup_frames": ["INT", {"default": 0, "min": 0, "max": 16}],
+                    "runtime_dir": ["STRING", {"default": ""}]
+                  }
+                },
+                "input_order": {
+                  "required": [
+                    "upscaling_mode", "nr_intensity", "scene_change_threshold", "warmup_frames", "runtime_dir"
+                  ]
+                }
+              }
+            }
+            """) as JsonObject;
+            var cp = ToApiPrompt(comboUi, comboObjectInfo, validate: true);
+            if (cp["20"] is not JsonObject cn || cn["inputs"] is not JsonObject ci)
+                return "COMBO 声明: 节点 20 未进入 prompt";
+            var um = ci["upscaling_mode"]?.ToString();
+            if (!string.Equals(um, "1x (DLAA / native)", StringComparison.Ordinal))
+                return $"COMBO 声明: upscaling_mode 应为 '1x (DLAA / native)'，实际 '{um}'（COMBO 字段被误当连线跳过导致错位）";
+            var sct = ci["scene_change_threshold"];
+            if (sct is not JsonValue sctv
+                || sctv.GetValueKind() != JsonValueKind.Number
+                || Math.Abs(sctv.GetValue<double>() - 0.24) > 0.0001)
+                return $"COMBO 声明: scene_change_threshold 应为 0.24，实际 '{sct}'";
+            var wf = ci["warmup_frames"];
+            if (wf is not JsonValue wfv
+                || wfv.GetValueKind() != JsonValueKind.Number
+                || wfv.GetValue<int>() != 0)
+                return $"COMBO 声明: warmup_frames 应为 0，实际 '{wf}'";
 
             return null;
         }

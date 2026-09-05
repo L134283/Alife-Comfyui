@@ -207,6 +207,12 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 
 ## 版本历史
 
+### v4.4.1（2026-09-05）
+
+- **修复**：DLSS5Settings、RTXVideoSuperResolution 等新式自定义节点的 UI→API widget 错位。这类节点把下拉声明为 `["COMBO", {options:[...]}]`（含 `COMFY_DYNAMICCOMBO_V3` 动态下拉，选中后带 `resize_type.scale` 子控件），不再用旧式选项数组；转换器此前把这些字段误判为连线输入跳过，并按 object_info `input_order` 重排 widget，导致参数整体错位（如「动漫4」`scene_change_threshold` 错拿 `local_structure_strength` 的 1.5 报「大于最大值 1」）
+- widget 映射顺序改为以 UI 保存的 widget 槽位顺序（`widgets_values`）为准，object_info 仅补齐 UI 缺失的当前新增字段；combo 选项读取、可选值校验与 seed 后 control token 判定同步支持新式 `COMBO` 声明
+- 新增回归自检：新式 `COMBO` 声明节点转换不得丢字段、不得错位
+
 ### v4.4.0（2026-09-03）
 
 - **新增「在线角色检索扩充」（可选，默认关）**：本地角色索引（`character-prompts.json`）未命中、或带作品名仍歧义时，`findcharacterprompt` 自动联网查 AnimaDex 在线角色库（约 3.6 万角色，数据基于 Danbooru 标签聚合），把返回的 trigger/特征标签包装回原有三段格式（无默认服装段）；本地命中与中文/别名/作品消歧仍优先，保持离线可用，在线失败自动回纯本地提示
