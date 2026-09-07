@@ -75,11 +75,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     padding: 3px;
     isolation: isolate;
     overflow: hidden;
-    animation: cfy-root-in 0.8s cubic-bezier(.16,1,.3,1) both;
-}
-@keyframes cfy-root-in {
-    from { opacity: 0; transform: scale(0.94) translateY(28px); filter: blur(12px); }
-    to { opacity: 1; transform: scale(1) translateY(0); filter: blur(0); }
 }
 .cfy-root::before {
     content: '';
@@ -91,7 +86,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         #ff6bb5, #ff9ad5, #ffd0e8, #fff, #fda4af,
         #f472b6, #e879f9, #c084fc, #f472b6, #ff6bb5
     );
-    animation: cfy-spin 4s linear infinite;
     filter: blur(0px);
 }
 .cfy-root::after {
@@ -146,7 +140,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             rgba(251,113,133,0.16) 55%,
             transparent 70%);
     background-size: 200% 200%;
-    animation: cfy-aurora 10s ease-in-out infinite alternate;
     mix-blend-mode: multiply;
     filter: blur(8px);
 }
@@ -154,29 +147,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     0% { background-position: 0% 40%; transform: rotate(-2deg) scale(1.05); }
     50% { background-position: 80% 60%; transform: rotate(1deg) scale(1.1); }
     100% { background-position: 100% 30%; transform: rotate(-1deg) scale(1.05); }
-}
-
-/* 扫描线 */
-.cfy-scan {
-    position: absolute;
-    left: 0; right: 0;
-    height: 120px;
-    z-index: 0;
-    pointer-events: none;
-    background: linear-gradient(
-        180deg,
-        transparent 0%,
-        rgba(255,255,255,0.35) 45%,
-        rgba(244,114,182,0.12) 50%,
-        rgba(255,255,255,0.25) 55%,
-        transparent 100%
-    );
-    animation: cfy-scan 5.5s cubic-bezier(.4,0,.2,1) infinite;
-    opacity: 0.55;
-}
-@keyframes cfy-scan {
-    0% { top: -20%; }
-    100% { top: 110%; }
 }
 
 /* 网格 */
@@ -190,7 +160,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         linear-gradient(90deg, rgba(244,114,182,0.06) 1px, transparent 1px);
     background-size: 28px 28px;
     mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, #000 20%, transparent 75%);
-    animation: cfy-grid-drift 20s linear infinite;
 }
 @keyframes cfy-grid-drift {
     from { background-position: 0 0; }
@@ -210,26 +179,21 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     width: 280px; height: 280px;
     top: -90px; right: -70px;
     background: radial-gradient(circle, rgba(255,120,190,0.75) 0%, rgba(255,120,190,0) 68%);
-    animation: cfy-orb-a 8s ease-in-out infinite;
 }
 .cfy-orb-2 {
     width: 220px; height: 220px;
     bottom: 20px; left: -70px;
     background: radial-gradient(circle, rgba(253,164,175,0.65) 0%, rgba(253,164,175,0) 68%);
-    animation: cfy-orb-b 10s ease-in-out infinite;
 }
 .cfy-orb-3 {
     width: 160px; height: 160px;
     top: 40%; left: 55%;
     background: radial-gradient(circle, rgba(232,121,249,0.4) 0%, rgba(232,121,249,0) 70%);
-    animation: cfy-orb-c 7s ease-in-out infinite;
 }
 .cfy-orb-4 {
     width: 100px; height: 100px;
     top: 15%; left: 20%;
     background: radial-gradient(circle, rgba(255,255,255,0.7) 0%, rgba(255,182,213,0.3) 40%, transparent 70%);
-    animation: cfy-orb-d 6s ease-in-out infinite;
-    filter: blur(0);
 }
 @keyframes cfy-orb-a {
     0%,100% { transform: translate(0,0) scale(1); }
@@ -257,7 +221,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     z-index: 0;
     background: #fff;
     box-shadow: 0 0 6px 1px rgba(255,182,213,0.95), 0 0 14px rgba(236,72,153,0.5);
-    animation: cfy-particle-float linear infinite;
+    opacity: 0.85;
 }
 @keyframes cfy-particle-float {
     0% { transform: translateY(20px) scale(0.4); opacity: 0; }
@@ -285,8 +249,8 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     z-index: 0;
     pointer-events: none;
     background: radial-gradient(circle, #fff 0%, #ffc0e0 40%, transparent 70%);
+    opacity: 0.75;
     clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-    animation: cfy-star-twinkle 2.2s ease-in-out infinite;
 }
 .cfy-star-1 { top: 8%;  left: 12%; animation-delay: 0s; }
 .cfy-star-2 { top: 18%; right: 15%; animation-delay: 0.6s; width: 8px; height: 8px; }
@@ -302,22 +266,9 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 .cfy-content { position: relative; z-index: 2; }
 
 /* 错落入场 */
-.cfy-stagger > * {
-    animation: cfy-rise 0.7s cubic-bezier(.16,1,.3,1) both;
-}
-.cfy-stagger > *:nth-child(1) { animation-delay: 0.05s; }
-.cfy-stagger > *:nth-child(2) { animation-delay: 0.12s; }
-.cfy-stagger > *:nth-child(3) { animation-delay: 0.2s; }
-.cfy-stagger > *:nth-child(4) { animation-delay: 0.28s; }
-.cfy-stagger > *:nth-child(5) { animation-delay: 0.36s; }
-.cfy-stagger > *:nth-child(6) { animation-delay: 0.44s; }
-.cfy-stagger > *:nth-child(7) { animation-delay: 0.52s; }
-.cfy-stagger > *:nth-child(8) { animation-delay: 0.6s; }
-.cfy-stagger > *:nth-child(9) { animation-delay: 0.68s; }
-.cfy-stagger > *:nth-child(10) { animation-delay: 0.76s; }
 @keyframes cfy-rise {
-    from { opacity: 0; transform: translateY(28px) scale(0.96); filter: blur(6px); }
-    to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+    from { opacity: 0; transform: translateY(14px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 /* ========== Hero ========== */
@@ -355,14 +306,12 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     inset: 0;
     background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8), transparent);
     transform: translateX(-100%);
-    animation: cfy-sheen 2.8s ease-in-out infinite;
 }
 .cfy-kicker-dot {
     width: 7px; height: 7px;
     border-radius: 50%;
     background: #ec4899;
     box-shadow: 0 0 8px #f472b6;
-    animation: cfy-blink 1.2s ease-in-out infinite;
 }
 @keyframes cfy-blink {
     0%,100% { opacity: 1; transform: scale(1); }
@@ -400,23 +349,8 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
-    animation:
-        cfy-title-shimmer 3.5s linear infinite,
-        cfy-title-pop 0.9s 0.15s cubic-bezier(.16,1,.3,1) both;
+    animation: cfy-title-pop 0.9s 0.15s cubic-bezier(.16,1,.3,1) both;
     filter: drop-shadow(0 4px 16px rgba(236,72,153,0.35));
-}
-.cfy-title::after {
-    content: 'ComfyUI 生图';
-    position: absolute;
-    left: 0; top: 0;
-    width: 100%;
-    background: linear-gradient(100deg, transparent, rgba(255,255,255,0.85), transparent);
-    background-size: 200% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: cfy-title-glint 2.8s ease-in-out infinite;
-    pointer-events: none;
 }
 @keyframes cfy-title-shimmer {
     0% { background-position: 0% center; }
@@ -440,16 +374,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     display: inline-block;
     animation: cfy-sub-in 0.8s 0.35s both;
 }
-.cfy-subtitle::after {
-    content: '';
-    display: inline-block;
-    width: 2px; height: 0.95em;
-    background: #ec4899;
-    margin-left: 3px;
-    vertical-align: -0.1em;
-    animation: cfy-cursor 0.9s step-end infinite;
-    box-shadow: 0 0 6px #f472b6;
-}
 @keyframes cfy-cursor {
     0%,100% { opacity: 1; }
     50% { opacity: 0; }
@@ -471,7 +395,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     inset: -6px;
     border-radius: 999px;
     border: 2px solid rgba(236,72,153,0.45);
-    animation: cfy-ring-pulse 2s ease-out infinite;
     pointer-events: none;
 }
 .cfy-badge-ring2 {
@@ -479,7 +402,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     inset: -12px;
     border-radius: 999px;
     border: 1.5px solid rgba(244,114,182,0.3);
-    animation: cfy-ring-pulse 2s 0.5s ease-out infinite;
     pointer-events: none;
 }
 @keyframes cfy-ring-pulse {
@@ -503,7 +425,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     color: #fff;
     background: linear-gradient(135deg, #f9a8d4, #f472b6 40%, #ec4899 70%, #db2777);
     background-size: 200% 200%;
-    animation: cfy-badge-flow 3s ease infinite, cfy-badge-glow 2s ease-in-out infinite;
     box-shadow:
         0 6px 22px rgba(236,72,153,0.55),
         0 0 0 1px rgba(255,255,255,0.4) inset,
@@ -515,7 +436,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     border-radius: 50%;
     background: #fff;
     box-shadow: 0 0 10px #fff, 0 0 18px #fbcfe8;
-    animation: cfy-blink 1s ease-in-out infinite;
 }
 @keyframes cfy-badge-flow {
     0%,100% { background-position: 0% 50%; }
@@ -564,7 +484,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     width: 5px;
     background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9, #f472b6);
     background-size: 100% 200%;
-    animation: cfy-bar-flow 2.5s linear infinite;
     border-radius: 5px 0 0 5px;
 }
 .cfy-alert::after {
@@ -574,7 +493,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     width: 140px; height: 140px;
     border-radius: 50%;
     background: radial-gradient(circle, rgba(244,114,182,0.2), transparent 70%);
-    animation: cfy-orb-d 5s ease-in-out infinite;
     pointer-events: none;
 }
 @keyframes cfy-bar-flow {
@@ -593,7 +511,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 .cfy-alert-title::before {
     content: '✦';
     display: inline-block;
-    animation: cfy-spin-icon 4s linear infinite;
     color: #f472b6;
     text-shadow: 0 0 10px rgba(244,114,182,0.8);
 }
@@ -627,7 +544,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     background-size: 200% 200%;
     box-shadow: 0 0 14px rgba(236,72,153,0.85), 0 0 28px rgba(244,114,182,0.4);
     flex-shrink: 0;
-    animation: cfy-dot-pulse 1.8s ease-in-out infinite, cfy-badge-flow 3s ease infinite;
 }
 .cfy-section::after {
     content: '';
@@ -739,11 +655,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     overflow: hidden;
     transition: transform 0.4s cubic-bezier(.16,1,.3,1), box-shadow 0.4s ease;
     transform-style: preserve-3d;
-    animation: cfy-card-float 5s ease-in-out infinite;
 }
-.cfy-reso-card:nth-child(1) { animation-delay: 0s; }
-.cfy-reso-card:nth-child(2) { animation-delay: 0.6s; }
-.cfy-reso-card:nth-child(3) { animation-delay: 1.2s; }
 @keyframes cfy-card-float {
     0%,100% { transform: translateY(0); }
     50% { transform: translateY(-5px); }
@@ -776,7 +688,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
     -webkit-mask-composite: xor;
     mask-composite: exclude;
-    animation: cfy-spin 3s linear infinite;
     opacity: 0.7;
     pointer-events: none;
     z-index: 0;
@@ -821,7 +732,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     color: #fff;
     background: linear-gradient(135deg, #f472b6, #ec4899, #e879f9);
     background-size: 200% 200%;
-    animation: cfy-badge-flow 3s ease infinite;
     border-radius: 999px;
     padding: 3px 10px;
     margin-bottom: 10px;
@@ -890,7 +800,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     top: 0; left: -40%;
     width: 40%; height: 100%;
     background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
-    animation: cfy-panel-sweep 6s ease-in-out infinite;
     pointer-events: none;
 }
 @keyframes cfy-panel-sweep {
@@ -919,7 +828,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         0 0 30px rgba(244,114,182,0.3);
     transition: all 0.35s cubic-bezier(.16,1,.3,1);
     overflow: hidden;
-    animation: cfy-badge-flow 4s ease infinite;
     text-shadow: 0 1px 2px rgba(157,23,77,0.3);
 }
 .cfy-btn::before {
@@ -975,11 +883,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     top: 0; left: 0; right: 0;
     height: 2px;
     background: linear-gradient(90deg, transparent, #f472b6, #e879f9, transparent);
-    animation: cfy-detect-line 1.5s ease-in-out infinite;
 }
 @keyframes cfy-detect-in {
-    from { opacity: 0; transform: scale(0.95) translateY(10px); filter: blur(4px); }
-    to { opacity: 1; transform: scale(1) translateY(0); filter: blur(0); }
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 @keyframes cfy-detect-line {
     0% { transform: translateX(-100%); }
@@ -1005,7 +912,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     font-size: 10px;
     letter-spacing: 0.4em;
     color: #f9a8d4;
-    animation: cfy-star-twinkle 2.5s ease-in-out infinite;
 }
 .cfy-footer span {
     background: linear-gradient(90deg, #f472b6, #ec4899, #e879f9, #f472b6);
@@ -1014,7 +920,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     background-clip: text;
     -webkit-text-fill-color: transparent;
     font-weight: 900;
-    animation: cfy-title-shimmer 3s linear infinite;
 }
 
 /* 装饰彩条 */
@@ -1025,7 +930,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     background: linear-gradient(90deg,
         #f472b6, #ec4899, #e879f9, #c084fc, #f472b6, #fb7185, #f472b6);
     background-size: 300% 100%;
-    animation: cfy-title-shimmer 4s linear infinite;
     box-shadow: 0 0 12px rgba(244,114,182,0.5);
 }
 
@@ -1702,7 +1606,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         // 装饰层
         b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-aurora"); b.CloseElement();
         b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-grid-bg"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-scan"); b.CloseElement();
         b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-1"); b.CloseElement();
         b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-2"); b.CloseElement();
         b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-3"); b.CloseElement();
@@ -1754,11 +1657,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cfy-badge-wrap");
-        if (configured)
-        {
-            b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-badge-ring"); b.CloseElement();
-            b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-badge-ring2"); b.CloseElement();
-        }
         b.OpenElement(i++, "span");
         b.AddAttribute(i++, "class", configured ? "cfy-badge-on" : "cfy-badge-off");
         b.AddContent(i++, configured ? "已配置 · LIVE" : "未配置");
