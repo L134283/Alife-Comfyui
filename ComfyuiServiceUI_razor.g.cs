@@ -13,6 +13,18 @@ using AntDesign;
 
 namespace Alife.Plugin.Comfyui;
 
+/// <summary>
+/// ComfyUI 配置面板。
+///
+/// 重构要点（v4.5.0）：
+/// 1) 分页签，**只渲染当前页签**——原来一次性构建全部区块，任何交互都整页重建；
+/// 2) 文本输入改为 onchange（失焦/回车提交），不再每敲一个字符整页重建（原为 oninput）；
+/// 3) 去掉毛玻璃(backdrop-filter)、keyframes 动画、超大 conic-gradient、模糊滤镜与多层阴影——
+///    这些是面板闪烁/掉帧的主因，且与渲染树无关；
+/// 4) 事件回调不再手写 StateHasChanged（Blazor 事件后自动重渲染）；
+/// 5) 卡片列表改为进入页签时惰性加载，不在渲染过程中改状态。
+/// 所有业务方法（扫描/识别/连通测试/卡片增删改/节点概览等）保持原实现不变。
+/// </summary>
 public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConfig>
 {
     string? detectMessage; string? _scanDetectMessage;
@@ -44,6 +56,30 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     bool _unloadingModel;
     string? _unloadMessage;
 
+    // APP-MCP 模板模式连通测试
+    string? _appMcpTestMessage;
+    bool _appMcpTesting;
+
+    // 页签（只渲染当前页签）。页签列表按后端模式生成：模板模式隐藏「工作流」整页
+    int _tab = 0;
+    static readonly (int Id, string Title)[] AllTabs =
+    {
+        (0, "基础"), (1, "工作流"), (2, "后端 · 画风"), (3, "提示词"), (4, "检索"), (5, "高级")
+    };
+    bool _loadedWorkflowCards;
+    bool _loadedPresetCards;
+
+    IEnumerable<(int Id, string Title)> EffectiveTabs()
+    {
+        var appMcp = IsAppMcp();
+        foreach (var t in AllTabs)
+        {
+            if (appMcp && t.Id == 1)
+                continue; // 模板模式：工作流配置整体不可用，隐藏该页签
+            yield return t;
+        }
+    }
+
     record WorkflowCard
     {
         public string Name { get; set; } = "";
@@ -58,1529 +94,92 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         public string Content { get; set; } = "";
     }
 
+    // ============================================================
+    // 样式：纯静态、无动画、无滤镜、无毛玻璃。避免宿主每帧重绘导致闪烁/掉帧。
+    // ============================================================
     const string Css = @"
-/* ========== 根：旋转霓虹描边 ========== */
-.cfy-root {
-    --pink: #ec4899;
-    --pink-hot: #f472b6;
-    --rose: #fb7185;
-    --blush: #fbcfe8;
-    --cream: #fff7fb;
-    --ink: #5b2145;
-    --ink-soft: #9d4b74;
-    position: relative;
-    width: 100%;
-    box-sizing: border-box;
-    border-radius: 26px;
-    padding: 3px;
-    isolation: isolate;
-    overflow: hidden;
-}
-.cfy-root::before {
-    content: '';
-    position: absolute;
-    inset: -40%;
-    z-index: -2;
-    background: conic-gradient(
-        from var(--cfy-angle, 0deg),
-        #ff6bb5, #ff9ad5, #ffd0e8, #fff, #fda4af,
-        #f472b6, #e879f9, #c084fc, #f472b6, #ff6bb5
-    );
-    filter: blur(0px);
-}
-.cfy-root::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    z-index: -1;
-    border-radius: 26px;
-    background: linear-gradient(135deg, #fff9fc, #ffe4ef);
-    box-shadow:
-        0 0 40px rgba(236,72,153,0.35),
-        0 0 80px rgba(244,114,182,0.2),
-        0 25px 60px rgba(190,24,93,0.18),
-        inset 0 1px 0 rgba(255,255,255,0.9);
-}
-@property --cfy-angle {
-    syntax: '<angle>';
-    initial-value: 0deg;
-    inherits: false;
-}
-@keyframes cfy-spin {
-    to { --cfy-angle: 360deg; transform: rotate(360deg); }
-}
-
-/* ========== 主容器 ========== */
-.cfy-container {
-    position: relative;
-    width: 100%;
-    box-sizing: border-box;
-    border-radius: 23px;
-    padding: 30px 32px 24px;
-    color: var(--ink);
-    overflow: hidden;
-    background:
-        radial-gradient(ellipse 90% 60% at 0% 0%, rgba(255,154,198,0.45), transparent 55%),
-        radial-gradient(ellipse 80% 50% at 100% 0%, rgba(253,164,175,0.35), transparent 50%),
-        radial-gradient(ellipse 70% 50% at 50% 100%, rgba(232,121,249,0.18), transparent 55%),
-        linear-gradient(165deg, #fffafc 0%, #fff0f6 45%, #ffe8f1 100%);
-}
-
-/* 极光层 */
-.cfy-aurora {
-    position: absolute;
-    inset: -20%;
-    z-index: 0;
-    pointer-events: none;
-    background:
-        linear-gradient(115deg,
-            transparent 20%,
-            rgba(244,114,182,0.18) 35%,
-            rgba(232,121,249,0.14) 45%,
-            rgba(251,113,133,0.16) 55%,
-            transparent 70%);
-    background-size: 200% 200%;
-    mix-blend-mode: multiply;
-    filter: blur(8px);
-}
-@keyframes cfy-aurora {
-    0% { background-position: 0% 40%; transform: rotate(-2deg) scale(1.05); }
-    50% { background-position: 80% 60%; transform: rotate(1deg) scale(1.1); }
-    100% { background-position: 100% 30%; transform: rotate(-1deg) scale(1.05); }
-}
-
-/* 网格 */
-.cfy-grid-bg {
-    position: absolute;
-    inset: 0;
-    z-index: 0;
-    pointer-events: none;
-    background-image:
-        linear-gradient(rgba(244,114,182,0.06) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(244,114,182,0.06) 1px, transparent 1px);
-    background-size: 28px 28px;
-    mask-image: radial-gradient(ellipse 80% 70% at 50% 40%, #000 20%, transparent 75%);
-}
-@keyframes cfy-grid-drift {
-    from { background-position: 0 0; }
-    to { background-position: 28px 28px; }
-}
-
-/* 光球 */
-.cfy-orb {
-    position: absolute;
-    border-radius: 50%;
-    pointer-events: none;
-    z-index: 0;
-    filter: blur(1px);
-    will-change: transform;
-}
-.cfy-orb-1 {
-    width: 280px; height: 280px;
-    top: -90px; right: -70px;
-    background: radial-gradient(circle, rgba(255,120,190,0.75) 0%, rgba(255,120,190,0) 68%);
-}
-.cfy-orb-2 {
-    width: 220px; height: 220px;
-    bottom: 20px; left: -70px;
-    background: radial-gradient(circle, rgba(253,164,175,0.65) 0%, rgba(253,164,175,0) 68%);
-}
-.cfy-orb-3 {
-    width: 160px; height: 160px;
-    top: 40%; left: 55%;
-    background: radial-gradient(circle, rgba(232,121,249,0.4) 0%, rgba(232,121,249,0) 70%);
-}
-.cfy-orb-4 {
-    width: 100px; height: 100px;
-    top: 15%; left: 20%;
-    background: radial-gradient(circle, rgba(255,255,255,0.7) 0%, rgba(255,182,213,0.3) 40%, transparent 70%);
-}
-@keyframes cfy-orb-a {
-    0%,100% { transform: translate(0,0) scale(1); }
-    33% { transform: translate(-30px, 40px) scale(1.15); }
-    66% { transform: translate(-10px, 15px) scale(0.92); }
-}
-@keyframes cfy-orb-b {
-    0%,100% { transform: translate(0,0) scale(1); }
-    50% { transform: translate(35px, -30px) scale(1.2); }
-}
-@keyframes cfy-orb-c {
-    0%,100% { transform: translate(0,0) scale(1) rotate(0deg); }
-    50% { transform: translate(-40px, -25px) scale(1.25) rotate(40deg); }
-}
-@keyframes cfy-orb-d {
-    0%,100% { transform: translate(0,0) scale(1); opacity: 0.6; }
-    50% { transform: translate(20px, 30px) scale(1.4); opacity: 1; }
-}
-
-/* 粒子星场 */
-.cfy-particle {
-    position: absolute;
-    border-radius: 50%;
-    pointer-events: none;
-    z-index: 0;
-    background: #fff;
-    box-shadow: 0 0 6px 1px rgba(255,182,213,0.95), 0 0 14px rgba(236,72,153,0.5);
-    opacity: 0.85;
-}
-@keyframes cfy-particle-float {
-    0% { transform: translateY(20px) scale(0.4); opacity: 0; }
-    15% { opacity: 1; }
-    85% { opacity: 0.85; }
-    100% { transform: translateY(-420px) scale(1.2); opacity: 0; }
-}
-.cfy-p1  { width:5px; height:5px; left:6%;  bottom:5%;  animation-duration: 7s;  animation-delay: 0s; }
-.cfy-p2  { width:3px; height:3px; left:14%; bottom:0%;  animation-duration: 9s;  animation-delay: 1.2s; }
-.cfy-p3  { width:4px; height:4px; left:22%; bottom:8%;  animation-duration: 6.5s; animation-delay: 0.4s; }
-.cfy-p4  { width:6px; height:6px; left:35%; bottom:2%;  animation-duration: 8s;  animation-delay: 2s; }
-.cfy-p5  { width:3px; height:3px; left:48%; bottom:10%; animation-duration: 10s; animation-delay: 0.8s; }
-.cfy-p6  { width:5px; height:5px; left:58%; bottom:0%;  animation-duration: 7.5s; animation-delay: 1.6s; }
-.cfy-p7  { width:4px; height:4px; left:68%; bottom:6%;  animation-duration: 9.5s; animation-delay: 0.2s; }
-.cfy-p8  { width:3px; height:3px; left:78%; bottom:3%;  animation-duration: 6s;  animation-delay: 2.4s; }
-.cfy-p9  { width:5px; height:5px; left:88%; bottom:9%;  animation-duration: 8.5s; animation-delay: 1s; }
-.cfy-p10 { width:4px; height:4px; left:42%; bottom:4%;  animation-duration: 11s; animation-delay: 3s; }
-.cfy-p11 { width:3px; height:3px; left:92%; bottom:1%;  animation-duration: 7s;  animation-delay: 1.8s; }
-.cfy-p12 { width:6px; height:6px; left:28%; bottom:7%;  animation-duration: 9s;  animation-delay: 2.8s; }
-
-/* 闪星 */
-.cfy-star {
-    position: absolute;
-    width: 10px; height: 10px;
-    z-index: 0;
-    pointer-events: none;
-    background: radial-gradient(circle, #fff 0%, #ffc0e0 40%, transparent 70%);
-    opacity: 0.75;
-    clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-}
-.cfy-star-1 { top: 8%;  left: 12%; animation-delay: 0s; }
-.cfy-star-2 { top: 18%; right: 15%; animation-delay: 0.6s; width: 8px; height: 8px; }
-.cfy-star-3 { top: 55%; left: 8%;  animation-delay: 1.1s; width: 7px; height: 7px; }
-.cfy-star-4 { top: 70%; right: 10%; animation-delay: 1.7s; width: 12px; height: 12px; }
-.cfy-star-5 { top: 30%; left: 50%; animation-delay: 0.3s; width: 6px; height: 6px; }
-@keyframes cfy-star-twinkle {
-    0%,100% { opacity: 0.15; transform: scale(0.5) rotate(0deg); }
-    50% { opacity: 1; transform: scale(1.4) rotate(20deg); filter: drop-shadow(0 0 6px #fff); }
-}
-
-/* 内容层 */
-.cfy-content { position: relative; z-index: 2; }
-
-/* 错落入场 */
-@keyframes cfy-rise {
-    from { opacity: 0; transform: translateY(14px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-/* ========== Hero ========== */
-.cfy-hero {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-}
-.cfy-title-wrap { flex: 1; min-width: 220px; }
-.cfy-kicker {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: #be185d;
-    background: linear-gradient(90deg, rgba(255,255,255,0.95), rgba(255,228,240,0.8));
-    border: 1px solid rgba(244,114,182,0.4);
-    border-radius: 999px;
-    padding: 4px 14px;
-    margin-bottom: 10px;
-    box-shadow: 0 4px 16px rgba(244,114,182,0.2);
-    position: relative;
-    overflow: hidden;
-    animation: cfy-kicker-in 0.8s 0.1s cubic-bezier(.16,1,.3,1) both;
-}
-.cfy-kicker::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8), transparent);
-    transform: translateX(-100%);
-}
-.cfy-kicker-dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: #ec4899;
-    box-shadow: 0 0 8px #f472b6;
-}
-@keyframes cfy-blink {
-    0%,100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.7); }
-}
-@keyframes cfy-sheen {
-    0%, 60% { transform: translateX(-100%); }
-    100% { transform: translateX(200%); }
-}
-@keyframes cfy-kicker-in {
-    from { opacity: 0; transform: translateX(-20px); }
-    to { opacity: 1; transform: translateX(0); }
-}
-
-.cfy-title {
-    font-size: 32px;
-    font-weight: 900;
-    line-height: 1.1;
-    margin: 0 0 8px;
-    letter-spacing: -0.02em;
-    position: relative;
-    display: inline-block;
-    background: linear-gradient(
-        100deg,
-        #9d174d 0%,
-        #be185d 15%,
-        #ec4899 30%,
-        #f472b6 45%,
-        #fb7185 55%,
-        #e879f9 70%,
-        #f472b6 85%,
-        #be185d 100%
-    );
-    background-size: 300% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: cfy-title-pop 0.9s 0.15s cubic-bezier(.16,1,.3,1) both;
-    filter: drop-shadow(0 4px 16px rgba(236,72,153,0.35));
-}
-@keyframes cfy-title-shimmer {
-    0% { background-position: 0% center; }
-    100% { background-position: 300% center; }
-}
-@keyframes cfy-title-glint {
-    0%, 40% { background-position: -100% center; opacity: 0; }
-    50% { opacity: 1; }
-    100% { background-position: 200% center; opacity: 0; }
-}
-@keyframes cfy-title-pop {
-    from { opacity: 0; transform: scale(0.85) translateY(12px); letter-spacing: 0.15em; }
-    to { opacity: 1; transform: scale(1) translateY(0); letter-spacing: -0.02em; }
-}
-
-.cfy-subtitle {
-    font-size: 13px;
-    color: var(--ink-soft);
-    line-height: 1.55;
-    position: relative;
-    display: inline-block;
-    animation: cfy-sub-in 0.8s 0.35s both;
-}
-@keyframes cfy-cursor {
-    0%,100% { opacity: 1; }
-    50% { opacity: 0; }
-}
-@keyframes cfy-sub-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-/* 状态徽章 */
-.cfy-badge-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-}
-.cfy-badge-ring {
-    position: absolute;
-    inset: -6px;
-    border-radius: 999px;
-    border: 2px solid rgba(236,72,153,0.45);
-    pointer-events: none;
-}
-.cfy-badge-ring2 {
-    position: absolute;
-    inset: -12px;
-    border-radius: 999px;
-    border: 1.5px solid rgba(244,114,182,0.3);
-    pointer-events: none;
-}
-@keyframes cfy-ring-pulse {
-    0% { transform: scale(0.9); opacity: 0.9; }
-    100% { transform: scale(1.35); opacity: 0; }
-}
-.cfy-badge-on, .cfy-badge-off {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 18px;
-    border-radius: 999px;
-    font-size: 12.5px;
-    font-weight: 800;
-    white-space: nowrap;
-    letter-spacing: 0.03em;
-    position: relative;
-    z-index: 1;
-}
-.cfy-badge-on {
-    color: #fff;
-    background: linear-gradient(135deg, #f9a8d4, #f472b6 40%, #ec4899 70%, #db2777);
-    background-size: 200% 200%;
-    box-shadow:
-        0 6px 22px rgba(236,72,153,0.55),
-        0 0 0 1px rgba(255,255,255,0.4) inset,
-        0 0 30px rgba(244,114,182,0.4);
-}
-.cfy-badge-on::before {
-    content: '';
-    width: 9px; height: 9px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 0 10px #fff, 0 0 18px #fbcfe8;
-}
-@keyframes cfy-badge-flow {
-    0%,100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-}
-@keyframes cfy-badge-glow {
-    0%,100% { filter: brightness(1); }
-    50% { filter: brightness(1.12); }
-}
-.cfy-badge-off {
-    color: var(--ink-soft);
-    background: rgba(255,255,255,0.75);
-    border: 1.5px solid rgba(244,114,182,0.35);
-    backdrop-filter: blur(8px);
-}
-.cfy-badge-off::before {
-    content: '';
-    width: 9px; height: 9px;
-    border-radius: 50%;
-    background: #f9a8d4;
-}
-
-/* 说明卡片 */
-.cfy-alert {
-    position: relative;
-    background: linear-gradient(135deg, rgba(255,255,255,0.88), rgba(255,240,247,0.72));
-    border: 1px solid rgba(244,114,182,0.3);
-    border-radius: 18px;
-    padding: 16px 20px;
-    margin-bottom: 8px;
-    backdrop-filter: blur(14px);
-    box-shadow:
-        0 10px 30px rgba(244,114,182,0.12),
-        inset 0 1px 0 rgba(255,255,255,0.95);
-    overflow: hidden;
-    transition: transform 0.35s cubic-bezier(.16,1,.3,1), box-shadow 0.35s ease;
-}
-.cfy-alert:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 16px 40px rgba(236,72,153,0.18);
-}
-.cfy-alert::before {
-    content: '';
-    position: absolute;
-    left: 0; top: 0; bottom: 0;
-    width: 5px;
-    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9, #f472b6);
-    background-size: 100% 200%;
-    border-radius: 5px 0 0 5px;
-}
-.cfy-alert::after {
-    content: '';
-    position: absolute;
-    top: -50%; right: -10%;
-    width: 140px; height: 140px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(244,114,182,0.2), transparent 70%);
-    pointer-events: none;
-}
-@keyframes cfy-bar-flow {
-    0% { background-position: 0% 0%; }
-    100% { background-position: 0% 200%; }
-}
-.cfy-alert-title {
-    font-weight: 900;
-    color: #be185d;
-    margin-bottom: 8px;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-.cfy-alert-title::before {
-    content: '✦';
-    display: inline-block;
-    color: #f472b6;
-    text-shadow: 0 0 10px rgba(244,114,182,0.8);
-}
-@keyframes cfy-spin-icon {
-    to { transform: rotate(360deg); }
-}
-.cfy-alert-desc {
-    font-size: 12.5px;
-    color: #8b3a62;
-    line-height: 1.8;
-    white-space: pre-line;
-}
-
-/* 分区标题 */
-.cfy-section {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-size: 15px;
-    font-weight: 900;
-    color: #be185d;
-    margin: 26px 0 14px;
-    letter-spacing: 0.03em;
-    position: relative;
-}
-.cfy-section::before {
-    content: '';
-    width: 12px; height: 12px;
-    border-radius: 50%;
-    background: linear-gradient(135deg, #f472b6, #ec4899, #e879f9);
-    background-size: 200% 200%;
-    box-shadow: 0 0 14px rgba(236,72,153,0.85), 0 0 28px rgba(244,114,182,0.4);
-    flex-shrink: 0;
-}
-.cfy-section::after {
-    content: '';
-    flex: 1;
-    height: 2px;
-    background: linear-gradient(90deg,
-        rgba(244,114,182,0.7),
-        rgba(232,121,249,0.4),
-        rgba(251,207,232,0.15),
-        transparent);
-    border-radius: 2px;
-    position: relative;
-    overflow: hidden;
-}
-@keyframes cfy-dot-pulse {
-    0%,100% { transform: scale(1); }
-    50% { transform: scale(1.35); }
-}
-
-/* 标签 / 提示 */
-.cfy-label {
-    font-weight: 800;
-    margin-bottom: 6px;
-    margin-top: 12px;
-    font-size: 12.5px;
-    color: #9d174d;
-    letter-spacing: 0.02em;
-    transition: color 0.2s;
-}
-.cfy-hint {
-    font-size: 11px;
-    color: #b06a8c;
-    margin: 5px 0 8px 2px;
-    line-height: 1.65;
-}
-
-/* 输入框 */
-.cfy-container .ant-input,
-.cfy-container .cfy-textarea,
-.cfy-container .cfy-select {
-    border: 1.5px solid rgba(244,114,182,0.3) !important;
-    border-radius: 14px !important;
-    background: rgba(255,255,255,0.82) !important;
-    color: var(--ink) !important;
-    box-shadow: 0 2px 10px rgba(244,114,182,0.07);
-    transition: all 0.3s cubic-bezier(.16,1,.3,1) !important;
-    backdrop-filter: blur(6px);
-}
-.cfy-container .ant-input:hover,
-.cfy-container .cfy-textarea:hover,
-.cfy-container .cfy-select:hover {
-    border-color: #f9a8d4 !important;
-    background: rgba(255,255,255,0.96) !important;
-    transform: translateY(-1px);
-    box-shadow: 0 6px 18px rgba(244,114,182,0.14) !important;
-}
-.cfy-container .ant-input:focus,
-.cfy-container .ant-input-focused,
-.cfy-container .cfy-textarea:focus,
-.cfy-container .cfy-select:focus {
-    border-color: #ec4899 !important;
-    box-shadow:
-        0 0 0 4px rgba(236,72,153,0.18),
-        0 8px 24px rgba(244,114,182,0.16) !important;
-    background: #fff !important;
-    transform: translateY(-1px);
-}
-.cfy-container .cfy-textarea {
-    width: 100%;
-    min-height: 96px;
-    resize: vertical;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.7;
-    padding: 12px 14px;
-    box-sizing: border-box;
-}
-.cfy-container .cfy-select {
-    width: 100%;
-    padding: 9px 14px;
-    font-size: 13px;
-    cursor: pointer;
-    outline: none;
-}
-.cfy-container .cfy-select option {
-    background: #fff;
-    color: var(--ink);
-}
-
-/* 分辨率卡片 — 全息 */
-.cfy-reso-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 14px;
-    margin: 10px 0 8px;
-    perspective: 900px;
-}
-@media (max-width: 720px) {
-    .cfy-reso-grid { grid-template-columns: 1fr; }
-}
-.cfy-reso-card {
-    position: relative;
-    border-radius: 18px;
-    padding: 16px 15px 14px;
-    background:
-        linear-gradient(145deg, rgba(255,255,255,0.95), rgba(255,240,247,0.8));
-    border: 1px solid rgba(244,114,182,0.3);
-    box-shadow: 0 8px 24px rgba(244,114,182,0.12);
-    overflow: hidden;
-    transition: transform 0.4s cubic-bezier(.16,1,.3,1), box-shadow 0.4s ease;
-    transform-style: preserve-3d;
-}
-@keyframes cfy-card-float {
-    0%,100% { transform: translateY(0); }
-    50% { transform: translateY(-5px); }
-}
-.cfy-reso-card:hover {
-    transform: translateY(-8px) rotateX(4deg) rotateY(-3deg) scale(1.03);
-    box-shadow:
-        0 20px 45px rgba(236,72,153,0.28),
-        0 0 0 1px rgba(244,114,182,0.4),
-        0 0 40px rgba(244,114,182,0.2);
-    animation: none;
-}
-.cfy-reso-card::before {
-    content: '';
-    position: absolute;
-    inset: -1px;
-    border-radius: 18px;
-    padding: 1.5px;
-    background: conic-gradient(
-        from var(--cfy-angle, 0deg),
-        transparent 0%, transparent 3%,
-        rgba(255,255,255,0.95) 4%, rgba(244,114,182,1) 4.5%, rgba(232,121,249,0.8) 5%,
-        transparent 5.5%, transparent 33%,
-        rgba(255,255,255,0.95) 34%, rgba(244,114,182,1) 34.5%, rgba(232,121,249,0.8) 35%,
-        transparent 35.5%, transparent 66%,
-        rgba(255,255,255,0.95) 67%, rgba(244,114,182,1) 67.5%, rgba(232,121,249,0.8) 68%,
-        transparent 68.5%, transparent 100%
-    );
-    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-    -webkit-mask-composite: xor;
-    mask-composite: exclude;
-    opacity: 0.7;
-    pointer-events: none;
-    z-index: 0;
-}
-.cfy-reso-card::after {
-    content: '';
-    position: absolute;
-    top: -40%; right: -30%;
-    width: 100px; height: 100px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(244,114,182,0.3), transparent 70%);
-    pointer-events: none;
-    transition: transform 0.4s ease;
-}
-.cfy-reso-card:hover::after {
-    transform: scale(1.6) translate(-10px, 10px);
-}
-.cfy-reso-shine {
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(
-        115deg,
-        transparent 30%,
-        rgba(255,255,255,0.55) 48%,
-        transparent 62%
-    );
-    transform: translateX(-120%);
-    pointer-events: none;
-}
-.cfy-reso-card:hover .cfy-reso-shine {
-    animation: cfy-card-shine 0.8s ease forwards;
-}
-@keyframes cfy-card-shine {
-    to { transform: translateX(120%); }
-}
-.cfy-reso-tag {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 900;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: #fff;
-    background: linear-gradient(135deg, #f472b6, #ec4899, #e879f9);
-    background-size: 200% 200%;
-    border-radius: 999px;
-    padding: 3px 10px;
-    margin-bottom: 10px;
-    box-shadow: 0 3px 12px rgba(236,72,153,0.4);
-    position: relative;
-    z-index: 1;
-}
-.cfy-reso-size {
-    font-size: 18px;
-    font-weight: 900;
-    color: #9d174d;
-    margin-bottom: 3px;
-    position: relative;
-    z-index: 1;
-    letter-spacing: -0.02em;
-}
-.cfy-reso-name {
-    font-size: 13px;
-    color: #b06a8c;
-    font-weight: 700;
-    position: relative;
-    z-index: 1;
-}
-.cfy-reso-hint {
-    font-size: 11px;
-    color: #c084a0;
-    margin-top: 8px;
-    line-height: 1.45;
-    position: relative;
-    z-index: 1;
-}
-
-/* 双栏 */
-.cfy-grid-2 {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0 20px;
-}
-@media (max-width: 720px) {
-    .cfy-grid-2 { grid-template-columns: 1fr; }
-}
-
-/* 玻璃面板 */
-.cfy-panel {
-    position: relative;
-    background: linear-gradient(150deg, rgba(255,255,255,0.78), rgba(255,240,247,0.58));
-    border: 1px solid rgba(244,114,182,0.25);
-    border-radius: 18px;
-    padding: 16px 18px 18px;
-    margin-top: 6px;
-    backdrop-filter: blur(12px);
-    box-shadow:
-        0 10px 30px rgba(244,114,182,0.1),
-        inset 0 1px 0 rgba(255,255,255,0.9);
-    overflow: hidden;
-    transition: box-shadow 0.35s ease, transform 0.35s cubic-bezier(.16,1,.3,1);
-}
-.cfy-panel:hover {
-    box-shadow:
-        0 16px 40px rgba(236,72,153,0.16),
-        inset 0 1px 0 rgba(255,255,255,0.95);
-}
-.cfy-panel::before {
-    content: '';
-    position: absolute;
-    top: 0; left: -40%;
-    width: 40%; height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
-    pointer-events: none;
-}
-@keyframes cfy-panel-sweep {
-    0%, 70% { left: -40%; }
-    100% { left: 140%; }
-}
-
-/* 按钮 — 液态霓虹 */
-.cfy-btn {
-    position: relative;
-    padding: 11px 24px;
-    border-radius: 999px;
-    border: none;
-    background: linear-gradient(135deg, #f9a8d4 0%, #f472b6 30%, #ec4899 60%, #e879f9 100%);
-    background-size: 220% 220%;
-    color: #fff;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 900;
-    font-family: inherit;
-    margin: 8px 10px 8px 0;
-    letter-spacing: 0.04em;
-    box-shadow:
-        0 8px 24px rgba(236,72,153,0.5),
-        0 0 0 1px rgba(255,255,255,0.35) inset,
-        0 0 30px rgba(244,114,182,0.3);
-    transition: all 0.35s cubic-bezier(.16,1,.3,1);
-    overflow: hidden;
-    text-shadow: 0 1px 2px rgba(157,23,77,0.3);
-}
-.cfy-btn::before {
-    content: '';
-    position: absolute;
-    top: 0; left: -80%;
-    width: 50%; height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
-    transition: left 0.55s ease;
-}
-.cfy-btn::after {
-    content: '';
-    position: absolute;
-    inset: -2px;
-    border-radius: 999px;
-    background: linear-gradient(135deg, #f472b6, #e879f9, #f472b6);
-    z-index: -1;
-    opacity: 0;
-    filter: blur(10px);
-    transition: opacity 0.35s ease;
-}
-.cfy-btn:hover {
-    transform: translateY(-3px) scale(1.05);
-    box-shadow:
-        0 14px 36px rgba(236,72,153,0.65),
-        0 0 0 1px rgba(255,255,255,0.5) inset,
-        0 0 50px rgba(244,114,182,0.5);
-}
-.cfy-btn:hover::before { left: 140%; }
-.cfy-btn:hover::after { opacity: 0.85; }
-.cfy-btn:active { transform: translateY(0) scale(0.97); }
-
-/* 识别结果 */
-.cfy-detect {
-    position: relative;
-    background: linear-gradient(135deg, rgba(255,255,255,0.95), rgba(252,231,243,0.9));
-    border: 1px solid rgba(236,72,153,0.35);
-    border-left: 4px solid #ec4899;
-    border-radius: 14px;
-    padding: 12px 16px;
-    margin: 12px 0 8px;
-    font-size: 12.5px;
-    color: #9d174d;
-    white-space: pre-line;
-    line-height: 1.8;
-    box-shadow: 0 6px 20px rgba(236,72,153,0.15);
-    animation: cfy-detect-in 0.5s cubic-bezier(.16,1,.3,1) both;
-    overflow: hidden;
-}
-.cfy-detect::after {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, transparent, #f472b6, #e879f9, transparent);
-}
-@keyframes cfy-detect-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-@keyframes cfy-detect-line {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(100%); }
-}
-
-/* 页脚 */
-.cfy-footer {
-    text-align: center;
-    font-size: 11.5px;
-    color: #c084a0;
-    margin-top: 28px;
-    padding-top: 16px;
-    border-top: 1px solid rgba(244,114,182,0.2);
-    letter-spacing: 0.1em;
-    font-weight: 600;
-    position: relative;
-}
-.cfy-footer::before {
-    content: '✦  ✧  ✦';
-    display: block;
-    margin-bottom: 8px;
-    font-size: 10px;
-    letter-spacing: 0.4em;
-    color: #f9a8d4;
-}
-.cfy-footer span {
-    background: linear-gradient(90deg, #f472b6, #ec4899, #e879f9, #f472b6);
-    background-size: 200% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight: 900;
-}
-
-/* 装饰彩条 */
-.cfy-rainbow-bar {
-    height: 3px;
-    border-radius: 3px;
-    margin: 4px 0 18px;
-    background: linear-gradient(90deg,
-        #f472b6, #ec4899, #e879f9, #c084fc, #f472b6, #fb7185, #f472b6);
-    background-size: 300% 100%;
-    box-shadow: 0 0 12px rgba(244,114,182,0.5);
-}
-
-/* ========== 分辨率卡片可编辑输入 ========== */
-.cfy-reso-input-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 3px;
-    position: relative;
-    z-index: 1;
-}
-.cfy-reso-input {
-    width: 64px;
-    padding: 4px 6px;
-    border: 1.5px solid rgba(244,114,182,0.35);
-    border-radius: 8px;
-    background: rgba(255,255,255,0.85);
-    color: #9d174d;
-    font-size: 13px;
-    font-weight: 700;
-    text-align: center;
-    font-family: inherit;
-    outline: none;
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    box-sizing: border-box;
-}
-.cfy-reso-input:hover {
-    border-color: #f9a8d4;
-    background: rgba(255,255,255,0.96);
-}
-.cfy-reso-input:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.18);
-    background: #fff;
-}
-.cfy-reso-sep {
-    font-weight: 900;
-    color: #c084a0;
-    font-size: 13px;
-}
-
-/* ========== 工作流扫描 ========== */
-.cfy-scan-row {
-    display: flex;
-    gap: 8px;
-    align-items: flex-end;
-}
-.cfy-scan-row > div:first-child {
-    flex: 1;
-}
-.cfy-scan-btn {
-    padding: 6px 16px;
-    border-radius: 999px;
-    border: 1.5px solid rgba(244,114,182,0.4);
-    background: rgba(255,255,255,0.85);
-    color: #be185d;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 800;
-    font-family: inherit;
-    white-space: nowrap;
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    backdrop-filter: blur(6px);
-    letter-spacing: 0.03em;
-}
-.cfy-scan-btn:hover {
-    background: linear-gradient(135deg, #f9a8d4, #f472b6);
-    color: #fff;
-    border-color: transparent;
-    box-shadow: 0 4px 16px rgba(236,72,153,0.4);
-}
-.cfy-workflow-dropdown {
-    margin-top: 6px;
-}
-.cfy-workflow-dropdown select {
-    width: 100%;
-    padding: 8px 12px;
-    border: 1.5px solid rgba(244,114,182,0.3);
-    border-radius: 12px;
-    background: rgba(255,255,255,0.85);
-    color: var(--ink);
-    font-size: 12.5px;
-    font-family: inherit;
-    cursor: pointer;
-    outline: none;
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    backdrop-filter: blur(6px);
-    box-shadow: 0 2px 10px rgba(244,114,182,0.07);
-}
-.cfy-workflow-dropdown select:hover {
-    border-color: #f9a8d4;
-}
-.cfy-workflow-dropdown select:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.18);
-}
-
-/* ========== 高级开关 ========== */
-.cfy-advanced-toggle {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 18px;
-    margin: 8px 0;
-    background: linear-gradient(135deg, rgba(255,255,255,0.85), rgba(252,231,243,0.8));
-    border: 1px solid rgba(244,114,182,0.25);
-    border-radius: 14px;
-    cursor: pointer;
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    user-select: none;
-}
-.cfy-advanced-toggle:hover {
-    border-color: #f9a8d4;
-    box-shadow: 0 4px 16px rgba(244,114,182,0.15);
-    transform: translateY(-1px);
-}
-.cfy-advanced-label {
-    font-weight: 800;
-    font-size: 13px;
-    color: #9d174d;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-.cfy-advanced-badge {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 900;
-    letter-spacing: 0.08em;
-    color: #fff;
-    background: linear-gradient(135deg, #f472b6, #ec4899);
-    border-radius: 999px;
-    padding: 2px 8px;
-}
-.cfy-advanced-switch {
-    position: relative;
-    width: 44px;
-    height: 24px;
-    background: rgba(244,114,182,0.3);
-    border-radius: 12px;
-    transition: background 0.3s ease;
-    flex-shrink: 0;
-}
-.cfy-advanced-switch.active {
-    background: linear-gradient(135deg, #f472b6, #ec4899);
-}
-.cfy-advanced-switch::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 20px;
-    height: 20px;
-    background: #fff;
-    border-radius: 50%;
-    transition: transform 0.3s cubic-bezier(.16,1,.3,1);
-    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
-}
-.cfy-advanced-switch.active::after {
-    transform: translateX(20px);
-}
-
-/* ========== 节点概览表 ========== */
-.cfy-node-overview {
-    margin: 10px 0 8px;
-    border: 1px solid rgba(244,114,182,0.25);
-    border-radius: 14px;
-    overflow: hidden;
-    background: rgba(255,255,255,0.85);
-    backdrop-filter: blur(8px);
-    animation: cfy-rise 0.6s cubic-bezier(.16,1,.3,1) both;
-}
-.cfy-node-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-}
-.cfy-node-table th {
-    text-align: left;
-    padding: 9px 14px;
-    background: linear-gradient(135deg, rgba(252,231,243,0.95), rgba(255,240,247,0.8));
-    color: #be185d;
-    font-weight: 800;
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    border-bottom: 2px solid rgba(244,114,182,0.25);
-}
-.cfy-node-table td {
-    padding: 8px 14px;
-    border-bottom: 1px solid rgba(244,114,182,0.1);
-    color: var(--ink);
-    line-height: 1.5;
-}
-.cfy-node-table tr:hover td {
-    background: rgba(252,231,243,0.5);
-}
-.cfy-node-table tr:last-child td {
-    border-bottom: none;
-}
-.cfy-node-table .nid {
-    font-family: ui-monospace, SFMono-Regular, monospace;
-    font-size: 11px;
-    color: #ec4899;
-    font-weight: 700;
-}
-.cfy-node-table .params {
-    color: #8b3a62;
-    font-size: 11px;
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.cfy-node-count {
-    font-size: 11px;
-    color: #b06a8c;
-    margin-bottom: 4px;
-    font-weight: 600;
-}
-
-/* ========== 命名工作流卡片 ========== */
-.cfy-wf-list {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin: 8px 0;
-}
-.cfy-wf-card {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px;
-    border-radius: 14px;
-    background: linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,240,247,0.7));
-    border: 1px solid rgba(244,114,182,0.25);
-    backdrop-filter: blur(10px);
-    box-shadow: 0 4px 16px rgba(244,114,182,0.08);
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    position: relative;
-    overflow: hidden;
-}
-.cfy-wf-card:hover {
-    border-color: #f9a8d4;
-    box-shadow: 0 8px 24px rgba(236,72,153,0.14);
-    transform: translateY(-1px);
-}
-.cfy-wf-card::before {
-    content: '';
-    position: absolute;
-    left: 0; top: 0; bottom: 0;
-    width: 4px;
-    border-radius: 4px 0 0 4px;
-    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9);
-    opacity: 0;
-    transition: opacity 0.3s ease;
-}
-.cfy-wf-card.enabled::before {
-    opacity: 1;
-}
-.cfy-wf-card.disabled {
-    opacity: 0.55;
-    background: linear-gradient(135deg, rgba(255,255,255,0.6), rgba(245,235,240,0.5));
-}
-.cfy-wf-toggle {
-    width: 38px;
-    height: 20px;
-    border-radius: 10px;
-    border: none;
-    cursor: pointer;
-    transition: all 0.3s ease;
-    flex-shrink: 0;
-    position: relative;
-    outline: none;
-}
-.cfy-wf-toggle.on {
-    background: linear-gradient(135deg, #f472b6, #ec4899);
-    box-shadow: 0 0 10px rgba(236,72,153,0.4);
-}
-.cfy-wf-toggle.off {
-    background: rgba(244,114,182,0.3);
-}
-.cfy-wf-toggle::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    width: 16px; height: 16px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
-    transition: transform 0.3s cubic-bezier(.16,1,.3,1);
-}
-.cfy-wf-toggle.on::after { left: 20px; }
-.cfy-wf-toggle.off::after { left: 2px; }
-.cfy-wf-name {
-    width: 80px;
-    flex-shrink: 0;
-    border: 1.5px solid rgba(244,114,182,0.25);
-    border-radius: 10px;
-    padding: 6px 10px;
-    font-size: 12.5px;
-    font-weight: 700;
-    color: #9d174d;
-    background: rgba(255,255,255,0.8);
-    font-family: inherit;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-}
-.cfy-wf-name:hover, .cfy-wf-name:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
-}
-.cfy-wf-path-row {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-}
-.cfy-wf-path {
-    flex: 1;
-    border: 1.5px solid rgba(244,114,182,0.25);
-    border-radius: 10px;
-    padding: 6px 10px;
-    font-size: 12px;
-    color: #5b2145;
-    background: rgba(255,255,255,0.8);
-    font-family: ui-monospace, SFMono-Regular, monospace;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-    min-width: 0;
-}
-.cfy-wf-path:hover, .cfy-wf-path:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
-}
-.cfy-wf-prefix-row {
-    flex-basis: 100%;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-}
-.cfy-wf-prefix-row::before {
-    content: '前缀';
-    flex-shrink: 0;
-    font-size: 11px;
-    font-weight: 700;
-    color: #be185d;
-    opacity: 0.85;
-}
-.cfy-wf-prefix {
-    flex: 1;
-    border: 1.5px dashed rgba(244,114,182,0.3);
-    border-radius: 10px;
-    padding: 6px 10px;
-    font-size: 12px;
-    color: #5b2145;
-    background: rgba(255,255,255,0.7);
-    font-family: inherit;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-    min-width: 0;
-}
-.cfy-wf-prefix:hover, .cfy-wf-prefix:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
-}
-.cfy-wf-browse {
-    padding: 6px 12px;
-    border-radius: 10px;
-    border: 1.5px solid rgba(244,114,182,0.35);
-    background: rgba(255,255,255,0.85);
-    color: #be185d;
-    cursor: pointer;
-    font-size: 11px;
-    font-weight: 700;
-    font-family: inherit;
-    white-space: nowrap;
-    transition: all 0.3s ease;
-    flex-shrink: 0;
-}
-.cfy-wf-browse:hover {
-    background: linear-gradient(135deg, #f9a8d4, #f472b6);
-    color: #fff;
-    border-color: transparent;
-    box-shadow: 0 3px 12px rgba(236,72,153,0.35);
-}
-.cfy-wf-delete {
-    width: 28px; height: 28px;
-    border-radius: 50%;
-    border: 1.5px solid rgba(244,114,182,0.3);
-    background: rgba(255,255,255,0.8);
-    color: #d6608a;
-    cursor: pointer;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-family: inherit;
-    transition: all 0.3s ease;
-    flex-shrink: 0;
-    padding: 0;
-    line-height: 1;
-}
-.cfy-wf-delete:hover {
-    background: #f43f5e;
-    color: #fff;
-    border-color: #f43f5e;
-    box-shadow: 0 3px 12px rgba(244,63,94,0.35);
-}
-.cfy-wf-add {
-    padding: 10px 20px;
-    border-radius: 14px;
-    border: 2px dashed rgba(244,114,182,0.35);
-    background: rgba(255,255,255,0.7);
-    color: #be185d;
-    cursor: pointer;
-    font-size: 12.5px;
-    font-weight: 800;
-    font-family: inherit;
-    width: 100%;
-    transition: all 0.3s ease;
-    letter-spacing: 0.02em;
-}
-.cfy-wf-add:hover {
-    border-color: #f472b6;
-    background: rgba(252,231,243,0.85);
-    box-shadow: 0 4px 16px rgba(244,114,182,0.18);
-    transform: translateY(-1px);
-}
-.cfy-wf-browse-dropdown {
-    position: absolute;
-    top: 100%;
-    left: 0; right: 0;
-    z-index: 10;
-    margin-top: 4px;
-    border: 1px solid rgba(244,114,182,0.3);
-    border-radius: 12px;
-    background: rgba(255,255,255,0.97);
-    box-shadow: 0 12px 32px rgba(236,72,153,0.2);
-    max-height: 180px;
-    overflow-y: auto;
-    backdrop-filter: blur(12px);
-}
-.cfy-wf-browse-item {
-    padding: 8px 14px;
-    cursor: pointer;
-    font-size: 12px;
-    color: #5b2145;
-    transition: all 0.15s ease;
-    font-family: ui-monospace, SFMono-Regular, monospace;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.cfy-wf-browse-item:hover {
-    background: linear-gradient(90deg, rgba(244,114,182,0.15), rgba(236,72,153,0.08));
-    color: #be185d;
-}
-
-/* ========== 提示词预设卡片 ========== */
-.cfy-ps-list {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin: 8px 0;
-}
-.cfy-ps-card {
-    border-radius: 14px;
-    background: linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,240,247,0.7));
-    border: 1px solid rgba(244,114,182,0.25);
-    backdrop-filter: blur(10px);
-    box-shadow: 0 4px 16px rgba(244,114,182,0.08);
-    transition: all 0.3s cubic-bezier(.16,1,.3,1);
-    overflow: hidden;
-    position: relative;
-}
-.cfy-ps-card:hover {
-    border-color: #f9a8d4;
-    box-shadow: 0 8px 24px rgba(236,72,153,0.14);
-}
-.cfy-ps-card::before {
-    content: '';
-    position: absolute;
-    left: 0; top: 0; bottom: 0;
-    width: 4px;
-    border-radius: 4px 0 0 4px;
-    background: linear-gradient(180deg, #f472b6, #ec4899, #e879f9);
-    opacity: 1;
-}
-.cfy-ps-head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px 10px 18px;
-    cursor: pointer;
-}
-.cfy-ps-name {
-    flex: 1;
-    font-size: 13px;
-    font-weight: 700;
-    color: #9d174d;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.cfy-ps-preview {
-    font-size: 11px;
-    color: #a85569;
-    opacity: 0.7;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 200px;
-    font-family: ui-monospace, SFMono-Regular, monospace;
-}
-.cfy-ps-expand {
-    color: #d6608a;
-    font-size: 12px;
-    flex-shrink: 0;
-    transition: transform 0.3s ease;
-}
-.cfy-ps-card.expanded .cfy-ps-expand { transform: rotate(90deg); }
-.cfy-ps-body {
-    padding: 0 14px 12px 18px;
-    display: none;
-}
-.cfy-ps-card.expanded .cfy-ps-body { display: block; }
-.cfy-ps-textarea {
-    width: 100%;
-    min-height: 80px;
-    border: 1.5px solid rgba(244,114,182,0.25);
-    border-radius: 10px;
-    padding: 8px 10px;
-    font-size: 12px;
-    color: #5b2145;
-    background: rgba(255,255,255,0.85);
-    font-family: ui-monospace, SFMono-Regular, monospace;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-    resize: vertical;
-}
-.cfy-ps-textarea:focus {
-    border-color: #ec4899;
-    box-shadow: 0 0 0 3px rgba(236,72,153,0.12);
-}
-.cfy-ps-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-}
-.cfy-ps-btn {
-    padding: 6px 14px;
-    border-radius: 10px;
-    border: 1.5px solid rgba(244,114,182,0.35);
-    background: rgba(255,255,255,0.85);
-    color: #be185d;
-    cursor: pointer;
-    font-size: 11px;
-    font-weight: 700;
-    font-family: inherit;
-    white-space: nowrap;
-    transition: all 0.3s ease;
-}
-.cfy-ps-btn:hover {
-    background: linear-gradient(135deg, #f9a8d4, #f472b6);
-    color: #fff;
-    border-color: transparent;
-    box-shadow: 0 3px 12px rgba(236,72,153,0.35);
-}
-.cfy-ps-btn.danger {
-    border-color: rgba(220,38,38,0.3);
-    color: #b91c1c;
-}
-.cfy-ps-btn.danger:hover {
-    background: linear-gradient(135deg, #f87171, #ef4444);
-    color: #fff;
-    border-color: transparent;
-}
-.cfy-ps-add-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 10px;
-    flex-wrap: wrap;
-}
-.cfy-ps-add-name {
-    width: 120px;
-    border: 1.5px solid rgba(244,114,182,0.25);
-    border-radius: 10px;
-    padding: 6px 10px;
-    font-size: 12.5px;
-    font-weight: 700;
-    color: #9d174d;
-    background: rgba(255,255,255,0.8);
-    font-family: inherit;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-}
-.cfy-ps-add-name:focus { border-color: #ec4899; box-shadow: 0 0 0 3px rgba(236,72,153,0.12); }
-.cfy-ps-add-content {
-    flex: 1;
-    min-width: 200px;
-    min-height: 40px;
-    border: 1.5px solid rgba(244,114,182,0.25);
-    border-radius: 10px;
-    padding: 6px 10px;
-    font-size: 12px;
-    color: #5b2145;
-    background: rgba(255,255,255,0.8);
-    font-family: ui-monospace, SFMono-Regular, monospace;
-    outline: none;
-    transition: all 0.3s ease;
-    box-sizing: border-box;
-    resize: vertical;
-}
-.cfy-ps-add-content:focus { border-color: #ec4899; box-shadow: 0 0 0 3px rgba(236,72,153,0.12); }
-.cfy-ps-add-btn {
-    padding: 6px 16px;
-    border-radius: 10px;
-    border: none;
-    background: linear-gradient(135deg, #f472b6, #ec4899);
-    color: #fff;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 700;
-    font-family: inherit;
-    white-space: nowrap;
-    transition: all 0.3s ease;
-    flex-shrink: 0;
-    box-shadow: 0 3px 12px rgba(236,72,153,0.3);
-}
-.cfy-ps-add-btn:hover {
-    background: linear-gradient(135deg, #ec4899, #db2777);
-    box-shadow: 0 6px 20px rgba(236,72,153,0.45);
-    transform: translateY(-1px);
-}
-.cfy-ps-empty {
-    text-align: center;
-    padding: 16px;
-    color: #a85569;
-    font-size: 12px;
-    opacity: 0.7;
-}
+.cu-root { width:100%; box-sizing:border-box; color:#3f2a38; font-size:13px; }
+.cu-card { background:#fff; border:1px solid #f2d7e5; border-radius:14px; box-shadow:0 1px 2px rgba(190,24,93,.06); overflow:hidden; }
+.cu-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:13px 16px; border-bottom:1px solid #f7e3ee; background:#fff8fb; }
+.cu-title { font-weight:800; font-size:15px; color:#9d174d; }
+.cu-spacer { flex:1; }
+.cu-chip { font-size:11px; font-weight:700; padding:2px 9px; border-radius:999px; border:1px solid #f4c8dd; color:#9d174d; background:#fff; white-space:nowrap; }
+.cu-chip.on { background:#ec4899; border-color:#ec4899; color:#fff; }
+.cu-tabs { display:flex; gap:4px; flex-wrap:wrap; padding:8px 10px; border-bottom:1px solid #f7e3ee; background:#fff; }
+.cu-tab { border:1px solid transparent; background:transparent; color:#9d4b74; font-weight:700; font-size:12.5px; padding:6px 13px; border-radius:999px; cursor:pointer; font-family:inherit; }
+.cu-tab:hover { background:#fff0f7; }
+.cu-tab.active { background:#ec4899; border-color:#ec4899; color:#fff; }
+.cu-body { padding:14px 16px 18px; }
+.cu-sec { font-size:11.5px; font-weight:800; color:#9d174d; letter-spacing:.8px; margin:18px 0 6px; }
+.cu-sec:first-child { margin-top:0; }
+.cu-panel { border:1px solid #f7e3ee; border-radius:10px; padding:12px; background:#fffdfe; }
+.cu-grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; }
+.cu-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.cu-col { display:flex; flex-direction:column; gap:2px; }
+.cu-label { font-size:11.5px; font-weight:700; color:#9d4b74; margin:9px 0 4px; }
+.cu-input, .cu-textarea, .cu-select { width:100%; box-sizing:border-box; border:1px solid #efccdd; border-radius:8px; padding:6px 9px; font-size:12.5px; color:#3f2a38; background:#fff; outline:none; font-family:inherit; }
+.cu-input:focus, .cu-textarea:focus, .cu-select:focus { border-color:#ec4899; }
+.cu-textarea { resize:vertical; line-height:1.5; font-family:Consolas,ui-monospace,monospace; }
+.cu-hint { font-size:11px; color:#b06a8c; margin:4px 0 10px; line-height:1.55; white-space:pre-wrap; }
+.cu-detect { font-size:11.5px; color:#9d174d; background:#fff5fa; border:1px solid #f7d3e6; border-radius:8px; padding:8px 10px; margin:8px 0; white-space:pre-wrap; line-height:1.5; }
+.cu-btn { border:1px solid #efccdd; background:#fff; color:#9d174d; font-weight:700; font-size:12px; padding:6px 12px; border-radius:8px; cursor:pointer; font-family:inherit; }
+.cu-btn:hover { background:#fff0f7; }
+.cu-btn.primary { background:#ec4899; border-color:#ec4899; color:#fff; }
+.cu-btn.primary:hover { background:#db2777; }
+.cu-btn:disabled { opacity:.5; cursor:default; }
+.cu-check { display:inline-flex; align-items:center; gap:7px; cursor:pointer; font-size:12.5px; font-weight:700; color:#9d174d; }
+.cu-check input { accent-color:#ec4899; width:15px; height:15px; flex:none; }
+.cu-check.off { opacity:.45; cursor:not-allowed; }
+.cu-list { display:flex; flex-direction:column; gap:8px; }
+.cu-item { border:1px solid #f7e3ee; border-radius:10px; padding:10px; background:#fffdfe; }
+.cu-item.off { background:#faf7f9; }
+.cu-itemhead { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.cu-mini { flex:1; min-width:110px; box-sizing:border-box; border:1px solid #efccdd; border-radius:7px; padding:5px 8px; font-size:12px; font-family:inherit; }
+.cu-del { margin-left:auto; border:1px solid #f3c9da; background:#fff; color:#be185d; border-radius:7px; cursor:pointer; padding:2px 9px; font-size:12px; }
+.cu-mini2 { display:flex; gap:6px; margin-top:7px; align-items:center; }
+.cu-drop { margin-top:7px; border:1px solid #efccdd; border-radius:8px; max-height:180px; overflow:auto; background:#fff; }
+.cu-dropitem { padding:6px 9px; font-size:12px; cursor:pointer; }
+.cu-dropitem:hover { background:#fff0f7; }
+.cu-empty { font-size:12px; color:#b06a8c; padding:8px 2px; }
+.cu-code { font-family:Consolas,ui-monospace,monospace; word-break:break-all; }
+.cu-toggle { display:flex; align-items:center; gap:10px; padding:9px 11px; border:1px solid #f7e3ee; border-radius:10px; background:#fffdfe; cursor:pointer; margin-bottom:6px; }
+.cu-toggle:hover { background:#fff7fb; }
+.cu-toggle .t { font-size:12.5px; font-weight:700; color:#9d174d; display:flex; align-items:center; gap:6px; }
+.cu-toggle .b { font-size:10px; font-weight:700; color:#db2777; border:1px solid #f4c8dd; border-radius:999px; padding:1px 6px; }
+.cu-sw { margin-left:auto; width:38px; height:20px; border-radius:999px; background:#edd3e0; position:relative; flex:none; }
+.cu-sw::after { content:''; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:#fff; }
+.cu-sw.on { background:#ec4899; }
+.cu-sw.on::after { left:20px; }
+/* 分辨率卡片（沿用被保留的 AddEditableResoCard 的类名） */
+.cfy-reso-card { border:1px solid #f7e3ee; border-radius:12px; padding:11px 12px; background:#fffdfe; }
+.cfy-reso-shine { display:none; }
+.cfy-reso-tag { font-size:10.5px; font-weight:800; color:#db2777; letter-spacing:1px; }
+.cfy-reso-input-row { display:flex; align-items:center; gap:6px; margin:7px 0 5px; }
+.cfy-reso-input { width:76px; box-sizing:border-box; border:1px solid #efccdd; border-radius:7px; padding:4px 7px; font-size:12.5px; font-family:inherit; color:#3f2a38; }
+.cfy-reso-sep { color:#b06a8c; font-weight:700; }
+.cfy-reso-name { font-size:12.5px; font-weight:700; color:#9d174d; }
+.cfy-reso-hint { font-size:11px; color:#b06a8c; margin-top:2px; }
+/* 节点概览（沿用被保留的 AddNodeOverview 的类名） */
+.cfy-node-overview { margin-top:8px; }
+.cfy-node-count { font-size:12px; font-weight:700; color:#9d174d; margin-bottom:6px; }
+.cfy-node-table { width:100%; border-collapse:collapse; font-size:11.5px; }
+.cfy-node-table th, .cfy-node-table td { border-bottom:1px solid #f7e3ee; padding:5px 7px; text-align:left; vertical-align:top; }
+.cfy-node-table th { color:#9d174d; font-weight:800; }
+.cfy-node-table td.nid { font-family:Consolas,ui-monospace,monospace; color:#db2777; }
+.cfy-node-table td.params { font-family:Consolas,ui-monospace,monospace; word-break:break-all; color:#6b4459; }
+/* 教程 / 说明 / 链接 */
+.cu-note { font-size:11.5px; color:#5b3a4d; background:#fff8fb; border:1px dashed #f6c6dc; border-radius:8px; padding:9px 11px; margin:6px 0; line-height:1.65; white-space:pre-wrap; }
+.cu-note b { color:#9d174d; }
+.cu-steps { margin:6px 0 10px; padding-left:20px; font-size:12px; color:#5b3a4d; line-height:1.75; }
+.cu-steps li { margin-bottom:3px; }
+.cu-linkrow { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin:5px 0; font-size:12px; }
+.cu-link { color:#db2777; font-weight:700; text-decoration:none; border-bottom:1px dashed #f3c9da; }
+.cu-link:hover { color:#9d174d; }
+.cu-url { font-family:Consolas,ui-monospace,monospace; font-size:10.5px; color:#9d4b74; background:#fff5fa; border:1px solid #f7d3e6; border-radius:6px; padding:1px 6px; }
+.cu-tag { display:inline-block; font-size:10.5px; font-weight:800; color:#db2777; border:1px solid #f4c8dd; border-radius:6px; padding:0 5px; margin-right:5px; }
+.cu-figure { margin:8px 0 10px; }
+.cu-img { display:block; max-width:100%; height:auto; border:1px solid #f2d7e5; border-radius:10px; background:#fff; }
+.cu-cap { font-size:11px; color:#9d4b74; margin-top:5px; line-height:1.55; }
 ";
 
     protected override void BuildRenderTree(RenderTreeBuilder b)
@@ -1591,6 +190,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             return;
         }
 
+        // 卡片列表惰性加载：不在渲染过程中改 Configuration，避免额外重渲染
+        if (!_loadedWorkflowCards) { LoadWorkflowCards(); _loadedWorkflowCards = true; }
+        if (!_loadedPresetCards) { LoadPresetCards(); _loadedPresetCards = true; }
+
         int i = 0;
 
         b.OpenElement(i++, "style");
@@ -1598,1036 +201,930 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
 
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-root");
-
+        b.AddAttribute(i++, "class", "cu-root");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-container");
+        b.AddAttribute(i++, "class", "cu-card");
 
-        // 装饰层
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-aurora"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-grid-bg"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-1"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-2"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-3"); b.CloseElement();
-        b.OpenElement(i++, "div"); b.AddAttribute(i++, "class", "cfy-orb cfy-orb-4"); b.CloseElement();
-
-        // 粒子
-        for (int p = 1; p <= 12; p++)
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", $"cfy-particle cfy-p{p}");
-            b.CloseElement();
-        }
-        // 闪星
-        for (int s = 1; s <= 5; s++)
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", $"cfy-star cfy-star-{s}");
-            b.CloseElement();
-        }
-
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-content cfy-stagger");
-
-        // Hero
+        // ---------- 头部 ----------
+        var appMcp = IsAppMcp();
         var configured = !string.IsNullOrWhiteSpace(Configuration.BaseUrl)
-                         && !string.IsNullOrWhiteSpace(Configuration.WorkflowPath);
+                         && (appMcp || !string.IsNullOrWhiteSpace(Configuration.WorkflowPath));
 
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-hero");
-
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-title-wrap");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-kicker");
+        b.AddAttribute(i++, "class", "cu-head");
         b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "class", "cfy-kicker-dot");
-        b.CloseElement();
-        b.AddContent(i++, "Doro · ComfyUI");
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-title");
+        b.AddAttribute(i++, "class", "cu-title");
         b.AddContent(i++, "ComfyUI 生图");
         b.CloseElement();
+        AddChip(b, ref i, configured ? "已配置" : "未配置", configured);
+        AddChip(b, ref i, appMcp ? "APP-MCP 模板" : "工作流模式", appMcp);
+        var styleCount = 0;
+        try
+        {
+            if (JsonNode.Parse(Configuration.StylePresets ?? "[]") is JsonArray styleArr)
+                styleCount = styleArr.Count;
+        }
+        catch { }
+        if (styleCount > 0)
+            AddChip(b, ref i, $"画风 {styleCount}", true);
+        if (Configuration.EnableDanbooruSearch)
+            AddChip(b, ref i, "在线标签", true);
+        if (Configuration.EnableAnimadexCharacterSearch)
+            AddChip(b, ref i, "在线角色", true);
+        b.CloseElement(); // head
+
+        // ---------- 页签（按后端模式生成） ----------
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-subtitle");
-        b.AddContent(i++, "任意工作流 · 智能分辨率 · 固定提示词前缀");
-        b.CloseElement();
+        b.AddAttribute(i++, "class", "cu-tabs");
+        foreach (var (tabId, tabTitle) in EffectiveTabs())
+        {
+            var id = tabId;
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", _tab == id ? "cu-tab active" : "cu-tab");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
+            {
+                _tab = id;
+                if (id == 5 && Configuration.AdvancedMode)
+                    await LoadNodeOverview();
+            }));
+            b.AddContent(i++, tabTitle);
+            b.CloseElement();
+        }
+        b.CloseElement(); // tabs
+
+        // ---------- 内容：只渲染当前页签（模式切换后若停在已隐藏页签，回落到基础页） ----------
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-body");
+        var workflowTabUsable = !appMcp;
+        switch (_tab)
+        {
+            case 1: if (workflowTabUsable) RenderWorkflowTab(b); else RenderBasicTab(b); break;
+            case 2: RenderBackendTab(b); break;
+            case 3: RenderPromptTab(b); break;
+            case 4: RenderSearchTab(b); break;
+            case 5: RenderAdvancedTab(b); break;
+            default: RenderBasicTab(b); break;
+        }
+        b.CloseElement(); // body
+
+        b.CloseElement(); // card
+        b.CloseElement(); // root
+    }
+
+    bool IsAppMcp()
+        => string.Equals((Configuration?.BackendMode ?? "").Trim(), "appmcp", StringComparison.OrdinalIgnoreCase);
+
+    // ============================================================
+    // 页签 1：基础（连接 / 保存 / 分辨率 / 默认参数 / 生图行为）
+    // ============================================================
+    void RenderBasicTab(RenderTreeBuilder b)
+    {
+        int i = 1000;
+        var appMcp = IsAppMcp();
+
+        AddSection(b, ref i, "快速开始（新手看这里）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddSteps(b, ref i,
+            "启动 ComfyUI（默认地址 http://127.0.0.1:8188），确认下面「连接」里的地址与它一致。",
+            appMcp
+                ? "「后端 · 画风」页填好 APP-MCP 的默认模板名，点「测试连通并列出模板」；若提示连接失败，多半是还没装 APP-MCP 节点——该页有安装教程和链接。"
+                : "「工作流」页填工作流 JSON 路径（可点「扫描目录」从列表里选），再点「自动识别节点」。",
+            "让角色生图即可。想要一个工作流出多种画风，就去「后端 · 画风」页配「画风预设」。");
+        AddHint(b, ref i, "改完任何配置记得保存（用框架提供的保存入口）；切换生图后端后需要重载本模块，新设置与新提示词才会生效。");
         b.CloseElement();
 
+        AddSection(b, ref i, "连接");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-badge-wrap");
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "class", configured ? "cfy-badge-on" : "cfy-badge-off");
-        b.AddContent(i++, configured ? "已配置 · LIVE" : "未配置");
-        b.CloseElement();
-        b.CloseElement();
-
-        b.CloseElement(); // hero
-
+        b.AddAttribute(i++, "class", "cu-panel");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-rainbow-bar");
-        b.CloseElement();
-
-        // 使用说明
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-alert");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-alert-title");
-        b.AddContent(i++, "功能说明");
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-alert-desc");
-        b.AddContent(i++,
-            "【角色提示词检索】内置数千个动漫/游戏角色的中英文索引，AI 生图前可自动检索角色触发词、稳定外貌和默认服装，大幅提升角色还原度。原创角色和普通人物不检索。\n" +
-            "【提示词预设】可在下方保存常用提示词片段（角色人设/动作/背景），AI 生图时按需调用复用。支持实时增删改；也可在聊天中直接发预设内容给 AI，让 AI 自主调用函数存储。\n" +
-            "【在线标签检索】可选：自然语言→标准 Danbooru 标签（默认关）。有画面细节时 AI 可检索以提升质量；三种提示词模式均适用。大陆建议保留默认主源备份域。\n" +
-            "【使用步骤】1. 启动 ComfyUI → 2. 配置地址和工作流 → 3. AI 调用 GenerateImage 生图\n" +
-            "【分辨率】portrait 竖版 / landscape 横版 / square 正方形，AI 智能选择或手动指定");
-        b.CloseElement();
-        b.CloseElement();
-
-        // 分辨率
-        AddSection(b, ref i, "分辨率预设");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-reso-grid");
-        
-        // Portrait card
-        AddEditableResoCard(b, ref i, "PORTRAIT", "竖版", "全身立绘 · 人物 · 手机壁纸",
-            Configuration.PortraitWidth, v => Configuration.PortraitWidth = v,
-            Configuration.PortraitHeight, v => Configuration.PortraitHeight = v);
-        // Landscape card
-        AddEditableResoCard(b, ref i, "LANDSCAPE", "横版", "风景 · 场景 · 横构图",
-            Configuration.LandscapeWidth, v => Configuration.LandscapeWidth = v,
-            Configuration.LandscapeHeight, v => Configuration.LandscapeHeight = v);
-        // Square card
-        AddEditableResoCard(b, ref i, "SQUARE", "正方形", "头像 · 图标 · 对称构图",
-            Configuration.SquareWidth, v => Configuration.SquareWidth = v,
-            Configuration.SquareHeight, v => Configuration.SquareHeight = v);
-        
-        b.CloseElement();
-        AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖。点击数值即可修改预设分辨率。");
-
-        // 连接 + 工作流
-        AddSection(b, ref i, "连接与工作流");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-grid-2");
-
-        // 左栏
+        b.AddAttribute(i++, "class", "cu-grid2");
         b.OpenElement(i++, "div");
         AddInput(b, ref i, "ComfyUI 地址", Configuration.BaseUrl, v => Configuration.BaseUrl = v);
-        AddHint(b, ref i, "例如 http://127.0.0.1:8188");
         AddInput(b, ref i, "API Token（可选）", Configuration.ApiToken, v => Configuration.ApiToken = v);
-
-        // 额外保存副本开关
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-top:4px;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.ExtraSaveCopy);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.ExtraSaveCopy = (bool)(e.Value ?? false);
-            StateHasChanged();
-        }));
         b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
-        b.AddContent(i++, "额外保存副本：开启时复制到指定目录；关闭时直接用工作流保存路径");
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "图片保存目录（额外副本时用）", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
+        AddInput(b, ref i, "ComfyUI output 目录（可选）", Configuration.ComfyuiOutputPath, v => Configuration.ComfyuiOutputPath = v);
         b.CloseElement();
+        b.CloseElement();
+        AddHint(b, ref i,
+            "地址例如 http://127.0.0.1:8188（端口不是 8188 就填你自己的）。\n"
+            + "这个地址同时用于：在线状态检查、图生图上传、图片下载；开启模板模式且未填 APP-MCP 地址时，也会由它自动推导。\n"
+            + "「ComfyUI output 目录」填绝对路径后，标准 SaveImage 的图片直接引用该文件，不再重复下载。\n"
+            + "「API Token」只有你的 ComfyUI 藏在带鉴权的反代后面才需要，普通本地使用留空即可。");
         b.CloseElement();
 
-        // 开启时才显示图片保存目录
-        if (Configuration.ExtraSaveCopy)
+        AddSection(b, ref i, "图片落盘");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddCheck(b, ref i, "额外保存副本（复制到「图片保存目录」；关闭则直接用工作流保存路径）",
+            Configuration.ExtraSaveCopy, v => Configuration.ExtraSaveCopy = v);
+        var resolvedSaveDir = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
+            ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
+            : Configuration.SaveDirectory;
+        AddHint(b, ref i, Configuration.ExtraSaveCopy
+            ? $"开启：出图后会把图片复制一份到「图片保存目录」（留空则用默认目录）。\n当前实际目录：{resolvedSaveDir}"
+            : $"关闭：直接使用工作流/模板自带的保存路径，不额外复制。\n「图片保存目录」当前为：{resolvedSaveDir}");
+        AddHint(b, ref i, "提示：图片路径会被插件交给 AI 用于发图（QQ 环境用 qimage 标签），所以目录别设成需要权限的位置。");
+        b.CloseElement();
+
+        if (appMcp)
         {
-            AddInput(b, ref i, "图片保存目录", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
-            var currentSave = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
-                ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
-                : Configuration.SaveDirectory;
-            AddHint(b, ref i, $"当前: {currentSave}（留空用默认）");
+            // 模板模式：尺寸与等待由模板 / APP-MCP 决定 —— 工作流模式的这些项自动隐藏
+            AddSection(b, ref i, "尺寸与等待（模板模式）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddHint(b, ref i,
+                "以下工作流模式专用项在模板模式下不参与，已自动隐藏：分辨率预设、默认方向、兜底宽高、等待出图超时、轮询间隔。\n"
+                + "· 画面尺寸由模板决定；若模板声明了 width / height / 宽 / 高 输入，可用 generateimage 的 params 传。\n"
+                + "· 等待出图超时请在「后端 · 画风」页签的 APP-MCP 设置里调整。");
+            b.CloseElement();
         }
         else
         {
-            AddHint(b, ref i, "已关闭：直接使用工作流内保存节点的路径，不再额外复制或下载");
+            AddSection(b, ref i, "分辨率预设");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-grid2");
+            AddEditableResoCard(b, ref i, "PORTRAIT", "竖版", "全身立绘 · 人物 · 手机壁纸",
+                Configuration.PortraitWidth, v => Configuration.PortraitWidth = v,
+                Configuration.PortraitHeight, v => Configuration.PortraitHeight = v);
+            AddEditableResoCard(b, ref i, "LANDSCAPE", "横版", "风景 · 场景 · 横构图",
+                Configuration.LandscapeWidth, v => Configuration.LandscapeWidth = v,
+                Configuration.LandscapeHeight, v => Configuration.LandscapeHeight = v);
+            AddEditableResoCard(b, ref i, "SQUARE", "正方形", "头像 · 图标 · 对称构图",
+                Configuration.SquareWidth, v => Configuration.SquareWidth = v,
+                Configuration.SquareHeight, v => Configuration.SquareHeight = v);
+            b.CloseElement();
+            AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖。数值改完点空白处生效。");
+
+            AddSection(b, ref i, "默认参数");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-grid2");
+            b.OpenElement(i++, "div");
+            AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
+            {
+                ("portrait", $"竖版 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}"),
+                ("landscape", $"横版 {Configuration.LandscapeWidth}×{Configuration.LandscapeHeight}"),
+                ("square", $"正方形 {Configuration.SquareWidth}×{Configuration.SquareHeight}")
+            });
+            AddHint(b, ref i, "AI 未传 orientation 时使用");
+            AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), SetInt(v => Configuration.DefaultWidth = v));
+            AddInput(b, ref i, "兜底高度", Configuration.DefaultHeight.ToString(), SetInt(v => Configuration.DefaultHeight = v));
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "等待出图超时（秒）", Configuration.TimeoutSeconds.ToString(), SetInt(v => Configuration.TimeoutSeconds = v));
+            AddHint(b, ref i, "普通模式等待上限");
+            AddInput(b, ref i, "轮询间隔（毫秒）", Configuration.PollIntervalMs.ToString(), SetInt(v => Configuration.PollIntervalMs = v));
+            AddHint(b, ref i, "500~10000");
+            b.CloseElement();
+            b.CloseElement();
+            b.CloseElement();
         }
 
-        // ComfyUI output 目录始终显示（独立于额外保存开关）
-        AddInput(b, ref i, "ComfyUI output 目录（可选）", Configuration.ComfyuiOutputPath, v => Configuration.ComfyuiOutputPath = v);
-        AddHint(b, ref i, "填写 ComfyUI 的 output 绝对路径后，标准 SaveImage 的图片直接引用该目录，不再重复下载");
+        AddSection(b, ref i, "生图行为");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddCheck(b, ref i, "生完图自动用系统默认图片查看器打开（仅桌面端）", Configuration.AutoOpenImage,
+            v => Configuration.AutoOpenImage = v);
+        AddCheck(b, ref i, "优先生图：生图开始后等图完再返回（同机本地 TTS 建议开）", Configuration.PriorityImageGen,
+            v => Configuration.PriorityImageGen = v);
+        if (Configuration.PriorityImageGen)
+        {
+            AddInput(b, ref i, "硬超时上限（秒）", Configuration.PriorityMaxWaitSeconds.ToString(),
+                SetInt(v => Configuration.PriorityMaxWaitSeconds = Math.Clamp(v, 30, 1800)));
+            AddHint(b, ref i, "实际等待 = min(等待出图超时, 本上限)，超时强制结束避免卡死对话。");
+        }
+        AddHint(b, ref i, "本插件不依赖任何语音插件；优先生图只是避免同机 TTS 与 Comfy 抢 GPU。");
         b.CloseElement();
+    }
 
-        // 右栏 — 默认工作流 + 扫描
+    // ============================================================
+    // 页签 2：工作流（默认工作流 / 扫描 / 识别 / 多工作流）
+    // ============================================================
+    void RenderWorkflowTab(RenderTreeBuilder b)
+    {
+        int i = 2000;
+
+        if (IsAppMcp())
+        {
+            AddHint(b, ref i, "当前后端是「APP-MCP 模板模式」：本页签的工作流配置不参与生图（保留供切回工作流模式使用）。");
+        }
+
+        AddSection(b, ref i, "默认工作流");
         b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddInput(b, ref i, "工作流 JSON 路径（绝对路径或相对插件目录）", Configuration.WorkflowPath,
+            v => Configuration.WorkflowPath = v);
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-label");
-        b.AddContent(i++, "默认工作流");
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-scan-row");
-        b.OpenElement(i++, "div");
-        b.OpenComponent<Input<string>>(i++);
-        b.AddAttribute(i++, "Value", Configuration.WorkflowPath ?? "");
-        b.AddAttribute(i++, "ValueChanged", EventCallback.Factory.Create<string>(this, v => Configuration.WorkflowPath = v));
-        b.AddAttribute(i++, "Style", "width:100%;");
-        b.CloseComponent();
+        b.AddAttribute(i++, "class", "cu-row");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, ScanWorkflows));
+        b.AddContent(i++, "扫描目录");
         b.CloseElement();
         b.OpenElement(i++, "button");
         b.AddAttribute(i++, "type", "button");
-        b.AddAttribute(i++, "class", "cfy-scan-btn");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, ScanWorkflows));
-        b.AddContent(i++, "扫描");
+        b.AddAttribute(i++, "class", "cu-btn primary");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, AutoDetectNodes));
+        b.AddContent(i++, "自动识别节点");
         b.CloseElement();
         b.CloseElement();
-        AddHint(b, ref i, "填目录路径后点「扫描」浏览工作流文件，也可在下方多工作流卡片中手动选择");
+        AddHint(b, ref i,
+            "「扫描目录」会在路径所在目录 / ComfyUI 的 workflows 目录中列出可用工作流；「自动识别节点」扫描当前工作流的正/负/分辨率节点并回填。\n"
+            + "支持两种文件：ComfyUI 网页里直接保存的 UI 工作流 JSON（插件会自动转成 API 格式），以及官方 Export (API) 导出的 API JSON。\n"
+            + "填相对路径时按「插件目录」解析；填绝对路径最稳妥。");
 
-        // 扫描结果下拉
-        if (_showWorkflowDropdown && _scannedWorkflows.Count > 0)
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-workflow-dropdown");
-            b.OpenElement(i++, "select");
-            b.AddAttribute(i++, "size", "6");
-            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-            {
-                Configuration.WorkflowPath = e.Value?.ToString() ?? "";
-            }));
-            foreach (var wf in _scannedWorkflows)
-            {
-                b.OpenElement(i++, "option");
-                b.AddAttribute(i++, "value", wf);
-                b.AddAttribute(i++, "title", wf);
-                var display = GetWorkflowDisplayName(wf, _scanDir);
-                b.AddContent(i++, display);
-                b.CloseElement();
-            }
-            b.CloseElement();
-            b.CloseElement();
-        }
-
-        b.CloseElement(); // right
-        b.CloseElement(); // grid
-        b.CloseElement(); // panel
-
-        // 显示扫描状态
         if (!string.IsNullOrWhiteSpace(_scanDetectMessage))
         {
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-detect");
+            b.AddAttribute(i++, "class", "cu-detect");
             b.AddContent(i++, _scanDetectMessage);
             b.CloseElement();
         }
-
-        // ========== 模型卸载与显存释放 ==========
-        AddSection(b, ref i, "模型卸载与显存释放");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;");
-        b.OpenElement(i++, "button");
-        b.AddAttribute(i++, "type", "button");
-        b.AddAttribute(i++, "class", "cfy-btn");
-        b.AddAttribute(i++, "disabled", _unloadingModel);
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, UnloadModels));
-        b.AddContent(i++, _unloadingModel ? "卸载中…" : "✦ 立即卸载模型（释放显存）");
-        b.CloseElement();
-        if (!string.IsNullOrWhiteSpace(_unloadMessage))
+        if (_showWorkflowDropdown && _scannedWorkflows.Count > 0)
         {
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-detect");
-            b.AddAttribute(i++, "style", "margin:0;flex:1;");
-            b.AddContent(i++, _unloadMessage);
+            b.AddAttribute(i++, "class", "cu-drop");
+            foreach (var wf in _scannedWorkflows)
+            {
+                var picked = wf;
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-dropitem");
+                b.AddAttribute(i++, "title", picked);
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+                {
+                    Configuration.WorkflowPath = picked;
+                    _showWorkflowDropdown = false;
+                }));
+                b.AddContent(i++, GetWorkflowDisplayName(picked, _scanDir));
+                b.CloseElement();
+            }
+            b.CloseElement();
+        }
+        if (!string.IsNullOrWhiteSpace(detectMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-detect");
+            b.AddContent(i++, detectMessage);
             b.CloseElement();
         }
         b.CloseElement();
 
-        // 空闲自动卸载开关
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.EnableAutoUnload);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.EnableAutoUnload = (bool)(e.Value ?? false);
-            StateHasChanged();
-        }));
+        AddSection(b, ref i, "节点映射（留空自动识别）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-grid2");
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "正向提示词节点 ID", Configuration.PositivePromptNodeId, v => Configuration.PositivePromptNodeId = v);
+        AddInput(b, ref i, "正向提示词字段名", Configuration.PositivePromptInput, v => Configuration.PositivePromptInput = v);
+        AddInput(b, ref i, "分辨率节点 ID", Configuration.ResolutionNodeId, v => Configuration.ResolutionNodeId = v);
         b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
-        b.AddContent(i++, "空闲自动卸载：距上次生图空闲超时自动卸载模型释放显存");
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "负面提示词节点 ID", Configuration.NegativePromptNodeId, v => Configuration.NegativePromptNodeId = v);
+        AddInput(b, ref i, "负面提示词字段名", Configuration.NegativePromptInput, v => Configuration.NegativePromptInput = v);
+        AddInput(b, ref i, "图生图 LoadImage 节点 ID", Configuration.LoadImageNodeId, v => Configuration.LoadImageNodeId = v);
         b.CloseElement();
         b.CloseElement();
+        AddHint(b, ref i, "手动节点 ID 仅作用于默认工作流；命名工作流会按各自连接关系重新识别。");
+        b.CloseElement();
 
-        if (Configuration.EnableAutoUnload)
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap;");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "width:160px;flex-shrink:0;");
-            AddInput(b, ref i, "空闲小时数", Configuration.AutoUnloadIdleHours.ToString(), v =>
-            {
-                if (int.TryParse(v, out var n))
-                    Configuration.AutoUnloadIdleHours = Math.Clamp(n, 0, 720);
-            });
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "width:160px;flex-shrink:0;");
-            AddInput(b, ref i, "空闲分钟数", Configuration.AutoUnloadIdleMinutes.ToString(), v =>
-            {
-                if (int.TryParse(v, out var n))
-                    Configuration.AutoUnloadIdleMinutes = Math.Clamp(n, 0, 59);
-            });
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;");
-            b.AddContent(i++, $"合计空闲 {Configuration.AutoUnloadIdleHours} 小时 {Configuration.AutoUnloadIdleMinutes} 分钟后自动卸载（需保存配置后生效）");
-            b.CloseElement();
-            b.CloseElement();
-        }
-
-        b.CloseElement(); // panel
-
-        // ========== 多工作流（可选） ==========
         AddSection(b, ref i, "多工作流（可选）");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        // 初始化卡片
-        if (_workflowCards.Count == 0) LoadWorkflowCards();
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddHint(b, ref i, "启用后 AI 可通过 workflow 参数切换；每个工作流可单独设固定正向前缀（留空沿用全局）。名称需唯一且路径有效。");
 
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-wf-list");
-
-        for (int ci = 0; ci < _workflowCards.Count; ci++)
+        b.AddAttribute(i++, "class", "cu-list");
+        for (var ci = 0; ci < _workflowCards.Count; ci++)
         {
             var cardIndex = ci;
             var card = _workflowCards[ci];
-
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", $"cfy-wf-card{(card.Enabled ? " enabled" : " disabled")}");
+            b.AddAttribute(i++, "class", card.Enabled ? "cu-item" : "cu-item off");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-itemhead");
 
-            // 启用开关
-            b.OpenElement(i++, "button");
-            b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", $"cfy-wf-toggle{(card.Enabled ? " on" : " off")}");
-            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-            {
-                ToggleWorkflowCardEnabled(cardIndex);
-            }));
+            b.OpenElement(i++, "label");
+            b.AddAttribute(i++, "class", "cu-check");
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "type", "checkbox");
+            b.AddAttribute(i++, "checked", card.Enabled);
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                ToggleWorkflowCardEnabled(cardIndex)));
+            b.CloseElement();
+            b.OpenElement(i++, "span");
+            b.AddContent(i++, "启用");
+            b.CloseElement();
             b.CloseElement();
 
-            // 名称输入
             b.OpenElement(i++, "input");
-            b.AddAttribute(i++, "class", "cfy-wf-name");
+            b.AddAttribute(i++, "class", "cu-mini");
             b.AddAttribute(i++, "value", card.Name);
             b.AddAttribute(i++, "placeholder", "名称");
-            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-            {
-                UpdateWorkflowCardName(cardIndex, e.Value?.ToString() ?? "");
-            }));
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                UpdateWorkflowCardName(cardIndex, e.Value?.ToString() ?? "")));
             b.CloseElement();
 
-            // 路径行
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-wf-path-row");
-
-            b.OpenElement(i++, "input");
-            b.AddAttribute(i++, "class", "cfy-wf-path");
-            b.AddAttribute(i++, "value", card.Path);
-            b.AddAttribute(i++, "placeholder", "工作流 JSON 路径...");
-            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-            {
-                UpdateWorkflowCardPath(cardIndex, e.Value?.ToString() ?? "");
-            }));
-            b.CloseElement();
-
-            // 浏览按钮
             b.OpenElement(i++, "button");
             b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cfy-wf-browse");
+            b.AddAttribute(i++, "class", "cu-del");
             b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-            {
-                ToggleWorkflowScan(cardIndex);
-            }));
-            b.AddContent(i++, "浏览");
-            b.CloseElement();
-
-            b.CloseElement(); // path-row
-
-            // 固定正向前缀输入
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-wf-prefix-row");
-            b.OpenElement(i++, "input");
-            b.AddAttribute(i++, "class", "cfy-wf-prefix");
-            b.AddAttribute(i++, "value", card.Prefix);
-            b.AddAttribute(i++, "placeholder", "固定正向前缀（tag/短句；留空沿用全局前缀）");
-            b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-            {
-                UpdateWorkflowCardPrefix(cardIndex, e.Value?.ToString() ?? "");
-            }));
-            b.CloseElement();
-            b.CloseElement(); // prefix-row
-
-            // 删除按钮
-            b.OpenElement(i++, "button");
-            b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cfy-wf-delete");
-            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-            {
-                RemoveWorkflowCard(cardIndex);
-            }));
+                RemoveWorkflowCard(cardIndex)));
             b.AddContent(i++, "✕");
             b.CloseElement();
+            b.CloseElement();
 
-            b.CloseElement(); // card
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-mini2");
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "class", "cu-mini");
+            b.AddAttribute(i++, "value", card.Path);
+            b.AddAttribute(i++, "placeholder", "工作流 JSON 路径…");
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                UpdateWorkflowCardPath(cardIndex, e.Value?.ToString() ?? "")));
+            b.CloseElement();
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cu-btn");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+                ToggleWorkflowScan(cardIndex)));
+            b.AddContent(i++, "浏览");
+            b.CloseElement();
+            b.CloseElement();
 
-            // 浏览下拉
-            if (_activeScanCardIndex == cardIndex && _scannedWorkflows.Count > 0)
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-mini2");
+            b.OpenElement(i++, "input");
+            b.AddAttribute(i++, "class", "cu-mini");
+            b.AddAttribute(i++, "value", card.Prefix);
+            b.AddAttribute(i++, "placeholder", "固定正向前缀（留空沿用全局）");
+            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+                UpdateWorkflowCardPrefix(cardIndex, e.Value?.ToString() ?? "")));
+            b.CloseElement();
+            b.CloseElement();
+
+            if (_activeScanCardIndex == ci && _scannedWorkflows.Count > 0)
             {
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "style", "position:relative;");
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cfy-wf-browse-dropdown");
+                b.AddAttribute(i++, "class", "cu-drop");
                 foreach (var wf in _scannedWorkflows)
                 {
                     var wfPath = wf;
                     b.OpenElement(i++, "div");
-                    b.AddAttribute(i++, "class", "cfy-wf-browse-item");
+                    b.AddAttribute(i++, "class", "cu-dropitem");
+                    b.AddAttribute(i++, "title", wfPath);
                     b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
                     {
                         UpdateWorkflowCardPath(cardIndex, wfPath);
                         _activeScanCardIndex = -1;
-                        StateHasChanged();
                     }));
                     b.AddContent(i++, Path.GetFileName(wfPath));
                     b.CloseElement();
                 }
                 b.CloseElement();
-                b.CloseElement();
             }
+
+            b.CloseElement(); // item
         }
-
-        b.CloseElement(); // wf-list
-
-        // 添加按钮
-        b.OpenElement(i++, "button");
-        b.AddAttribute(i++, "type", "button");
-        b.AddAttribute(i++, "class", "cfy-wf-add");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-        {
-            AddWorkflowCard();
-        }));
-        b.AddContent(i++, "+ 添加工作流");
-        b.CloseElement();
-
-        b.CloseElement(); // panel
-
-        // ========== 提示词预设 ==========
-        AddSection(b, ref i, "提示词预设");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        AddHint(b, ref i, "保存常用提示词片段（角色人设/复杂动作/完整背景），AI 生图时按需调用复用。数据存在 Storage/Config/Alife.Plugin.Comfyui/（插件更新不会清空）；也可聊天里让 AI 调用 savepromptpreset。");
-
-        if (_presetCards.Count == 0) LoadPresetCards();
-
-        // 新增预设输入区
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-ps-add-row");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "class", "cfy-ps-add-name");
-        b.AddAttribute(i++, "value", _newPresetName);
-        b.AddAttribute(i++, "placeholder", "预设名称");
-        b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            _newPresetName = e.Value?.ToString() ?? "";
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "textarea");
-        b.AddAttribute(i++, "class", "cfy-ps-add-content");
-        b.AddAttribute(i++, "value", _newPresetContent);
-        b.AddAttribute(i++, "placeholder", "提示词内容（tag 串或自然语言）...");
-        b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            _newPresetContent = e.Value?.ToString() ?? "";
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "button");
-        b.AddAttribute(i++, "type", "button");
-        b.AddAttribute(i++, "class", "cfy-ps-add-btn");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-        {
-            AddPresetCard();
-        }));
-        b.AddContent(i++, "+ 保存预设");
-        b.CloseElement();
-        b.CloseElement(); // add-row
-
-        // 预设卡片列表
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-ps-list");
-
-        if (_presetCards.Count == 0)
+        if (_workflowCards.Count == 0)
         {
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-ps-empty");
-            b.AddContent(i++, "暂无预设。上方输入名称和内容后点「保存预设」，或在聊天中发内容给 AI 让其自主存储");
+            b.AddAttribute(i++, "class", "cu-empty");
+            b.AddContent(i++, "暂无命名工作流（不添加则只用默认工作流）");
+            b.CloseElement();
+        }
+        b.CloseElement(); // list
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-row");
+        b.AddAttribute(i++, "style", "margin-top:10px;");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn primary");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => AddWorkflowCard()));
+        b.AddContent(i++, "+ 添加工作流");
+        b.CloseElement();
+        if (_scannedWorkflows.Count == 0)
+            AddHint(b, ref i, "提示：先点上方「扫描目录」可把工作流列出来直接选。");
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    // ============================================================
+    // 页签 3：后端 · 画风（工作流/APP-MCP、画风预设、显存）
+    // ============================================================
+    void RenderBackendTab(RenderTreeBuilder b)
+    {
+        int i = 3000;
+        var appMcp = IsAppMcp();
+
+        AddSection(b, ref i, "生图后端");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-row");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", appMcp ? "cu-btn" : "cu-btn primary");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => Configuration.BackendMode = "workflow"));
+        b.AddContent(i++, "工作流模式（原有，默认）");
+        b.CloseElement();
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", appMcp ? "cu-btn primary" : "cu-btn");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => Configuration.BackendMode = "appmcp"));
+        b.AddContent(i++, "APP-MCP 模板模式");
+        b.CloseElement();
+        b.CloseElement();
+        AddHint(b, ref i, "切换后端后请「重载本模块」（面板的重载入口，或让 AI 调 reload_plugin），AI 提示词与函数说明才会按新模式生效。模板模式还依赖 ComfyUI 先装上第三方节点 APP-MCP，见下方教程。");
+        b.CloseElement();
+
+        if (appMcp)
+        {
+            AddSection(b, ref i, "APP-MCP 模板设置");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddInput(b, ref i, "APP-MCP 地址", Configuration.AppMcpUrl, v => Configuration.AppMcpUrl = v);
+            AddHint(b, ref i, "可填 http://127.0.0.1:8188/app-mcp 或 http://127.0.0.1:8188/mcp-server/api；留空自动由「ComfyUI 地址」推导。");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-grid2");
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "默认模板名", Configuration.AppMcpTemplate, v => Configuration.AppMcpTemplate = v);
+            AddHint(b, ref i, "如 913流；AI 也可用 template 参数切换。");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "提示词输入参数名", Configuration.AppMcpPromptParam, v => Configuration.AppMcpPromptParam = v);
+            AddHint(b, ref i, "默认 positive；留空则自动取第一个字符串输入。");
+            b.CloseElement();
+            b.CloseElement();
+
+            AddTextArea(b, ref i, "模板默认参数（JSON 对象）", Configuration.AppMcpDefaultParams,
+                v => Configuration.AppMcpDefaultParams = v, 3);
+            AddHint(b, ref i, "示例 {\"参数名\": 值}；只有模板已声明的输入才生效，AI 可用 params 覆盖。");
+
+            AddInput(b, ref i, "等待出图超时（秒）", Configuration.AppMcpTimeoutSeconds.ToString(),
+                SetInt(v => Configuration.AppMcpTimeoutSeconds = Math.Clamp(v, 30, 1800)));
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-row");
+            b.AddAttribute(i++, "style", "margin-top:10px;");
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cu-btn");
+            b.AddAttribute(i++, "disabled", _appMcpTesting);
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAppMcp));
+            b.AddContent(i++, _appMcpTesting ? "测试中…" : "测试连通并列出模板");
+            b.CloseElement();
+            b.CloseElement();
+            if (!string.IsNullOrWhiteSpace(_appMcpTestMessage))
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-detect");
+                b.AddContent(i++, _appMcpTestMessage);
+                b.CloseElement();
+            }
+            b.CloseElement();
+        }
+        else
+        {
+            AddHint(b, ref i,
+                "原有模式：直连 ComfyUI /prompt，读取「工作流」页签里的 JSON，行为完全不变。\n"
+                + "想用「APP-MCP 模板模式」？它需要先在 ComfyUI 里安装第三方开源节点 ComfyUI-APP-MCP（免费开源）。点上面那个「APP-MCP 模板模式」按钮，本页就会出现完整安装教程、新手避坑清单与官方文档链接。");
+        }
+
+        // 模板模式的第三方节点：安装教程 + 避坑 + 文档链接（小白向，只在模板模式显示）
+        if (appMcp)
+        {
+            AddSection(b, ref i, "① 安装 APP-MCP 节点（第三方，模板模式依赖它）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddNote(b, ref i, "本插件只是「调用方」：模板模式必须让 ComfyUI 先装上第三方开源节点 ComfyUI-APP-MCP，否则下面的「测试连通」一定失败。");
+            AddSteps(b, ref i,
+                "装节点（二选一）：① ComfyUI Manager → 搜索 app mode mcp → 安装（推荐）；② 手动：进 ComfyUI/custom_nodes 执行 git clone https://github.com/Lotus0614/ComfyUI-APP-MCP.git，再按该仓库 README 安装 requirements.txt 依赖（Windows 便携包要用包内 python_embeded\\python.exe）。",
+                "重启 ComfyUI（必须），确认启动日志没有报错。",
+                "打开你要用的工作流 → 左上角菜单进 App Builder → 把 AI 要填的控件标记为「输入」并起清晰参数名（例如 positive）→ 把保存图片的节点标记为「输出」。",
+                "在该工作流里加一个 Markdown Note：title 填模板短名（例如 913流），description 填说明（可留空）。",
+                "工作流用 Save 保存（不是 Export）；再进 ComfyUI 的 Settings → MCP Server → Templates → Create from Workflow 创建模板。",
+                "回到本插件：填「默认模板名」→ 点「测试连通并列出模板」，能看到模板与输入明细就算成功。");
+            AddImage(b, ref i, UiAssets.AppBuilderEntryPng,
+                "找不到 App Builder？看这张图：ComfyUI 左上角「图形」下拉左边的那个方框图标就是 App Builder 入口（对应上面第 3 步，点它展开输入/输出标记面板）。");
+            b.CloseElement();
+
+            AddSection(b, ref i, "② 新手避坑（最常见的 6 个坑）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddNote(b, ref i,
+                "1) 参数名必须完全一致：AI 传的名字要和模板输入名一字不差（含中文、大小写）；改名后要 Refresh 模板并重载本模块。\n"
+                + "2) 自定义 UI 选项不能当输入：要标记的是它上方的「数据内容输入框」。例如 ZML 强力 LoRA 加载器需要暴露 lora_loader_data（本插件正是靠它切换画风组）。\n"
+                + "3) 模板的「输出」必须包含保存图片节点，否则插件拿不到图（会提示「未找到输出图片」）。\n"
+                + "4) 模板列表为空？工作流要用 Save 保存，且模板不能在 Templates 里被禁用。\n"
+                + "5) 改过工作流：在 Templates 里对同名模板点 Refresh，然后重载本模块。\n"
+                + "6) 想让每次自动随机 seed：把那个输入命名为 seed，运行时自动填随机值，AI 不用传。");
+            b.CloseElement();
+
+            AddSection(b, ref i, "③ 官方文档与源码（点不开可直接复制地址）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddLinkRow(b, ref i, "ComfyUI-APP-MCP 仓库（GitHub，含安装说明）",
+                "https://github.com/Lotus0614/ComfyUI-APP-MCP");
+            AddLinkRow(b, ref i, "《工具参考》中文文档（模板/参数/输出格式）",
+                "https://github.com/Lotus0614/ComfyUI-APP-MCP/blob/master/docs/zh/tools.md");
+            AddLinkRow(b, ref i, "《故障排查》中文文档（装不上/没输出/参数报错）",
+                "https://github.com/Lotus0614/ComfyUI-APP-MCP/blob/master/docs/zh/troubleshooting.md");
+            AddLinkRow(b, ref i, "《独立部署与远程访问》文档",
+                "https://github.com/Lotus0614/ComfyUI-APP-MCP/blob/master/docs/zh/standalone.md");
+            AddHint(b, ref i,
+                "· 仓库地址以 Lotus0614 为准（旧链接 Luo-Lotus 会自动跳转，能打开但不是规范地址）。\n"
+                + "· 本插件走它的 REST 接口（/mcp-server/api），不需要你再配任何 MCP 客户端。\n"
+                + "· ComfyUI 端口不是 8188 也能用：地址填 http://127.0.0.1:<你的端口>/app-mcp 即可。");
             b.CloseElement();
         }
 
-        for (int pi = 0; pi < _presetCards.Count; pi++)
+        // 画风预设只在 APP-MCP 模板模式下有意义（一个模板切换多种画风）；工作流模式不显示。
+        if (appMcp)
+        {
+            AddSection(b, ref i, "画风预设（一个模板切换多种画风）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddTextArea(b, ref i, "画风预设（JSON 数组）", Configuration.StylePresets,
+                v => Configuration.StylePresets = v, 8);
+            AddHint(b, ref i,
+                "最简用法：只写 ZML 组名 —— [{\"n\":\"示例组名\",\"g\":\"示例组名\"}]（只开该组即一种画风，数据由插件从当前模板读取）。\n"
+                + "精细用法：可选 \"t\" 模板名、\"f\" 附加前缀、\"p\" 模板输入（如 {\"lora_loader_data\":\"……\"}）。\n"
+                + "AI 在 generateimage 里传 style=\"画风名\" 切换；它也能用 getcomfyuistyle 查看可用的 ZML 组名。");
+            b.CloseElement();
+        }
+
+        AddSection(b, ref i, "模型卸载与显存释放");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-row");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn");
+        b.AddAttribute(i++, "disabled", _unloadingModel);
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, UnloadModels));
+        b.AddContent(i++, _unloadingModel ? "卸载中…" : "立即卸载模型（释放显存）");
+        b.CloseElement();
+        if (!string.IsNullOrWhiteSpace(_unloadMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-detect");
+            b.AddAttribute(i++, "style", "margin:0;");
+            b.AddContent(i++, _unloadMessage);
+            b.CloseElement();
+        }
+        b.CloseElement();
+
+        AddCheck(b, ref i, "空闲自动卸载：距上次生图空闲超时后自动卸载模型", Configuration.EnableAutoUnload,
+            v => Configuration.EnableAutoUnload = v);
+        if (Configuration.EnableAutoUnload)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-row");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "width:150px;");
+            AddInput(b, ref i, "空闲小时数", Configuration.AutoUnloadIdleHours.ToString(),
+                SetInt(v => Configuration.AutoUnloadIdleHours = Math.Clamp(v, 0, 720)));
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "style", "width:150px;");
+            AddInput(b, ref i, "空闲分钟数", Configuration.AutoUnloadIdleMinutes.ToString(),
+                SetInt(v => Configuration.AutoUnloadIdleMinutes = Math.Clamp(v, 0, 59)));
+            b.CloseElement();
+            b.CloseElement();
+            AddHint(b, ref i, $"合计空闲 {Configuration.AutoUnloadIdleHours} 小时 {Configuration.AutoUnloadIdleMinutes} 分钟后自动卸载（需保存配置后生效）。");
+        }
+        b.CloseElement();
+    }
+
+    // ============================================================
+    // 页签 4：提示词（种类 / 前缀 / 负面 / 预设）
+    // ============================================================
+    void RenderPromptTab(RenderTreeBuilder b)
+    {
+        int i = 4000;
+        var appMcp = IsAppMcp();
+
+        AddSection(b, ref i, "提示词种类");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
+        {
+            ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
+            ("natural", "自然语言 — 角色 Tag 置前 + 英文短句"),
+            ("hybrid", "混合模式 — 静态用标签，动作/关系用短句")
+        });
+        AddHint(b, ref i, "控制 AI 落笔格式；与固定前缀叠加时仍会自动去重。AI 默认不写画风/质量词（由前缀或工作流决定）。");
+        b.CloseElement();
+
+        AddSection(b, ref i, "固定前缀与负面（两个模式通用）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+
+        if (appMcp)
+        {
+            AddCheck(b, ref i, "模板模式下也拼接上面的固定正向提示词前缀", Configuration.AppMcpUseGlobalPrefix,
+                v => Configuration.AppMcpUseGlobalPrefix = v);
+            AddHint(b, ref i, "默认开（两个模式行为一致）。若模板内部已带画风/质量前缀（如 913流 的节点 52），关闭可避免重复。");
+        }
+
+        AddTextArea(b, ref i, "固定正向提示词前缀（逗号或换行均可）",
+            Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
+        AddHint(b, ref i, appMcp
+            ? "拼在 prompt 最前，与 AI 提示词合并去重后统一英文逗号+空格；留空则不拼接。"
+            : "与 AI 提示词合并后自动去重，统一英文逗号+空格。命名工作流可在「工作流」页签各自设前缀；留空则不拼接。");
+
+        AddTextArea(b, ref i, "固定负面提示词", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
+        AddHint(b, ref i, appMcp
+            ? "模板模式下仅当模板声明了 negative / 负面提示词 输入时才会写入；留空则不发送。"
+            : "留空=用工作流自带负面；填写则覆盖并规范为英文逗号分隔。");
+        b.CloseElement();
+
+        AddSection(b, ref i, "提示词预设");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddHint(b, ref i, "保存常用片段（角色人设/动作/背景），AI 用 getpromptpreset 检索复用。数据存于 Storage/Config/Alife.Plugin.Comfyui/（插件更新不会清空）。");
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-grid2");
+        b.OpenElement(i++, "div");
+        AddInput(b, ref i, "预设名称", _newPresetName, v => _newPresetName = v);
+        b.CloseElement();
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "style", "display:flex;align-items:flex-end;");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn primary");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => AddPresetCard()));
+        b.AddContent(i++, "保存预设");
+        b.CloseElement();
+        b.CloseElement();
+        b.CloseElement();
+        AddTextArea(b, ref i, "预设内容", _newPresetContent, v => _newPresetContent = v, 3);
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-list");
+        for (var pi = 0; pi < _presetCards.Count; pi++)
         {
             var presetIndex = pi;
             var preset = _presetCards[pi];
             var expanded = _activePresetIndex == pi;
 
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", $"cfy-ps-card{(expanded ? " expanded" : "")}");
-
-            // 卡片头部（点击展开）
+            b.AddAttribute(i++, "class", "cu-item");
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-ps-head");
-            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-            {
-                TogglePresetExpand(presetIndex);
-            }));
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-ps-name");
+            b.AddAttribute(i++, "class", "cu-itemhead");
+            b.AddAttribute(i++, "style", "cursor:pointer;");
+            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => TogglePresetExpand(presetIndex)));
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cu-label");
+            b.AddAttribute(i++, "style", "margin:0;");
             b.AddContent(i++, preset.Name);
             b.CloseElement();
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-ps-preview");
-            var preview = preset.Content.Length > 50
-                ? preset.Content[..50] + "..." : preset.Content;
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cu-empty");
+            b.AddAttribute(i++, "style", "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+            var preview = preset.Content.Length > 70 ? preset.Content[..70] + "…" : preset.Content;
             b.AddContent(i++, preview);
             b.CloseElement();
             b.OpenElement(i++, "span");
-            b.AddAttribute(i++, "class", "cfy-ps-expand");
-            b.AddContent(i++, "▶");
+            b.AddAttribute(i++, "class", "cu-label");
+            b.AddAttribute(i++, "style", "margin:0;");
+            b.AddContent(i++, expanded ? "收起" : "展开");
             b.CloseElement();
-            b.CloseElement(); // head
+            b.CloseElement();
 
-            // 展开内容（编辑区）
             if (expanded)
             {
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cfy-ps-body");
-
-                b.OpenElement(i++, "input");
-                b.AddAttribute(i++, "class", "cfy-ps-add-name");
-                b.AddAttribute(i++, "style", "width:100%;margin-bottom:8px;");
-                b.AddAttribute(i++, "value", preset.Name);
-                b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-                {
-                    UpdatePresetCardName(presetIndex, e.Value?.ToString() ?? "");
-                }));
-                b.CloseElement();
-
-                b.OpenElement(i++, "textarea");
-                b.AddAttribute(i++, "class", "cfy-ps-textarea");
-                b.AddAttribute(i++, "value", preset.Content);
-                b.AddAttribute(i++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-                {
-                    UpdatePresetCardContent(presetIndex, e.Value?.ToString() ?? "");
-                }));
-                b.CloseElement();
-
+                b.AddAttribute(i++, "style", "margin-top:8px;");
+                AddInput(b, ref i, "名称", preset.Name, v => UpdatePresetCardName(presetIndex, v));
+                AddTextArea(b, ref i, "内容", preset.Content, v => UpdatePresetCardContent(presetIndex, v), 5);
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cfy-ps-actions");
+                b.AddAttribute(i++, "class", "cu-row");
                 b.OpenElement(i++, "button");
                 b.AddAttribute(i++, "type", "button");
-                b.AddAttribute(i++, "class", "cfy-ps-btn danger");
-                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-                {
-                    RemovePresetCard(presetIndex);
-                }));
+                b.AddAttribute(i++, "class", "cu-del");
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => RemovePresetCard(presetIndex)));
                 b.AddContent(i++, "删除");
                 b.CloseElement();
-                b.CloseElement(); // actions
-
-                b.CloseElement(); // body
+                b.CloseElement();
+                b.CloseElement();
             }
-
-            b.CloseElement(); // card
+            b.CloseElement();
         }
+        if (_presetCards.Count == 0)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-empty");
+            b.AddContent(i++, "暂无预设。填名称+内容后点「保存预设」，或让 AI 用 savepromptpreset 存。");
+            b.CloseElement();
+        }
+        b.CloseElement();
+        b.CloseElement();
+    }
 
-        b.CloseElement(); // ps-list
-        b.CloseElement(); // panel
+    // ============================================================
+    // 页签 5：检索（在线标签 / 在线角色）
+    // ============================================================
+    void RenderSearchTab(RenderTreeBuilder b)
+    {
+        int i = 5000;
 
-        // 提示词
-        AddSection(b, ref i, "提示词前缀与负面");
+        AddSection(b, ref i, "在线 Danbooru 语义标签检索");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-        AddTextArea(b, ref i, "固定正向提示词前缀（tag/短句，逗号或换行均可）", Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
-        AddHint(b, ref i, "与 AI 提示词合并后自动去重；最终注入统一为英文逗号+空格，如：masterpiece, best quality。命名工作流可在各自卡片里单独设前缀（留空则沿用这里）；默认工作流始终用这里。留空则不拼接");
-        AddTextArea(b, ref i, "固定负面提示词（可空=用工作流自带）", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
-        AddHint(b, ref i, "留空用工作流自带负面；填写则覆盖并规范为英文逗号分隔");
-        AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
-        {
-            ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
-            ("natural", "自然语言 — 角色 Tag 置前 + 英文短句"),
-            ("hybrid", "混合模式 — 静态用标签，动作/关系用短句；多人每角色独立描述")
-        });
-        AddHint(b, ref i, "控制 AI 生成提示词的格式风格，不影响已有前缀");
-        b.CloseElement();
-
-        // 在线 Danbooru 语义标签检索
-        AddSection(b, ref i, "在线标签检索（可选）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.EnableDanbooruSearch);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.EnableDanbooruSearch = (bool)(e.Value ?? false);
-            if (!Configuration.EnableDanbooruSearch)
-                Configuration.EnableDanbooruArtistRecommend = false;
-            StateHasChanged();
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
-        b.AddContent(i++, "启用 Danbooru 语义标签检索（search / related）");
-        b.CloseElement();
-        b.CloseElement();
-
-        AddHint(b, ref i, "质量优先：有服装/姿势/场景等细节时 AI 可检索标准 tag。默认关=零外网。需重载模块/重启角色后函数才注册。");
-
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style",
-            $"display:inline-flex;align-items:center;gap:8px;cursor:{(Configuration.EnableDanbooruSearch ? "pointer" : "not-allowed")};margin:10px 0 8px;opacity:{(Configuration.EnableDanbooruSearch ? "1" : "0.45")};");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.EnableDanbooruArtistRecommend);
-        b.AddAttribute(i++, "disabled", !Configuration.EnableDanbooruSearch);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            if (!Configuration.EnableDanbooruSearch) return;
-            Configuration.EnableDanbooruArtistRecommend = (bool)(e.Value ?? false);
-            StateHasChanged();
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
-        b.AddContent(i++, "启用画师推荐（额外外网调用，默认关；依赖总开关）");
-        b.CloseElement();
-        b.CloseElement();
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddCheck(b, ref i, "启用语义标签检索（search / related）", Configuration.EnableDanbooruSearch,
+            v => Configuration.EnableDanbooruSearch = v);
+        AddCheck(b, ref i, "启用画师推荐（额外外网调用，依赖总开关）", Configuration.EnableDanbooruArtistRecommend,
+            v => Configuration.EnableDanbooruArtistRecommend = v,
+            enabled: Configuration.EnableDanbooruSearch);
+        AddHint(b, ref i, "默认关=零外网。有服装/姿势/场景等细节时 AI 可检索标准 tag；失败会自写英文仍可生图。需重载模块后函数才注册。");
 
         if (Configuration.EnableDanbooruSearch)
         {
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-grid-2");
-            b.AddAttribute(i++, "style", "margin-top:8px;");
+            b.AddAttribute(i++, "class", "cu-grid2");
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "主源 URL", Configuration.DanbooruSearchPrimaryUrl, v => Configuration.DanbooruSearchPrimaryUrl = v);
+            AddHint(b, ref i, "默认官方备份域（大陆通常更快）；自建后不再自动回退备用。");
+            AddInput(b, ref i, "超时秒数（总预算）", Configuration.DanbooruSearchTimeoutSeconds.ToString(),
+                SetInt(v => Configuration.DanbooruSearchTimeoutSeconds = Math.Clamp(v, 10, 120)));
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "备用 URL（可空）", Configuration.DanbooruSearchFallbackUrl, v => Configuration.DanbooruSearchFallbackUrl = v);
+            AddHint(b, ref i, "默认 HF Space，可能冷启 30–60s。");
+            AddCheck(b, ref i, "包含 NSFW 标签（默认关，用 SFW）", Configuration.DanbooruSearchShowNsfw,
+                v => Configuration.DanbooruSearchShowNsfw = v);
+            b.CloseElement();
+            b.CloseElement();
 
             b.OpenElement(i++, "div");
-            AddInput(b, ref i, "主源 URL", Configuration.DanbooruSearchPrimaryUrl,
-                v => Configuration.DanbooruSearchPrimaryUrl = v);
-            AddHint(b, ref i, "默认官方备份域（大陆通常更快）。自建时填你的地址，将不再自动回退 HF");
-            AddInput(b, ref i, "超时秒数（总预算）", Configuration.DanbooruSearchTimeoutSeconds.ToString(), v =>
-            {
-                if (int.TryParse(v, out var n))
-                    Configuration.DanbooruSearchTimeoutSeconds = Math.Clamp(n, 10, 120);
-            });
-            b.CloseElement();
-
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "备用 URL（可空）", Configuration.DanbooruSearchFallbackUrl,
-                v => Configuration.DanbooruSearchFallbackUrl = v);
-            AddHint(b, ref i, "默认 HF Space；主源失败时回退。HF 可能冷启 30–60s，大陆常较慢");
-            b.OpenElement(i++, "label");
-            b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-top:12px;");
-            b.OpenElement(i++, "input");
-            b.AddAttribute(i++, "type", "checkbox");
-            b.AddAttribute(i++, "checked", Configuration.DanbooruSearchShowNsfw);
-            b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-            b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-            {
-                Configuration.DanbooruSearchShowNsfw = (bool)(e.Value ?? false);
-            }));
-            b.CloseElement();
-            b.OpenElement(i++, "span");
-            b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
-            b.AddContent(i++, "包含 NSFW 标签（默认关，用 SFW）");
-            b.CloseElement();
-            b.CloseElement();
-            b.CloseElement();
-
-            b.CloseElement(); // grid-2
-
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;");
+            b.AddAttribute(i++, "class", "cu-row");
+            b.AddAttribute(i++, "style", "margin-top:10px;");
             b.OpenElement(i++, "button");
             b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cfy-btn");
+            b.AddAttribute(i++, "class", "cu-btn");
             b.AddAttribute(i++, "disabled", _danbooruTesting);
             b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestDanbooruConnectivity));
-            b.AddContent(i++, _danbooruTesting ? "测试中…" : "✦ 测试连通");
+            b.AddContent(i++, _danbooruTesting ? "测试中…" : "测试连通");
+            b.CloseElement();
             b.CloseElement();
             if (!string.IsNullOrWhiteSpace(_danbooruTestMessage))
             {
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cfy-detect");
-                b.AddAttribute(i++, "style", "margin:0;flex:1;");
+                b.AddAttribute(i++, "class", "cu-detect");
                 b.AddContent(i++, _danbooruTestMessage);
                 b.CloseElement();
             }
-            b.CloseElement();
-
-            AddHint(b, ref i,
-                "公开服务请友情链接上游：https://huggingface.co/spaces/SAkizuki/DanbooruSearch 。自建最稳；失败时 AI 会自写 tag 仍可生图。");
+            AddHint(b, ref i, "使用公开服务时请友情链接上游（点不开可直接复制地址）：");
+            AddLinkRow(b, ref i, "DanbooruSearch 在线服务（Hugging Face Space）",
+                "https://huggingface.co/spaces/SAkizuki/DanbooruSearch");
         }
+        b.CloseElement();
 
-        b.CloseElement(); // danbooru panel
-
-        // 在线角色检索扩充（AnimaDex）：本地角色索引未命中/歧义时自动联网补查
-        AddSection(b, ref i, "在线角色检索扩充（可选）");
+        AddSection(b, ref i, "在线角色检索扩充（AnimaDex）");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.EnableAnimadexCharacterSearch);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.EnableAnimadexCharacterSearch = (bool)(e.Value ?? false);
-            StateHasChanged();
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;");
-        b.AddContent(i++, "启用 AnimaDex 在线角色检索");
-        b.CloseElement();
-        b.CloseElement();
-
-        AddHint(b, ref i, "仅作为本地角色索引（character-prompts.json）的补充：本地未命中、或带作品名仍歧义时，自动联网查约 3.6 万角色在线库。本地命中/歧义处理仍优先，不影响离线质量。默认关=零外网。需重载模块/重启角色后生效");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddCheck(b, ref i, "启用 AnimaDex 在线角色检索", Configuration.EnableAnimadexCharacterSearch,
+            v => Configuration.EnableAnimadexCharacterSearch = v);
+        AddHint(b, ref i, "仅作本地索引补充：本地未命中、或带作品名仍歧义时联网查约 3.6 万角色。本地命中仍优先，默认关=零外网。");
 
         if (Configuration.EnableAnimadexCharacterSearch)
         {
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-grid-2");
-            b.AddAttribute(i++, "style", "margin-top:8px;");
-
+            b.AddAttribute(i++, "class", "cu-grid2");
             b.OpenElement(i++, "div");
-            AddInput(b, ref i, "服务地址", Configuration.AnimadexBaseUrl,
-                v => Configuration.AnimadexBaseUrl = v);
-            AddHint(b, ref i, "默认官方站点 animadex.net（大陆直连通常约 1s）。中文角色名本地未收录时，返回会提示改用英文/罗马字名");
-            AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(), v =>
-            {
-                if (int.TryParse(v, out var n))
-                    Configuration.AnimadexTimeoutSeconds = Math.Clamp(n, 5, 60);
-            });
+            AddInput(b, ref i, "服务地址", Configuration.AnimadexBaseUrl, v => Configuration.AnimadexBaseUrl = v);
+            AddHint(b, ref i, "默认 animadex.net（大陆直连通常约 1s）。");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(),
+                SetInt(v => Configuration.AnimadexTimeoutSeconds = Math.Clamp(v, 5, 60)));
+            b.CloseElement();
             b.CloseElement();
 
             b.OpenElement(i++, "div");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;");
+            b.AddAttribute(i++, "class", "cu-row");
+            b.AddAttribute(i++, "style", "margin-top:10px;");
             b.OpenElement(i++, "button");
             b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cfy-btn");
+            b.AddAttribute(i++, "class", "cu-btn");
             b.AddAttribute(i++, "disabled", _animadexTesting);
             b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAnimadexConnectivity));
-            b.AddContent(i++, _animadexTesting ? "测试中…" : "✦ 测试连通");
+            b.AddContent(i++, _animadexTesting ? "测试中…" : "测试连通");
+            b.CloseElement();
             b.CloseElement();
             if (!string.IsNullOrWhiteSpace(_animadexTestMessage))
             {
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cfy-detect");
-                b.AddAttribute(i++, "style", "margin:0;flex:1;");
+                b.AddAttribute(i++, "class", "cu-detect");
                 b.AddContent(i++, _animadexTestMessage);
                 b.CloseElement();
             }
-            b.CloseElement();
-            b.CloseElement();
-
-            AddHint(b, ref i, "上游：animadex.net（Danbooru 角色标签聚合，MIT 客户端）。在线失败时 findcharacterprompt 自动回到纯本地提示，不阻塞生图");
-            b.CloseElement(); // grid-2
+            AddHint(b, ref i, "AnimaDex 不支持中文检索：中文角色名本地未收录时会提示改用英文/罗马字。");
         }
-
-        b.CloseElement(); // animadex panel
-
-        // 默认参数
-        AddSection(b, ref i, "默认参数");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-
-        // 双栏：仅放 select / input 类控件
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-grid-2");
-
-        b.OpenElement(i++, "div");
-        AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
-        {
-            ("portrait", $"竖版 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}"),
-            ("landscape", $"横版 {Configuration.LandscapeWidth}×{Configuration.LandscapeHeight}"),
-            ("square", $"正方形 {Configuration.SquareWidth}×{Configuration.SquareHeight}")
-        });
-        AddHint(b, ref i, "AI 未传 orientation 时的默认方向");
-        AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), v =>
-        {
-            if (int.TryParse(v, out var n)) Configuration.DefaultWidth = n;
-        });
-        AddInput(b, ref i, "兜底高度", Configuration.DefaultHeight.ToString(), v =>
-        {
-            if (int.TryParse(v, out var n)) Configuration.DefaultHeight = n;
-        });
         b.CloseElement();
-
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "超时秒数", Configuration.TimeoutSeconds.ToString(), v =>
-        {
-            if (int.TryParse(v, out var n)) Configuration.TimeoutSeconds = n;
-        });
-        AddInput(b, ref i, "轮询间隔毫秒", Configuration.PollIntervalMs.ToString(), v =>
-        {
-            if (int.TryParse(v, out var n)) Configuration.PollIntervalMs = n;
-        });
-        b.CloseElement();
-
-        b.CloseElement(); // grid-2
-
-        // 全宽区域：选项开关
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "style", "display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;margin-top:14px;");
-
-        // 自动打开图片
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.AutoOpenImage);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.AutoOpenImage = (bool)(e.Value ?? false);
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
-        b.AddContent(i++, "生完图自动用系统默认图片查看器打开");
-        b.CloseElement();
-        b.CloseElement();
-
-        // 优先生图
-        b.OpenElement(i++, "label");
-        b.AddAttribute(i++, "style", "display:inline-flex;align-items:center;gap:8px;cursor:pointer;");
-        b.OpenElement(i++, "input");
-        b.AddAttribute(i++, "type", "checkbox");
-        b.AddAttribute(i++, "checked", Configuration.PriorityImageGen);
-        b.AddAttribute(i++, "style", "accent-color:#ec4899;width:16px;height:16px;cursor:pointer;flex-shrink:0;");
-        b.AddAttribute(i++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
-        {
-            Configuration.PriorityImageGen = (bool)(e.Value ?? false);
-        }));
-        b.CloseElement();
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "style", "font-size:12.5px;color:#9d174d;font-weight:700;white-space:nowrap;");
-        b.AddContent(i++, "优先生图：生图开始后等图完再返回（同机 TTS 建议开）");
-        b.CloseElement();
-        b.CloseElement();
-
-        b.CloseElement(); // 选项开关行
-
-        // 同机 TTS 提示（不依赖语音插件）
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;margin-top:8px;line-height:1.45;");
-        b.AddContent(i++, "同机本地 TTS：建议开启「优先生图」。默认关，纯生图用户不受影响。本插件不依赖语音插件。");
-        b.CloseElement();
-
-        // 条件输入：硬超时上限（在开关行下方，独立一行）
-        if (Configuration.PriorityImageGen)
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap;");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "width:180px;flex-shrink:0;");
-            AddInput(b, ref i, "硬超时上限（秒）", Configuration.PriorityMaxWaitSeconds.ToString(), v =>
-            {
-                if (int.TryParse(v, out var n))
-                    Configuration.PriorityMaxWaitSeconds = Math.Clamp(n, 30, 1800);
-            });
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "style", "font-size:11px;color:#b06a8c;font-weight:600;");
-            b.AddContent(i++, "实际 = min(超时秒数, 本上限)，超时强制结束避免卡死");
-            b.CloseElement();
-            b.CloseElement();
-        }
-
-        b.CloseElement(); // panel
-
-        // 节点映射
-        AddSection(b, ref i, "节点映射（高级）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-panel");
-        AddHint(b, ref i, "留空即可自动识别。特殊工作流可点按钮扫描并回填节点 ID");
-
-        b.OpenElement(i++, "div");
-        b.OpenElement(i++, "button");
-        b.AddAttribute(i++, "type", "button");
-        b.AddAttribute(i++, "class", "cfy-btn");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, AutoDetectNodes));
-        b.AddContent(i++, "✦ 自动识别节点");
-        b.CloseElement();
-        b.CloseElement();
-
-        if (!string.IsNullOrWhiteSpace(detectMessage))
-        {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cfy-detect");
-            b.AddContent(i++, detectMessage);
-            b.CloseElement();
-        }
-
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-grid-2");
-
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "正向提示词节点 ID", Configuration.PositivePromptNodeId, v => Configuration.PositivePromptNodeId = v);
-        AddInput(b, ref i, "正向提示词字段名", Configuration.PositivePromptInput, v => Configuration.PositivePromptInput = v);
-        AddInput(b, ref i, "分辨率节点 ID", Configuration.ResolutionNodeId, v => Configuration.ResolutionNodeId = v);
-        b.CloseElement();
-
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "负面提示词节点 ID", Configuration.NegativePromptNodeId, v => Configuration.NegativePromptNodeId = v);
-        AddInput(b, ref i, "负面提示词字段名", Configuration.NegativePromptInput, v => Configuration.NegativePromptInput = v);
-        b.CloseElement();
-
-        b.CloseElement();
-        AddHint(b, ref i, "手动节点 ID 仅用于默认工作流；命名工作流会按各自连接关系自动识别");
-        b.CloseElement();
-
-        // 高级模式开关
-        AddSection(b, ref i, "高级模式");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
-        {
-            Configuration.AdvancedMode = !Configuration.AdvancedMode;
-            if (Configuration.AdvancedMode)
-                await LoadNodeOverview();
-            StateHasChanged();
-        }));
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-label");
-        b.AddContent(i++, "工作流节点概览");
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "class", "cfy-advanced-badge");
-        b.AddContent(i++, "BETA");
-        b.CloseElement();
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.AdvancedMode ? " active" : "")}");
-        b.CloseElement();
-        b.CloseElement();
-        AddHint(b, ref i, "开启后展示工作流中所有节点类型及关键参数，方便排查问题或手动配置节点映射");
-
-        // AI 节点控制开关
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-        {
-            Configuration.EnableNodeControl = !Configuration.EnableNodeControl;
-            StateHasChanged();
-        }));
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-label");
-        b.AddContent(i++, "AI 节点控制（高级）");
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "class", "cfy-advanced-badge");
-        b.AddContent(i++, "ADVANCED");
-        b.CloseElement();
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.EnableNodeControl ? " active" : "")}");
-        b.CloseElement();
-        b.CloseElement();
-        AddHint(b, ref i, "开启后，AI 可直接操控工作流节点参数（更换模型、调整步数/CFG/采样器等）。不开启则保持原有简单模式不受影响。");
-
-        // 隐式注入开关（4.0 新特性：DocumentMode.Implicit / Explicit 切换）
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-toggle");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
-        {
-            Configuration.ImplicitInjection = !Configuration.ImplicitInjection;
-            StateHasChanged();
-        }));
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-advanced-label");
-        b.AddContent(i++, "隐式注入（省 token）");
-        b.OpenElement(i++, "span");
-        b.AddAttribute(i++, "class", "cfy-advanced-badge");
-        b.AddContent(i++, "4.0");
-        b.CloseElement();
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", $"cfy-advanced-switch{(Configuration.ImplicitInjection ? " active" : "")}");
-        b.CloseElement();
-        b.CloseElement();
-        AddHint(b, ref i, "开启后函数文档不直接注入系统提示词，AI 需先调用 <comfyuiimagegeneration/> 按需加载（省 token，渐进式）；关闭则为显式注入（默认，功能说明直接可用）。改动需重载模块后生效。");
-
-        if (Configuration.AdvancedMode)
-        {
-            AddNodeOverview(b, ref i);
-        }
-
-        // footer
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cfy-footer");
-        b.OpenElement(i++, "span");
-        b.AddContent(i++, "ComfyUI × Alife");
-        b.CloseElement();
-        b.AddContent(i++, "  ·  Doro 的妙妙工具");
-        b.CloseElement();
-
-        b.CloseElement(); // content
-        b.CloseElement(); // container
-        b.CloseElement(); // root
     }
 
-    void AddResoCard(RenderTreeBuilder b, ref int seq, string tag, string size, string name, string hint)
+    // ============================================================
+    // 页签 6：高级（注入方式 / 节点控制 / 节点概览）
+    // ============================================================
+    void RenderAdvancedTab(RenderTreeBuilder b)
     {
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-card");
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-shine");
-        b.CloseElement();
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-tag");
-        b.AddContent(seq++, tag);
-        b.CloseElement();
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-size");
-        b.AddContent(seq++, size);
-        b.CloseElement();
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-name");
-        b.AddContent(seq++, name);
-        b.CloseElement();
-        b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-reso-hint");
-        b.AddContent(seq++, hint);
-        b.CloseElement();
+        int i = 6000;
+
+        var appMcp = IsAppMcp();
+
+        AddSection(b, ref i, "AI 注入方式");
+        AddToggle(b, ref i, "隐式注入（省 token）", "4.0", Configuration.ImplicitInjection,
+            v => Configuration.ImplicitInjection = v);
+        AddHint(b, ref i, "开启后函数文档不直接注入系统提示词，AI 先调用 <comfyuiimagegeneration/> 按需加载；关闭为显式注入（默认）。改动需重载模块后生效。");
+
+        if (appMcp)
+        {
+            AddSection(b, ref i, "工作流节点相关");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-panel");
+            AddHint(b, ref i,
+                "「AI 节点控制」与「工作流节点概览」在 APP-MCP 模板模式下不适用（模板不使用工作流节点），"
+                + "已自动隐藏，相关规则也已从 AI 提示词中移除；切回工作流模式即恢复。");
+            b.CloseElement();
+        }
+        else
+        {
+            AddToggle(b, ref i, "AI 节点控制", "ADVANCED", Configuration.EnableNodeControl,
+                v => Configuration.EnableNodeControl = v);
+            AddHint(b, ref i, "开启后 AI 可直接操控工作流节点参数（换模型/步数/CFG/采样器等）。不开启则保持原有简单模式。");
+
+            AddToggle(b, ref i, "工作流节点概览", "BETA", Configuration.AdvancedMode,
+                v => Configuration.AdvancedMode = v,
+                afterToggleAsync: async () =>
+                {
+                    if (Configuration.AdvancedMode)
+                        await LoadNodeOverview();
+                });
+            AddHint(b, ref i, "开启后展示工作流全部节点类型与关键参数，便于排查问题或手动配置节点映射。");
+
+            if (Configuration.AdvancedMode)
+            {
+                AddSection(b, ref i, "节点概览");
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-panel");
+                if (!string.IsNullOrWhiteSpace(_nodeOverviewError))
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-detect");
+                    b.AddContent(i++, _nodeOverviewError);
+                    b.CloseElement();
+                }
+                else if (_nodeOverview.Count == 0)
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-empty");
+                    b.AddContent(i++, "尚未加载。切换一次本页签或关闭再开启上面开关即可加载。");
+                    b.CloseElement();
+                }
+                AddNodeOverview(b, ref i);
+                b.CloseElement();
+            }
+        }
+
+        AddSection(b, ref i, "关于与依赖");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddHint(b, ref i,
+            "ComfyUI × Alife · Doro 的妙妙工具。\n"
+            + "配置改完请用面板的保存入口应用；切换生图后端后需要重载本模块才会生效。\n"
+            + "本插件可在 Alife 的「插件市场」里搜索安装/更新。\n"
+            + "提示词预设存放目录（插件更新不会清空）：\n" + ComfyuiService.GetUserDataDirectory());
+        AddHint(b, ref i,
+            "可选依赖（按需，装完请重载本模块）：\n"
+            + "· 模板模式 → ComfyUI 侧需装第三方节点 ComfyUI-APP-MCP（「后端 · 画风」页有安装教程与链接）。\n"
+            + "· 工作流用到的自定义节点（ZML / WeiLin / Crystools / DLSS 等）必须在 ComfyUI 侧已安装，工作流才能在那边跑通。");
+        AddLinkRow(b, ref i, "ComfyUI-APP-MCP（模板模式依赖，GitHub）",
+            "https://github.com/Lotus0614/ComfyUI-APP-MCP");
+        AddLinkRow(b, ref i, "在线标签检索上游 DanbooruSearchOnline（MIT）",
+            "https://github.com/SuzumiyaAkizuki/DanbooruSearchOnline");
+        AddLinkRow(b, ref i, "在线角色检索上游 AnimaDex", "https://animadex.net");
         b.CloseElement();
     }
 
+    // ============================================================
+    // 轻量渲染辅助
+    // ============================================================
     void AddSection(RenderTreeBuilder b, ref int seq, string text)
     {
         b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-section");
+        b.AddAttribute(seq++, "class", "cu-sec");
         b.AddContent(seq++, text);
         b.CloseElement();
     }
@@ -2635,38 +1132,49 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     void AddHint(RenderTreeBuilder b, ref int seq, string text)
     {
         b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-hint");
+        b.AddAttribute(seq++, "class", "cu-hint");
         b.AddContent(seq++, text);
         b.CloseElement();
     }
 
+    void AddChip(RenderTreeBuilder b, ref int seq, string text, bool on)
+    {
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", on ? "cu-chip on" : "cu-chip");
+        b.AddContent(seq++, text);
+        b.CloseElement();
+    }
+
+    /// <summary>文本输入：onchange 提交（失焦/回车），避免每敲一字符整页重渲染。</summary>
     void AddInput(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange)
     {
         b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddAttribute(seq++, "class", "cu-label");
         b.AddContent(seq++, label);
         b.CloseElement();
 
-        b.OpenComponent<Input<string>>(seq++);
-        b.AddAttribute(seq++, "Value", value ?? "");
-        b.AddAttribute(seq++, "ValueChanged", EventCallback.Factory.Create<string>(this, onChange));
-        b.AddAttribute(seq++, "Style", "width:100%;");
-        b.CloseComponent();
+        b.OpenElement(seq++, "input");
+        b.AddAttribute(seq++, "class", "cu-input");
+        b.AddAttribute(seq++, "value", value ?? "");
+        b.AddAttribute(seq++, "onchange",
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+        b.CloseElement();
     }
 
+    /// <summary>多行文本输入：onchange 提交。</summary>
     void AddTextArea(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange, int rows = 4)
     {
         b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddAttribute(seq++, "class", "cu-label");
         b.AddContent(seq++, label);
         b.CloseElement();
 
         b.OpenElement(seq++, "textarea");
-        b.AddAttribute(seq++, "class", "ant-input cfy-textarea");
+        b.AddAttribute(seq++, "class", "cu-textarea");
         b.AddAttribute(seq++, "rows", rows);
         b.AddAttribute(seq++, "spellcheck", "false");
         b.AddAttribute(seq++, "value", value ?? "");
-        b.AddAttribute(seq++, "oninput",
+        b.AddAttribute(seq++, "onchange",
             EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
         b.CloseElement();
     }
@@ -2674,12 +1182,12 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     void AddSelect(RenderTreeBuilder b, ref int seq, string label, string value, Action<string> onChange, (string val, string text)[] options)
     {
         b.OpenElement(seq++, "div");
-        b.AddAttribute(seq++, "class", "cfy-label");
+        b.AddAttribute(seq++, "class", "cu-label");
         b.AddContent(seq++, label);
         b.CloseElement();
 
         b.OpenElement(seq++, "select");
-        b.AddAttribute(seq++, "class", "cfy-select");
+        b.AddAttribute(seq++, "class", "cu-select");
         b.AddAttribute(seq++, "value", value ?? "");
         b.AddAttribute(seq++, "onchange",
             EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
@@ -2693,6 +1201,181 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
         b.CloseElement();
+    }
+
+    void AddCheck(RenderTreeBuilder b, ref int seq, string label, bool value, Action<bool> onChanged, bool enabled = true)
+    {
+        b.OpenElement(seq++, "label");
+        b.AddAttribute(seq++, "class", enabled ? "cu-check" : "cu-check off");
+        b.OpenElement(seq++, "input");
+        b.AddAttribute(seq++, "type", "checkbox");
+        b.AddAttribute(seq++, "checked", value);
+        if (!enabled)
+            b.AddAttribute(seq++, "disabled", true);
+        b.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        {
+            if (!enabled) return;
+            onChanged((bool)(e.Value ?? false));
+        }));
+        b.CloseElement();
+        b.OpenElement(seq++, "span");
+        b.AddContent(seq++, label);
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    /// <summary>开关行（整行可点）。afterToggleAsync 在状态变更后执行（用于按需加载）。</summary>
+    void AddToggle(RenderTreeBuilder b, ref int seq, string label, string badge, bool value,
+        Action<bool> onChanged, Func<Task>? afterToggleAsync = null)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-toggle");
+        b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
+        {
+            onChanged(!value);
+            if (afterToggleAsync != null)
+                await afterToggleAsync();
+        }));
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "t");
+        b.AddContent(seq++, label);
+        if (!string.IsNullOrWhiteSpace(badge))
+        {
+            b.OpenElement(seq++, "span");
+            b.AddAttribute(seq++, "class", "b");
+            b.AddContent(seq++, badge);
+            b.CloseElement();
+        }
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", value ? "cu-sw on" : "cu-sw");
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    /// <summary>编号步骤列表（教程用）。</summary>
+    void AddSteps(RenderTreeBuilder b, ref int seq, params string[] steps)
+    {
+        b.OpenElement(seq++, "ol");
+        b.AddAttribute(seq++, "class", "cu-steps");
+        foreach (var step in steps)
+        {
+            b.OpenElement(seq++, "li");
+            b.AddContent(seq++, step);
+            b.CloseElement();
+        }
+        b.CloseElement();
+    }
+
+    /// <summary>突出说明块（小白避坑用）。</summary>
+    void AddNote(RenderTreeBuilder b, ref int seq, string text)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-note");
+        b.AddContent(seq++, text);
+        b.CloseElement();
+    }
+
+    /// <summary>外链行：可点击 + 旁边给出可复制的地址（照顾不方便点链接的用户）。</summary>
+    void AddLinkRow(RenderTreeBuilder b, ref int seq, string text, string url)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-linkrow");
+        b.OpenElement(seq++, "a");
+        b.AddAttribute(seq++, "class", "cu-link");
+        b.AddAttribute(seq++, "href", url);
+        b.AddAttribute(seq++, "target", "_blank");
+        b.AddAttribute(seq++, "rel", "noreferrer noopener");
+        b.AddContent(seq++, text);
+        b.CloseElement();
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "cu-url");
+        b.AddContent(seq++, url);
+        b.CloseElement();
+        b.CloseElement();
+    }
+
+    /// <summary>教程插图：内嵌 data URI，避免外部文件路径与打包问题。</summary>
+    void AddImage(RenderTreeBuilder b, ref int seq, string dataUri, string caption)
+    {
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-figure");
+        b.OpenElement(seq++, "img");
+        b.AddAttribute(seq++, "class", "cu-img");
+        // UiAssets 里存的是纯 base64，这里补全 data URI 头，否则会被浏览器当成相对路径导致裂图。
+        b.AddAttribute(seq++, "src", "data:image/png;base64," + dataUri);
+        b.AddAttribute(seq++, "alt", caption ?? "");
+        b.CloseElement();
+        if (!string.IsNullOrWhiteSpace(caption))
+        {
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "class", "cu-cap");
+            b.AddContent(seq++, caption);
+            b.CloseElement();
+        }
+        b.CloseElement();
+    }
+
+    static Action<string> SetInt(Action<int> setter)
+        => v => { if (int.TryParse(v, out var n)) setter(n); };
+
+    async Task TestAppMcp()
+    {
+        if (_appMcpTesting) return;
+        _appMcpTesting = true;
+        _appMcpTestMessage = "正在连接 APP-MCP…";
+        StateHasChanged();
+        try
+        {
+            var cfg = Configuration ?? new ComfyuiConfig();
+            var comfy = string.IsNullOrWhiteSpace(cfg.BaseUrl)
+                ? "http://127.0.0.1:8188" : cfg.BaseUrl.Trim().TrimEnd('/');
+            var apiBase = AppMcpClient.ResolveApiBase(cfg.AppMcpUrl, comfy);
+            var message = await AppMcpClient.TestAsync(apiBase, cfg.ApiToken);
+
+            // 顺带把「默认模板」的输入明细与可用画风组列出来，省得去 ComfyUI 那边翻
+            var templateName = (cfg.AppMcpTemplate ?? "").Trim();
+            if (templateName.Length > 0)
+            {
+                var tpl = await AppMcpClient.GetTemplateAsync(apiBase, templateName, cfg.ApiToken);
+                if (tpl == null)
+                {
+                    message += $"\n默认模板「{templateName}」读取失败或不存在：请检查模板名，或刷新 APP-MCP 的 Templates 列表。";
+                }
+                else
+                {
+                    var inputs = tpl.Inputs.Count == 0
+                        ? "(无输入)"
+                        : string.Join("、", tpl.Inputs.Select(kv => $"{kv.Key}({kv.Value.Type.ToLowerInvariant()})"));
+                    message += $"\n默认模板「{templateName}」输入：{inputs}";
+
+                    var hasImageInput = tpl.Inputs.Values.Any(v =>
+                                            v.Type.ToUpperInvariant() is "IMAGE" or "LOADIMAGE")
+                                        || tpl.Inputs.Keys.Any(k =>
+                                            k.Contains("图", StringComparison.Ordinal)
+                                            || k.Contains("image", StringComparison.OrdinalIgnoreCase));
+                    message += hasImageInput
+                        ? "\n该模板支持图生图（可用 imagepath）"
+                        : "\n该模板未声明图片输入：imagepath 会被忽略";
+
+                    var zmlGroups = AppMcpClient.ListTemplateZmlGroups(tpl.RawJson);
+                    message += zmlGroups.Count > 0
+                        ? $"\nZML LoRA 组（可填进「画风预设」的 g）：{string.Join("、", zmlGroups)}"
+                        : "\n未发现 ZML LoRA 组（画风预设的 g 对该模板不适用）";
+                }
+            }
+
+            _appMcpTestMessage = message;
+        }
+        catch (Exception ex)
+        {
+            _appMcpTestMessage = "测试异常: " + ex.Message;
+        }
+        finally
+        {
+            _appMcpTesting = false;
+            StateHasChanged();
+        }
     }
 
     async Task UnloadModels()
@@ -2877,7 +1560,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "value", width);
         b.AddAttribute(seq++, "min", "64");
         b.AddAttribute(seq++, "max", "4096");
-        b.AddAttribute(seq++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        b.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
         {
             if (int.TryParse(e.Value?.ToString(), out var n))
                 onWidthChanged(Math.Clamp(n, 64, 4096));
@@ -2893,7 +1576,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "value", height);
         b.AddAttribute(seq++, "min", "64");
         b.AddAttribute(seq++, "max", "4096");
-        b.AddAttribute(seq++, "oninput", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+        b.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
         {
             if (int.TryParse(e.Value?.ToString(), out var n))
                 onHeightChanged(Math.Clamp(n, 64, 4096));

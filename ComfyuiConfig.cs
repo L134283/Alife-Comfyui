@@ -163,4 +163,32 @@ public class ComfyuiConfig
 
     [Description("空闲自动卸载时长-分钟部分（0~59），与小时部分相加为总空闲时长。默认 30 分钟")]
     public int AutoUnloadIdleMinutes { get; set; } = 30;
+
+    // ---------- APP-MCP 模板模式（可选，与原有工作流模式共存兼容） ----------
+
+    [Description("生图后端：workflow=原有直连工作流模式（默认，行为完全不变）；appmcp=APP-MCP 模板模式，直接调用 ComfyUI-APP-MCP 的模板（AI 只填模板输入，无需在本插件配置节点；一个模板内可含 ZML LoRA 组等可切换参数）")]
+    public string BackendMode { get; set; } = "workflow";
+
+    [Description("APP-MCP 服务地址。可填 ComfyUI 端口下的代理入口（如 http://127.0.0.1:8188/app-mcp）或直接填 API 根（如 http://127.0.0.1:8188/mcp-server/api）；留空则自动用「ComfyUI 地址」推导")]
+    public string AppMcpUrl { get; set; } = "";
+
+    [Description("APP-MCP 模板模式下默认使用的模板名（如 动漫7）。AI 也可在调用时用 template 参数切换；留空则必须由 AI 指定")]
+    public string AppMcpTemplate { get; set; } = "";
+
+    [Description("提示词写入的模板输入参数名（默认 positive）。留空或该模板无此输入时，自动回退到模板第一个 string 输入")]
+    public string AppMcpPromptParam { get; set; } = "positive";
+
+    [Description("模板默认参数（JSON 对象），例如 {\"参数名\": 值}；AI 未显式覆盖时使用。只有模板已声明的输入才会生效")]
+    public string AppMcpDefaultParams { get; set; } = "{}";
+
+    [Description("APP-MCP 模板等待出图超时秒数（等待上限；超时后会继续轮询结果）。默认 300")]
+    public int AppMcpTimeoutSeconds { get; set; } = 300;
+
+    [Description("模板模式下是否也拼接「固定正向提示词前缀」（默认开=两个模式行为一致）。若模板内部已带画风/质量前缀（如 913流 的节点 52），可关闭以免重复")]
+    public bool AppMcpUseGlobalPrefix { get; set; } = true;
+
+    // ---------- 画风预设（一个工作流/模板切换多种画风） ----------
+
+    [Description("画风预设列表（JSON 数组）。格式：[{\"n\":\"画风名\",\"t\":\"模板名(可空)\",\"f\":\"附加正向前缀(可空)\",\"p\":{参数}}]。workflow 模式 p=节点覆盖（如 {\"11\":{\"lora_loader_data\":\"...\"}}）；appmcp 模式 p=模板输入（如 {\"lora_loader_data\":\"...\"}）。AI 用 generateimage 的 style 参数按名一键切换画风")]
+    public string StylePresets { get; set; } = "[]";
 }

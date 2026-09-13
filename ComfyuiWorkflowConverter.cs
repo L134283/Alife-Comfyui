@@ -1248,6 +1248,211 @@ public static class ComfyuiWorkflowConverter
             ApplyValidatedRawOverrides(prompt, rawOverrides);
     }
 
+    /// <summary>
+    /// 应用用户配置的「画风预设」节点覆盖。
+    /// 与提供给 AI 的 nodeOverrides 不同：这些数据由用户自己在配置里编写，
+    /// 因此允许长字符串（如 ZML 强力 LoRA 加载器的 lora_loader_data 整段 JSON）。
+    /// 仍禁止路径/脚本/凭据等敏感字段，且只允许覆盖已存在节点的已有标量字段。
+    /// </summary>
+    public static void ApplyUserNodeOverrides(JsonObject prompt, string? rawOverrides)
+    {
+        if (string.IsNullOrWhiteSpace(rawOverrides))
+            return;
+        if (rawOverrides.Length > 400_000)
+            throw new ArgumentException("画风预设参数过长（上限 400000 字符）", nameof(rawOverrides));
+
+        JsonObject overrides;
+        try
+        {
+            overrides = JsonNode.Parse(rawOverrides) as JsonObject
+                ?? throw new ArgumentException("画风预设的 p 必须是 JSON 对象 {\"节点ID\":{\"字段\":值}}");
+        }
+        catch (JsonException ex)
+        {
+            throw new ArgumentException($"画风预设 JSON 无效: {ex.Message}");
+        }
+
+        var pending = new List<(JsonObject Inputs, string Field, JsonNode Value)>();
+        var overrideCount = 0;
+        foreach (var nodeOverride in overrides)
+        {
+            if (prompt[nodeOverride.Key] is not JsonObject targetNode)
+                throw new ArgumentException($"画风预设包含不存在的节点 #{nodeOverride.Key}");
+            if (targetNode["inputs"] is not JsonObject targetInputs)
+                throw new ArgumentException($"节点 #{nodeOverride.Key} 没有可覆盖的 inputs");
+            if (nodeOverride.Value is not JsonObject fields)
+                throw new ArgumentException($"节点 #{nodeOverride.Key} 的覆盖值必须是 JSON 对象");
+
+            foreach (var fieldOverride in fields)
+            {
+                if (++overrideCount > 64)
+                    throw new ArgumentException("画风预设最多允许 64 个字段");
+                if (IsSensitiveOverrideField(fieldOverride.Key))
+                    throw new ArgumentException($"画风预设禁止覆盖敏感字段 #{nodeOverride.Key}.{fieldOverride.Key}");
+                if (!targetInputs.TryGetPropertyValue(fieldOverride.Key, out var currentValue))
+                    throw new ArgumentException($"节点 #{nodeOverride.Key} 不存在字段 {fieldOverride.Key}");
+                if (currentValue is not JsonValue || fieldOverride.Value is not JsonValue newValue)
+                    throw new ArgumentException(
+                        $"#{nodeOverride.Key}.{fieldOverride.Key} 只允许标量值，不能修改连线、对象或数组");
+                if (!AreCompatibleScalarTypes(currentValue, newValue))
+                    throw new ArgumentException($"#{nodeOverride.Key}.{fieldOverride.Key} 的值类型不匹配");
+
+                pending.Add((targetInputs, fieldOverride.Key, newValue.DeepClone()));
+            }
+        }
+
+        foreach (var change in pending)
+            change.Inputs[change.Field] = change.Value;
+    }
+
+    /// <summary>
+    /// 按 ZML 强力 LoRA 加载器的「组名」切换画风：只启用该组内的 LoRA，关闭其余全部。
+    /// 返回新的 lora_loader_data 字符串；数据非法或找不到该组时抛可读错误。
+    /// </summary>
+    public static string EnableZmlLoraGroup(string rawData, string groupName)
+    {
+        if (string.IsNullOrWhiteSpace(rawData))
+            throw new ArgumentException("lora_loader_data 为空");
+        if (string.IsNullOrWhiteSpace(groupName))
+            throw new ArgumentException("未指定 ZML LoRA 组名");
+
+        var target = groupName.Trim();
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(rawData) as JsonObject
+                   ?? throw new FormatException("顶层不是对象");
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException($"lora_loader_data 无法解析: {ex.Message}");
+        }
+
+        if (root["entries"] is not JsonArray entries)
+            throw new ArgumentException("lora_loader_data 缺少 entries");
+
+        var groupIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var allGroups = new List<string>();
+        foreach (var item in entries.OfType<JsonObject>())
+        {
+            if (!IsZmlKind(item, "folder")) continue;
+            var name = (item["name"]?.ToString() ?? "").Trim();
+            if (name.Length == 0) continue;
+            allGroups.Add(name);
+            if (name.Equals(target, StringComparison.OrdinalIgnoreCase))
+            {
+                var id = item["id"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(id))
+                    groupIds.Add(id!);
+            }
+        }
+
+        if (groupIds.Count == 0)
+        {
+            var available = allGroups.Count > 0 ? string.Join("、", allGroups) : "(无)";
+            throw new ArgumentException($"ZML 里没有名为「{groupName}」的 LoRA 组；可用：{available}");
+        }
+
+        foreach (var item in entries.OfType<JsonObject>())
+        {
+            if (!IsZmlKind(item, "lora")) continue;
+            var parentId = item["parent_id"]?.ToString() ?? "";
+            item["enabled"] = groupIds.Contains(parentId);
+        }
+
+        return root.ToJsonString();
+    }
+
+    /// <summary>
+    /// 把画风组应用到 API prompt 里所有含 lora_loader_data 的节点（ZML 强力 LoRA 加载器）。
+    /// 返回被处理的节点数（0 = 工作流里没有该字段）。
+    /// </summary>
+    public static int ApplyZmlLoraGroup(JsonObject prompt, string groupName)
+    {
+        if (string.IsNullOrWhiteSpace(groupName))
+            return 0;
+
+        var handled = 0;
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            if (node["inputs"] is not JsonObject inputs) continue;
+            if (!inputs.TryGetPropertyValue("lora_loader_data", out var dataNode)) continue;
+            if (dataNode is not JsonValue dataValue
+                || !dataValue.TryGetValue<string>(out var raw)
+                || string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            inputs["lora_loader_data"] = EnableZmlLoraGroup(raw!, groupName);
+            handled++;
+        }
+        return handled;
+    }
+
+    /// <summary>列出 prompt 中所有 ZML 强力 LoRA 加载器里的组名（去重，保序）。</summary>
+    public static List<string> ListZmlLoraGroups(JsonObject prompt)
+    {
+        var groups = new List<string>();
+        foreach (var kv in prompt)
+        {
+            if (kv.Value is not JsonObject node) continue;
+            if (node["inputs"] is not JsonObject inputs) continue;
+            if (!inputs.TryGetPropertyValue("lora_loader_data", out var dataNode)) continue;
+            if (dataNode is not JsonValue dataValue
+                || !dataValue.TryGetValue<string>(out var raw)
+                || string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            try
+            {
+                if (JsonNode.Parse(raw!) is not JsonObject root
+                    || root["entries"] is not JsonArray entries)
+                    continue;
+
+                foreach (var item in entries.OfType<JsonObject>())
+                {
+                    if (!IsZmlKind(item, "folder")) continue;
+                    var name = (item["name"]?.ToString() ?? "").Trim();
+                    if (name.Length > 0 && !groups.Contains(name, StringComparer.OrdinalIgnoreCase))
+                        groups.Add(name);
+                }
+            }
+            catch
+            {
+                // 数据不可解析时跳过
+            }
+        }
+        return groups;
+    }
+
+    /// <summary>从 ZML lora_loader_data 原始字符串里列组名。</summary>
+    public static List<string> ListZmlLoraGroups(string? rawData)
+    {
+        var groups = new List<string>();
+        if (string.IsNullOrWhiteSpace(rawData))
+            return groups;
+        try
+        {
+            if (JsonNode.Parse(rawData) is not JsonObject root
+                || root["entries"] is not JsonArray entries)
+                return groups;
+            foreach (var item in entries.OfType<JsonObject>())
+            {
+                if (!IsZmlKind(item, "folder")) continue;
+                var name = (item["name"]?.ToString() ?? "").Trim();
+                if (name.Length > 0 && !groups.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    groups.Add(name);
+            }
+        }
+        catch
+        {
+        }
+        return groups;
+    }
+
+    static bool IsZmlKind(JsonObject item, string kind)
+        => string.Equals(item["item_type"]?.ToString(), kind, StringComparison.OrdinalIgnoreCase);
+
     static void ValidateSemanticOverrides(
         string? model, int? steps, double? cfg, string? sampler, string? scheduler,
         double? denoise, int? batch_size)

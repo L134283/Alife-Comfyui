@@ -60,6 +60,19 @@ public class ComfyuiService(
     static readonly ConcurrentDictionary<string, long> ClaimedCustomOutputs = new(StringComparer.OrdinalIgnoreCase);
 
     record WorkflowEntry(string Name, string Path, bool Enabled, string Prefix = "");
+
+    /// <summary>
+    /// 画风预设：一个工作流/模板切换多种画风。
+    /// Group = ZML 强力 LoRA 加载器的「组名」（只开该组即为一种画风，配置里只存组名，数据由插件从工作流读取）；
+    /// Params = 节点覆盖（workflow 模式）或模板输入（appmcp 模式）的 JSON 对象字符串。
+    /// </summary>
+    record StyleEntry(string Name, string Template, string Prefix, string Params, string Group = "");
+
+    // APP-MCP 模板模式：启动时缓存的模板列表（仅用于系统提示与报错提示）
+    List<AppMcpClient.AppMcpTemplate> _appMcpTemplates = new();
+    // 启动时缓存的「默认模板」明细（输入名/类型），让注入说明与 UI 提示精确到该模板
+    AppMcpClient.AppMcpTemplate? _appMcpDefaultTemplate;
+
     CharacterPromptIndex? _characterPromptIndex;
     // AnimaDex 在线角色扩充：由本地索引构建的「中文名/别名 → 英文名」「中文作品 → 英文作品」映射（键已小写去标点）
     Dictionary<string, string>? _animadexCnNameToEn;
@@ -99,33 +112,84 @@ public class ComfyuiService(
             LogWarn($"角色提示词索引加载失败: {ex.Message}");
         }
 
-        // 只向 AI 暴露名称唯一且文件存在的工作流。
-        var configuredWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows)
-            .Where(w => w.Enabled
-                        && !string.IsNullOrWhiteSpace(w.Name)
-                        && !string.IsNullOrWhiteSpace(w.Path))
-            .ToList();
+        var appMcpMode = IsAppMcpMode(cfg);
         var namedWorkflows = new List<WorkflowEntry>();
-        foreach (var group in configuredWorkflows.GroupBy(w => w.Name, StringComparer.OrdinalIgnoreCase))
+        bool hasNamedWorkflows;
+        bool supportsImageInput;
+
+        if (appMcpMode)
         {
-            if (group.Count() != 1)
+            // APP-MCP 模板模式：不读工作流，改为读取模板列表（失败不阻塞，生图时会再试）
+            hasNamedWorkflows = false;
+            supportsImageInput = false;
+            _appMcpTemplates = new List<AppMcpClient.AppMcpTemplate>();
+            var apiBase = ResolveAppMcpApiBase(cfg);
+            try
             {
-                LogWarn($"工作流名称重复，未向 AI 暴露: {group.Key}");
-                continue;
+                _appMcpTemplates = await AppMcpClient.ListTemplatesAsync(apiBase, cfg.ApiToken);
+                if (_appMcpTemplates.Count == 0)
+                    LogWarn($"APP-MCP 未返回任何模板（或未安装 ComfyUI-APP-MCP）: {apiBase}");
+                else
+                    Log($"APP-MCP 模板 {_appMcpTemplates.Count} 个: {string.Join("、", _appMcpTemplates.Select(t => t.Name))}");
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"APP-MCP 模板列表获取失败: {ex.Message}（生图时会再试；地址 {apiBase}）");
             }
 
-            var entry = group.First();
-            var resolved = ResolveSinglePath(cfg, entry.Path);
-            if (!File.Exists(resolved))
+            // 顺带取默认模板的输入明细：让注入说明与「不可用项」判定精确到该模板（失败不阻塞）
+            _appMcpDefaultTemplate = null;
+            var defaultTemplateName = (cfg.AppMcpTemplate ?? "").Trim();
+            if (defaultTemplateName.Length > 0)
             {
-                LogWarn($"命名工作流文件不存在，未向 AI 暴露: {entry.Name}");
-                continue;
+                try
+                {
+                    _appMcpDefaultTemplate = await AppMcpClient.GetTemplateAsync(
+                        apiBase, defaultTemplateName, cfg.ApiToken);
+                    if (_appMcpDefaultTemplate != null)
+                    {
+                        Log($"APP-MCP 默认模板「{defaultTemplateName}」输入: "
+                            + (_appMcpDefaultTemplate.Inputs.Count == 0
+                                ? "(无)"
+                                : string.Join("、", _appMcpDefaultTemplate.Inputs.Select(
+                                    kv => $"{kv.Key}({kv.Value.Type.ToLowerInvariant()})"))));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogWarn($"APP-MCP 默认模板读取失败（不影响生图）: {ex.Message}");
+                }
             }
-            namedWorkflows.Add(entry with { Path = resolved });
         }
-        var hasNamedWorkflows = namedWorkflows.Count > 0;
-        var workflowPaths = new[] { wf }.Concat(namedWorkflows.Select(w => w.Path));
-        var supportsImageInput = await AnyWorkflowSupportsImageInputAsync(workflowPaths);
+        else
+        {
+            // 只向 AI 暴露名称唯一且文件存在的工作流。
+            var configuredWorkflows = ParseNamedWorkflows(cfg.NamedWorkflows)
+                .Where(w => w.Enabled
+                            && !string.IsNullOrWhiteSpace(w.Name)
+                            && !string.IsNullOrWhiteSpace(w.Path))
+                .ToList();
+            foreach (var group in configuredWorkflows.GroupBy(w => w.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                if (group.Count() != 1)
+                {
+                    LogWarn($"工作流名称重复，未向 AI 暴露: {group.Key}");
+                    continue;
+                }
+
+                var entry = group.First();
+                var resolved = ResolveSinglePath(cfg, entry.Path);
+                if (!File.Exists(resolved))
+                {
+                    LogWarn($"命名工作流文件不存在，未向 AI 暴露: {entry.Name}");
+                    continue;
+                }
+                namedWorkflows.Add(entry with { Path = resolved });
+            }
+            hasNamedWorkflows = namedWorkflows.Count > 0;
+            var workflowPaths = new[] { wf }.Concat(namedWorkflows.Select(w => w.Path));
+            supportsImageInput = await AnyWorkflowSupportsImageInputAsync(workflowPaths);
+        }
 
         // UI→API widget 映射回归（FBCache fixed / KSampler seed control）；仅失败时打日志
         var mappingCheck = ComfyuiWorkflowConverter.RunWidgetMappingSelfCheck();
@@ -179,7 +243,7 @@ public class ComfyuiService(
             ? $"\n- 可选 workflow：{string.Join("、", namedWorkflows.Select(w => $"\"{w.Name}\""))}。"
             : "";
 
-        var nodeControlDesc = cfg.EnableNodeControl
+        var nodeControlDesc = cfg.EnableNodeControl && !appMcpMode
             ? "\n- 高级节点控制已开启；仅在用户明确要求时修改。需要节点信息时先调用 getcomfyuicontrols。"
             : "";
 
@@ -240,24 +304,105 @@ public class ComfyuiService(
             """;
         }
 
-        // 常时注入的硬规则：不依赖函数文档，AI 任何时候都需要（英文、质量词、方向、提示词模式、发图格式）。
+        // APP-MCP 模板模式说明（仅模板模式注入：函数文档里的 workflow/节点控制等规则已隐藏）
+        var appMcpNote = "";
+        if (appMcpMode)
+        {
+            var templateList = _appMcpTemplates.Count > 0
+                ? string.Join("、", _appMcpTemplates.Select(t =>
+                    string.IsNullOrWhiteSpace(t.Title) ? t.Name : $"{t.Name}({t.Title})"))
+                : (string.IsNullOrWhiteSpace(cfg.AppMcpTemplate) ? "（未能读取模板列表）" : cfg.AppMcpTemplate);
+            var defaultTemplate = string.IsNullOrWhiteSpace(cfg.AppMcpTemplate)
+                ? "未设置（必须由 AI 指定 template）"
+                : cfg.AppMcpTemplate;
+            var promptParam = string.IsNullOrWhiteSpace(cfg.AppMcpPromptParam) ? "positive" : cfg.AppMcpPromptParam.Trim();
+            var defaultParams = string.IsNullOrWhiteSpace(cfg.AppMcpDefaultParams) ? "{}" : cfg.AppMcpDefaultParams.Trim();
+
+            // 按「默认模板」的实际声明给出精确说明（读不到时退化为通用说明）
+            var templateDetail = "";
+            var imageLine = "- 图生图：仅当模板声明了图片输入时才支持 imagepath，未声明会被忽略（插件会记日志）。";
+            var prefixLine = cfg.AppMcpUseGlobalPrefix
+                ? "- 画风/质量：插件固定前缀会拼在 prompt 最前；若模板内部已带同类前缀可能重复，可在插件配置里关闭。"
+                : "";
+            if (_appMcpDefaultTemplate != null)
+            {
+                var declaredInputs = _appMcpDefaultTemplate.Inputs.Count == 0
+                    ? "(无输入)"
+                    : string.Join("、", _appMcpDefaultTemplate.Inputs.Select(
+                        kv => $"{kv.Key}({kv.Value.Type.ToLowerInvariant()})"));
+                templateDetail = $"\n- 默认模板已声明输入：{declaredInputs}。";
+
+                imageLine = FindTemplateImageParam(_appMcpDefaultTemplate) != null
+                    ? "- 图生图：默认模板已声明图片输入，可用 imagepath。"
+                    : ""; // 无图片输入时 imagepath 参数已隐藏，无需再解释
+
+            }
+
+            var defaultParamsLine = defaultParams == "{}"
+                ? ""
+                : $"- 模板默认参数已由插件配置：{defaultParams}（AI 可用 params 覆盖其中已声明的输入）。";
+
+            appMcpNote = $$"""
+
+            【当前后端：APP-MCP 模板模式】
+            - 调用方式：prompt 写画面（插件会自动写入模板输入「{{promptParam}}」）；用 template 选模板（不传则用默认模板）；用 params 传其它模板输入（JSON 对象，如 {"参数名": 值}）。
+            - 可用模板：{{templateList}}；默认模板：{{defaultTemplate}}。{{templateDetail}}
+            {{defaultParamsLine}}
+            - params 中只有模板已声明的输入才生效（未声明的会被忽略）；需要输入明细时调用 getcomfyuistyle。
+            {{imageLine}}
+            {{prefixLine}}
+            """;
+        }
+
+        // 画风预设：一个工作流/模板切换多种画风
+        var stylePresetList = ParseStylePresets(cfg.StylePresets);
+        var styleNames = stylePresetList.Select(s => s.Name)
+            .Where(n => !string.IsNullOrWhiteSpace(n)).ToList();
+        var styleNote = appMcpMode && styleNames.Count > 0
+            ? $"\n- 画风预设（generateimage 传 style=名称 可一键切换画风）：{string.Join("、", styleNames)}。用户指定某种画风/风格时优先使用对应预设；未命中再自写。"
+            : "";
+
+        // ===================== 系统提示词：严格按后端模式分流，禁止串味 =====================
+        // 硬规则（两模式共有）中「画风/质量的归属」与「尺寸是否可控」必须按模式区分，
+        // 否则模板模式下会出现「由固定前缀/工作流决定」「传 orientation」这类无效指令。
+        var flavorOwner = appMcpMode
+            ? "由所调用的 APP-MCP 模板自身决定（模板内通常已内置画风/质量词与 LoRA 触发词）"
+            : "由插件固定前缀或工作流决定";
+        var sizeRule = appMcpMode
+            ? (_appMcpDefaultTemplate != null && HasTemplateSizeInput(_appMcpDefaultTemplate)
+                ? "- 尺寸：模板已声明尺寸输入，可用 width/height 覆盖。"
+                : "- 尺寸：画面尺寸由模板决定，无需指定。")
+            : $"- 方向：portrait=竖版、landscape=横版、square=正方形；默认 {cfg.DefaultOrientation}，也可直接传 width/height。";
+
         var hardRules = $$"""
         【ComfyUI 生图】
         - 所有 prompt 使用英文，直接描述目标画面，不要把用户的中文命令原句塞进 prompt。
-        - 不要写画风/质量类提示词（如 masterpiece、best quality、score、style、画师名等）：画风与质量由插件固定前缀或工作流决定，AI 只写主体、动作、服装、构图、场景与氛围；用户明确指定画风/画师时例外。
-        - 方向：portrait=竖版、landscape=横版、square=正方形；默认 {{cfg.DefaultOrientation}}，也可直接传 width/height。
+        - 不要写画风/质量类提示词（如 masterpiece、best quality、score、style、画师名等）：画风与质量{{flavorOwner}}，AI 只写主体、动作、服装、构图、场景与氛围；用户明确指定画风/画师时例外。
+        {{sizeRule}}
         - 提示词模式：{{styleLabel}}。{{styleGuide}}
         - QQ 发图：<qimage type="Private/Group" targetid="QQ号或群号" image="完整路径" />（私聊 Private / 群聊 Group）。
         """;
 
-        // 详细规则：与各函数的使用时机/约束相关。显式模式直接注入（现状不变）；
+        // 后端专属规则：按模式二选一，两边互不掺入
+        // —— 工作流模式：显式声明模板参数无效，避免 AI 误传 template/templateparams
+        var workflowModeNote = """
+
+        【当前后端：工作流模式】
+        - 只走工作流：不要传 template / templateparams（那是 APP-MCP 模板模式的参数，本模式无效）。
+        """;
+
+        var backendRules = appMcpMode
+            ? appMcpNote
+            : $"{workflowModeNote}{workflowListDesc}{imageInputNote}{nodeControlDesc}";
+
+        // 详细规则：与各函数的使用时机/约束相关。显式模式直接注入；
         // 隐式模式放进 handler.Explanation，AI 调用 <comfyuiimagegeneration/> 后随文档一并加载，
         // 避免这些规则在开启隐式注入时仍常时占用 token。
         var detailedRules = $$"""
-        {{workflowListDesc}}{{imageInputNote}}{{nodeControlDesc}}{{autoOpenNote}}{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}{{modelUnloadNote}}
+        {{backendRules}}{{styleNote}}{{autoOpenNote}}{{characterLookupNote}}{{presetNote}}{{danbooruNote}}{{priorityNote}}{{modelUnloadNote}}
         """;
 
-        RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput,
+        RegisterFunctionHandlers(cfg, hasNamedWorkflows, supportsImageInput, appMcpMode,
             cfg.ImplicitInjection ? detailedRules : null);
 
         if (cfg.ImplicitInjection)
@@ -294,7 +439,7 @@ public class ComfyuiService(
 
     void RegisterFunctionHandlers(
         ComfyuiConfig cfg, bool hasNamedWorkflows, bool supportsImageInput,
-        string? explanation = null)
+        bool appMcpMode, string? explanation = null)
     {
         var discovered = new XmlHandler(this);
         var functions = discovered.Functions.ToDictionary(
@@ -313,26 +458,57 @@ public class ComfyuiService(
         if (functions.TryGetValue("generateimage", out var generateFunction))
         {
             var hiddenParameters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (!hasNamedWorkflows)
-                hiddenParameters.Add("workflow");
-            if (!supportsImageInput)
+            if (appMcpMode)
             {
-                hiddenParameters.Add("imagepath");
-                hiddenParameters.Add("denoise");
-            }
-            if (!cfg.EnableNodeControl)
-            {
+                // 模板模式：工作流/节点参数不适用，改为 template / templateparams
                 foreach (var name in new[]
                 {
-                    "model", "steps", "cfg", "sampler", "scheduler",
-                    "batch_size", "nodeoverrides"
+                    "workflow", "model", "steps", "cfg", "sampler", "scheduler",
+                    "batch_size", "nodeoverrides", "denoise"
                 })
                     hiddenParameters.Add(name);
+
+                // 按默认模板实际能力隐藏无效参数，避免 AI 看到并误传
+                if (_appMcpDefaultTemplate != null)
+                {
+                    if (FindTemplateImageParam(_appMcpDefaultTemplate) == null)
+                        hiddenParameters.Add("imagepath");
+                    if (!HasTemplateSizeInput(_appMcpDefaultTemplate))
+                    {
+                        hiddenParameters.Add("orientation");
+                        hiddenParameters.Add("width");
+                        hiddenParameters.Add("height");
+                    }
+                }
+            }
+            else
+            {
+                hiddenParameters.Add("template");
+                hiddenParameters.Add("templateparams");
+                hiddenParameters.Add("style");
+                if (!hasNamedWorkflows)
+                    hiddenParameters.Add("workflow");
+                if (!supportsImageInput)
+                {
+                    hiddenParameters.Add("imagepath");
+                    hiddenParameters.Add("denoise");
+                }
+                if (!cfg.EnableNodeControl)
+                {
+                    foreach (var name in new[]
+                    {
+                        "model", "steps", "cfg", "sampler", "scheduler",
+                        "batch_size", "nodeoverrides"
+                    })
+                        hiddenParameters.Add(name);
+                }
             }
 
-            var description = supportsImageInput
-                ? "使用 ComfyUI 生成图片；传 imagepath 时执行图生图。"
-                : "使用 ComfyUI 生成图片。";
+            var description = appMcpMode
+                ? "使用 ComfyUI-APP-MCP 模板生成图片：template 选模板（默认用配置模板），prompt 写画面，params 传模板输入（可选，含画风/LoRA 组切换参数）。"
+                : supportsImageInput
+                    ? "使用 ComfyUI 生成图片；传 imagepath 时执行图生图。"
+                    : "使用 ComfyUI 生成图片。";
             exposed.Add(CloneFunctionDocument(
                 generateFunction, description, hiddenParameters));
         }
@@ -347,7 +523,7 @@ public class ComfyuiService(
                 characterFunction, characterDesc));
         }
 
-        if (cfg.EnableNodeControl
+        if (!appMcpMode && cfg.EnableNodeControl
             && functions.TryGetValue("getcomfyuicontrols", out var controlsFunction))
         {
             var hiddenParameters = hasNamedWorkflows
@@ -411,7 +587,15 @@ public class ComfyuiService(
                 "查看或设置 ComfyUI 空闲自动卸载：距最近一次生图结束空闲超过设定时长后自动卸载模型释放显存。用户想自动释放显存时调用；不传参可查看当前设置。"));
         }
 
-        var handlerDesc = "ComfyUI 生图";
+        // 画风预设 / 模板输入明细：始终暴露，AI 按需查看
+        if (appMcpMode && functions.TryGetValue("getcomfyuistyle", out var styleFunction))
+        {
+            exposed.Add(CloneFunctionDocument(
+                styleFunction,
+                "查看画风预设列表（可用 generateimage 的 style 参数一键切换画风）；附带当前模板的输入明细。"));
+        }
+
+        var handlerDesc = appMcpMode ? "ComfyUI 生图（APP-MCP 模板模式）" : "ComfyUI 生图（工作流模式）";
         if (_characterPromptIndex != null || cfg.EnableAnimadexCharacterSearch)
             handlerDesc += "与具体二次元角色提示词检索";
         if (cfg.EnableDanbooruSearch)
@@ -460,7 +644,7 @@ public class ComfyuiService(
     [XmlFunction(FunctionMode.OneShot)]
     [Description("使用 ComfyUI 工作流生成图片（生图主入口）。正向提示词必填；其余方向/尺寸/图生图/切换工作流/采样参数等均为可选，见各参数说明。")]
     public async Task GenerateImage(
-        [Description("正向提示词，描述画面内容（固定前缀会自动拼在最前）")] string prompt,
+        [Description("正向提示词，描述画面内容（主体、动作、服装、构图、场景与氛围；画风/质量无需写）")] string prompt,
         [Description("图片方向：portrait=竖版、landscape=横版、square=正方形；实际尺寸取当前配置")] string? orientation = null,
         [Description("输入图片路径或 URL（本地路径、QQ 图片链接等）。传了则图生图，不传则为文生图")] string? imagePath = null,
         [Description("图片宽度，显式指定则覆盖 orientation")] int? width = null,
@@ -473,7 +657,10 @@ public class ComfyuiService(
         [Description("【高级】大模型文件名（如 meinamix_v11.safetensors），覆盖 CheckpointLoader 中的 ckpt_name")] string? model = null,
         [Description("降噪强度 0.0~1.0，仅图生图有效。控制原图保留程度，文生图请勿传入")] double? denoise = null,
         [Description("【高级】批次大小，覆盖 EmptyLatentImage 中的 batch_size")] int? batch_size = null,
-        [Description("【高级】安全节点覆盖，格式 {\"节点ID\":{\"参数名\":标量值}}")] string? nodeOverrides = null)
+        [Description("【高级】安全节点覆盖，格式 {\"节点ID\":{\"参数名\":标量值}}")] string? nodeOverrides = null,
+        [Description("画风预设名（配置里预设的「画风」/「风格」）。一个工作流或模板即可切换多种画风；不传则用默认画风")] string? style = null,
+        [Description("【APP-MCP 模板模式】指定模板名（不传则用配置里的默认模板）")] string? template = null,
+        [Description("【APP-MCP 模板模式】模板输入参数（JSON 对象），如 {\"参数名\": 值}；只有模板已声明的输入才会生效")] string? templateParams = null)
     {
         var cfgConfig = Configuration ?? new ComfyuiConfig();
         if (!cfgConfig.PriorityImageGen)
@@ -496,6 +683,7 @@ public class ComfyuiService(
                 await RunGenerationSafelyAsync(
                     prompt, orientation, imagePath, width, height,
                     workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
+                    style, template, templateParams,
                     priorityMode: true);
             }
             finally
@@ -510,6 +698,7 @@ public class ComfyuiService(
             _ = RunGenerationSafelyAsync(
                 prompt, orientation, imagePath, width, height,
                 workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
+                style, template, templateParams,
                 priorityMode: false);
         }
     }
@@ -1344,14 +1533,25 @@ public class ComfyuiService(
         int? width, int? height,
         string? workflow, int? steps, double? cfg, string? sampler, string? scheduler,
         string? model, double? denoise, int? batch_size, string? nodeOverrides,
+        string? style, string? template, string? templateParams,
         bool priorityMode)
     {
         try
         {
-            await GenerateImageAsync(
-                prompt, orientation, imagePath, width, height,
-                workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size,
-                nodeOverrides, priorityMode);
+            var cfgNow = Configuration ?? new ComfyuiConfig();
+            if (IsAppMcpMode(cfgNow))
+            {
+                await GenerateAppMcpAsync(
+                    prompt, orientation, imagePath, width, height,
+                    template, style, templateParams, priorityMode);
+            }
+            else
+            {
+                await GenerateImageAsync(
+                    prompt, orientation, imagePath, width, height,
+                    workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size,
+                    nodeOverrides, style, priorityMode);
+            }
         }
         catch (Exception ex)
         {
@@ -1392,7 +1592,7 @@ public class ComfyuiService(
         int? width, int? height,
         string? workflow, int? steps, double? cfg, string? sampler, string? scheduler,
         string? model, double? denoise, int? batch_size, string? nodeOverrides,
-        bool priorityMode = false)
+        string? style, bool priorityMode = false)
     {
         if (string.IsNullOrWhiteSpace(prompt))
         {
@@ -1408,8 +1608,14 @@ public class ComfyuiService(
 
         var (w, h) = ResolveResolution(orientation, width, height, cfgConfig);
 
+        // 画风预设（用户自带）：可覆盖正向前缀，并可向工作流注入节点覆盖（如 ZML LoRA 组）
+        var styleEntry = ResolveStyleOrThrow(cfgConfig, style);
+
         // 正向提示词 = 固定前缀 + AI 提示词，合并后自动去重；分隔符强制英文逗号+空格 ", "
-        var finalPositive = BuildPositivePrompt(prompt, ResolvePositivePromptPrefix(cfgConfig, workflow));
+        var effectivePrefix = !string.IsNullOrWhiteSpace(styleEntry?.Prefix)
+            ? styleEntry!.Prefix
+            : ResolvePositivePromptPrefix(cfgConfig, workflow);
+        var finalPositive = BuildPositivePrompt(prompt, effectivePrefix);
         // 固定负面：同样规范为英文逗号分隔（若配置了才覆盖工作流负面）
         var finalNegative = string.IsNullOrWhiteSpace(cfgConfig.NegativePrompt)
             ? cfgConfig.NegativePrompt
@@ -1538,6 +1744,27 @@ public class ComfyuiService(
                 string.IsNullOrWhiteSpace(cfgConfig.NegativePromptInput) ? "positive" : cfgConfig.NegativePromptInput,
                 useConfiguredNodeIds && !string.IsNullOrWhiteSpace(cfgConfig.ResolutionNodeId) ? cfgConfig.ResolutionNodeId : null,
                 isImg2Img: !string.IsNullOrWhiteSpace(uploadedImageName));
+
+            // 5.1) 画风预设（无需开启 AI 节点控制）
+            if (styleEntry != null)
+            {
+                // a) ZML LoRA 组：只开该组 = 一种画风（数据从当前工作流自身读取，配置里只存组名）
+                if (!string.IsNullOrWhiteSpace(styleEntry.Group))
+                {
+                    var touched = ComfyuiWorkflowConverter.ApplyZmlLoraGroup(apiPrompt, styleEntry.Group);
+                    if (touched == 0)
+                        LogWarn($"画风预设「{styleEntry.Name}」指定了 ZML 组「{styleEntry.Group}」，"
+                                + "但当前工作流没有 lora_loader_data 字段（已跳过）");
+                    else
+                        Log($"应用画风预设: {styleEntry.Name} → ZML 组「{styleEntry.Group}」（{touched} 个加载器）");
+                }
+                // b) 原始节点覆盖（用户自带数据，允许长字符串，如 ZML 的 lora_loader_data 整段 JSON）
+                if (!string.IsNullOrWhiteSpace(styleEntry.Params))
+                {
+                    Log($"应用画风预设节点覆盖: {styleEntry.Name}");
+                    ComfyuiWorkflowConverter.ApplyUserNodeOverrides(apiPrompt, styleEntry.Params);
+                }
+            }
 
             // denoise 始终可用；其余高级参数必须由配置开关明确授权。
             var advancedOverridesRequested = model != null || steps.HasValue || cfg.HasValue
@@ -1784,6 +2011,549 @@ public class ComfyuiService(
                 try { File.Delete(tempImageFile); } catch { }
             }
         }
+    }
+
+    // ===================== APP-MCP 模板模式 =====================
+
+    static bool IsAppMcpMode(ComfyuiConfig cfg)
+        => string.Equals(cfg.BackendMode?.Trim(), "appmcp", StringComparison.OrdinalIgnoreCase);
+
+    static string ResolveAppMcpApiBase(ComfyuiConfig cfg)
+        => AppMcpClient.ResolveApiBase(cfg.AppMcpUrl, NormalizeBaseUrl(cfg.BaseUrl));
+
+    /// <summary>解析「画风预设」列表（JSON 数组，字段间容错）。</summary>
+    static List<StyleEntry> ParseStylePresets(string? json)
+    {
+        var list = new List<StyleEntry>();
+        if (string.IsNullOrWhiteSpace(json))
+            return list;
+
+        try
+        {
+            if (JsonNode.Parse(json) is not JsonArray arr)
+                return list;
+
+            foreach (var item in arr.OfType<JsonObject>())
+            {
+                var name = WfJsonString(item, "n") ?? WfJsonString(item, "name") ?? "";
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                var template = WfJsonString(item, "t") ?? WfJsonString(item, "template") ?? "";
+                var prefix = WfJsonString(item, "f") ?? WfJsonString(item, "prefix") ?? "";
+                var group = WfJsonString(item, "g") ?? WfJsonString(item, "group") ?? "";
+
+                var paramsJson = "";
+                var pNode = item["p"] ?? item["params"];
+                if (pNode is JsonObject po)
+                    paramsJson = po.ToJsonString();
+                else if (pNode is JsonValue pv && pv.GetValueKind() == JsonValueKind.String)
+                    paramsJson = pv.GetValue<string>() ?? "";
+
+                list.Add(new StyleEntry(name.Trim(), template.Trim(), prefix, paramsJson, group.Trim()));
+            }
+        }
+        catch (Exception ex)
+        {
+            LogWarn($"画风预设解析失败（已忽略）: {ex.Message}");
+        }
+        return list;
+    }
+
+    /// <summary>按名取出画风预设；不存在时抛出可读错误（列出可用项）。</summary>
+    static StyleEntry? ResolveStyleOrThrow(ComfyuiConfig cfg, string? styleName)
+    {
+        if (string.IsNullOrWhiteSpace(styleName))
+            return null;
+
+        var styles = ParseStylePresets(cfg.StylePresets);
+        var found = styles.FirstOrDefault(s =>
+            s.Name.Equals(styleName.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (found != null)
+            return found;
+
+        var available = string.Join("、", styles.Select(s => s.Name));
+        throw new Exception(string.IsNullOrWhiteSpace(available)
+            ? $"未找到画风预设 \"{styleName}\"（当前未配置画风预设）"
+            : $"未找到画风预设 \"{styleName}\"；可用：{available}");
+    }
+
+    /// <summary>把 JSON 对象字符串合并进目标对象（同名覆盖）。非法 JSON 直接抛错，避免静默出错图。</summary>
+    static void MergeJsonObject(JsonObject target, string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        JsonObject obj;
+        try
+        {
+            obj = JsonNode.Parse(json) as JsonObject
+                  ?? throw new FormatException("必须是 JSON 对象");
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"参数 JSON 无效: {ex.Message}");
+        }
+
+        foreach (var kv in obj)
+            target[kv.Key] = kv.Value?.DeepClone();
+    }
+
+    /// <summary>决定提示词写入哪个模板输入：配置项优先，否则第一个 string/combo 输入。</summary>
+    static string ResolveTemplatePromptParam(ComfyuiConfig cfg, AppMcpClient.AppMcpTemplate tpl)
+    {
+        var configured = (cfg.AppMcpPromptParam ?? "").Trim();
+        if (configured.Length > 0 && tpl.HasInput(configured))
+            return configured;
+
+        foreach (var kv in tpl.Inputs)
+        {
+            var type = kv.Value.Type.ToUpperInvariant();
+            if (type is "STRING" or "COMBO")
+                return kv.Key;
+        }
+        return tpl.Inputs.Keys.FirstOrDefault() ?? "";
+    }
+
+    /// <summary>找到模板里最可能的图片输入（IMAGE 类型优先，其次名字含 image/图片）。</summary>
+    static string? FindTemplateImageParam(AppMcpClient.AppMcpTemplate tpl)
+    {
+        foreach (var kv in tpl.Inputs)
+        {
+            var type = kv.Value.Type.ToUpperInvariant();
+            if (type is "IMAGE" or "LOADIMAGE")
+                return kv.Key;
+        }
+        foreach (var kv in tpl.Inputs)
+        {
+            if (kv.Key.Contains("image", StringComparison.OrdinalIgnoreCase)
+                || kv.Key.Contains("图片", StringComparison.Ordinal)
+                || kv.Key.Contains("图像", StringComparison.Ordinal))
+                return kv.Key;
+        }
+        return null;
+    }
+
+    /// <summary>模板是否声明了尺寸类输入（width/height/宽/高/尺寸/分辨率等）。</summary>
+    static bool HasTemplateSizeInput(AppMcpClient.AppMcpTemplate tpl)
+    {
+        foreach (var kv in tpl.Inputs)
+        {
+            var k = kv.Key;
+            if (k.Contains("width", StringComparison.OrdinalIgnoreCase)
+                || k.Contains("height", StringComparison.OrdinalIgnoreCase)
+                || k.Contains("宽", StringComparison.Ordinal)
+                || k.Contains("高", StringComparison.Ordinal)
+                || k.Contains("尺寸", StringComparison.Ordinal)
+                || k.Contains("分辨率", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>找到模板里代表 ZML 加载器数据的输入（控件名为 lora_loader_data）。</summary>
+    static string? FindTemplateZmlDataInput(AppMcpClient.AppMcpTemplate tpl)
+    {
+        foreach (var kv in tpl.Inputs)
+        {
+            if (kv.Value.Widget.Equals("lora_loader_data", StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+        foreach (var kv in tpl.Inputs)
+        {
+            if (kv.Key.Equals("lora_loader_data", StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+        return null;
+    }
+
+    /// <summary>从模板自身携带的 workflow 里读出 ZML 的 lora_loader_data 原始字符串。</summary>
+    static string? TryReadTemplateZmlData(AppMcpClient.AppMcpTemplate tpl)
+        => AppMcpClient.ExtractZmlData(tpl.RawJson);
+
+    /// <summary>模板声明了宽/高输入时注入分辨率；否则由模板自身决定。</summary>
+    void ApplyTemplateResolution(
+        JsonObject parameters, AppMcpClient.AppMcpTemplate tpl,
+        string? orientation, int? width, int? height, ComfyuiConfig cfg)
+    {
+        var (w, h) = ResolveResolution(orientation, width, height, cfg);
+        if (w.HasValue)
+        {
+            if (tpl.HasInput("width")) parameters["width"] = w.Value;
+            if (tpl.HasInput("宽")) parameters["宽"] = w.Value;
+        }
+        if (h.HasValue)
+        {
+            if (tpl.HasInput("height")) parameters["height"] = h.Value;
+            if (tpl.HasInput("高")) parameters["高"] = h.Value;
+        }
+    }
+
+    /// <summary>组装模板输入：配置默认 → 画风预设 → AI 显式 → 提示词。只保留模板已声明的输入。</summary>
+    JsonObject BuildTemplateParams(
+        ComfyuiConfig cfg, AppMcpClient.AppMcpTemplate tpl,
+        string prompt, StyleEntry? style, string? extraParams)
+    {
+        var raw = new JsonObject();
+        MergeJsonObject(raw, cfg.AppMcpDefaultParams);
+        if (style != null && !string.IsNullOrWhiteSpace(style.Params))
+            MergeJsonObject(raw, style.Params);
+
+        // 画风预设：ZML LoRA 组 → 只开该组。数据从模板自身的工作流里取，配置里只存组名。
+        if (style != null && !string.IsNullOrWhiteSpace(style.Group))
+        {
+            var dataInput = FindTemplateZmlDataInput(tpl)
+                ?? throw new Exception(
+                    $"画风预设「{style.Name}」用 ZML 组切换，但模板未暴露 ZML 加载器的数据输入（lora_loader_data）。"
+                    + "请在 APP-MCP 的 App Builder 中把该节点的数据内容输入框标记为输入并刷新模板；"
+                    + "或改用画风预设的 p（整段 lora_loader_data）方式。");
+
+            var baseData = TryReadTemplateZmlData(tpl)
+                ?? throw new Exception(
+                    $"画风预设「{style.Name}」用 ZML 组切换，但读不到模板工作流里的 lora_loader_data，无法改组开关。");
+
+            raw[dataInput] = ComfyuiWorkflowConverter.EnableZmlLoraGroup(baseData, style.Group);
+            Log($"APP-MCP 画风预设: {style.Name} → ZML 组「{style.Group}」（写入模板输入 {dataInput}）");
+        }
+
+        MergeJsonObject(raw, extraParams);
+
+        var filtered = new JsonObject();
+        var dropped = new List<string>();
+        foreach (var kv in raw)
+        {
+            if (tpl.HasInput(kv.Key))
+                filtered[kv.Key] = kv.Value?.DeepClone();
+            else
+                dropped.Add(kv.Key);
+        }
+        if (dropped.Count > 0)
+        {
+            LogWarn($"模板未声明这些输入，已忽略: {string.Join("、", dropped)}（如需生效，"
+                    + "请在 APP-MCP App Builder 中把对应控件标记为输入，或改用 getcomfyuistyle 查看可填字段）");
+        }
+
+        var promptParam = ResolveTemplatePromptParam(cfg, tpl);
+        if (string.IsNullOrWhiteSpace(promptParam))
+            throw new Exception(
+                $"模板 \"{tpl.Name}\" 未声明任何输入，无法注入提示词；请先在 APP-MCP 的 App Builder 中把提示词节点标记为输入并命名");
+
+        // 前缀：画风预设自带的 f 优先；否则按开关决定是否叠加插件「固定正向提示词前缀」
+        // （模板若已内置同类前缀，可在配置里关闭 AppMcpUseGlobalPrefix 避免重复）
+        var stylePrefix = style?.Prefix;
+        var effectivePrefix = !string.IsNullOrWhiteSpace(stylePrefix)
+            ? stylePrefix
+            : (cfg.AppMcpUseGlobalPrefix ? cfg.PositivePromptPrefix : null);
+        filtered[promptParam] = BuildPositivePrompt(prompt, effectivePrefix);
+
+        if (!string.IsNullOrWhiteSpace(cfg.NegativePrompt))
+        {
+            var negParam = tpl.HasInput("negative") ? "negative"
+                : tpl.HasInput("负面提示词") ? "负面提示词" : null;
+            if (negParam != null)
+                filtered[negParam] = DeduplicateAndJoinPromptSegments(new[] { cfg.NegativePrompt });
+        }
+
+        return filtered;
+    }
+
+    /// <summary>下载模板返回的图片地址到本地保存目录（带图片魔数校验与大小限制）。</summary>
+    async Task<List<string>> DownloadTemplateImagesAsync(
+        IEnumerable<string> urls, string saveDir, CancellationToken ct)
+    {
+        var saved = new List<string>();
+        foreach (var url in urls)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                using var resp = await _dlHttp.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode)
+                {
+                    LogWarn($"[APP-MCP] 下载图片失败 HTTP {(int)resp.StatusCode}: {Truncate(url, 120)}");
+                    continue;
+                }
+
+                var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
+                if (bytes.Length == 0)
+                    continue;
+                if (bytes.Length > MaxInputImageBytes)
+                {
+                    LogWarn($"[APP-MCP] 图片过大，已跳过 ({bytes.Length / 1024 / 1024}MB)");
+                    continue;
+                }
+
+                string ext;
+                try
+                {
+                    ext = DetectImageExtension(bytes);
+                }
+                catch (Exception ex)
+                {
+                    LogWarn($"[APP-MCP] 非图片内容，已跳过: {ex.Message}");
+                    continue;
+                }
+
+                var path = Path.Combine(
+                    saveDir, $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext}");
+                await File.WriteAllBytesAsync(path, bytes, ct);
+                saved.Add(path);
+                Log($"[APP-MCP] 保存 ({bytes.Length / 1024.0:F0}KB) -> {Path.GetFileName(path)}");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"[APP-MCP] 下载图片异常: {ex.Message}");
+            }
+        }
+        return saved;
+    }
+
+    /// <summary>
+    /// APP-MCP 模板模式生图：选模板 → 组装模板输入 → 执行 → 下载图片。
+    /// 与工作流模式互不影响（由 BackendMode 分流）。
+    /// </summary>
+    async Task GenerateAppMcpAsync(
+        string prompt, string? orientation, string? imagePath,
+        int? width, int? height, string? templateName, string? styleName,
+        string? templateParams, bool priorityMode)
+    {
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            interactor.Poke("提示词不能为空");
+            return;
+        }
+
+        var cfg = Configuration ?? new ComfyuiConfig();
+        var apiBase = ResolveAppMcpApiBase(cfg);
+        var name = !string.IsNullOrWhiteSpace(templateName)
+            ? templateName!.Trim()
+            : (cfg.AppMcpTemplate ?? "").Trim();
+        if (name.Length == 0)
+        {
+            var hint = _appMcpTemplates.Count > 0
+                ? string.Join("、", _appMcpTemplates.Select(t => t.Name))
+                : "（未读取到模板）";
+            interactor.Poke($"APP-MCP 模板模式：请指定模板（配置里的默认模板，或 generateimage 传 template=模板名）。当前可用：{hint}");
+            return;
+        }
+
+        var saveDir = ResolveSaveDir(cfg);
+        Directory.CreateDirectory(saveDir);
+
+        var waitSeconds = Math.Clamp(cfg.AppMcpTimeoutSeconds, 30, 1800);
+        if (priorityMode)
+            waitSeconds = Math.Min(waitSeconds, Math.Clamp(cfg.PriorityMaxWaitSeconds, 30, 1800));
+
+        Interlocked.Increment(ref _activeGens);
+        Volatile.Write(ref _modelsLoadedFlag, 1);
+        Volatile.Write(ref _lastActivityUtc, DateTime.UtcNow.Ticks);
+        using var hardCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitSeconds + 60));
+        var ct = hardCts.Token;
+
+        try
+        {
+            if (priorityMode)
+                interactor.Poke($"优先生图进行中（最长约 {waitSeconds} 秒），请稍候，期间不要语音…");
+
+            var style = ResolveStyleOrThrow(cfg, styleName);
+            if (!string.IsNullOrWhiteSpace(style?.Template))
+                name = style!.Template.Trim();
+
+            Log($"{(priorityMode ? "[优先] " : "")}[APP-MCP] 模板生图: template={name} api={apiBase}");
+            var tpl = await AppMcpClient.GetTemplateAsync(apiBase, name, cfg.ApiToken, ct)
+                      ?? throw new Exception($"APP-MCP 模板不存在或已禁用: {name}");
+
+            var parameters = BuildTemplateParams(cfg, tpl, prompt, style, templateParams);
+            ApplyTemplateResolution(parameters, tpl, orientation, width, height, cfg);
+
+            // 图生图：模板声明了图片输入才上传
+            if (!string.IsNullOrWhiteSpace(imagePath))
+            {
+                var imgParam = FindTemplateImageParam(tpl);
+                if (imgParam == null)
+                {
+                    LogWarn("[APP-MCP] 模板未声明图片输入，已忽略 imagePath（按文生图执行）");
+                }
+                else
+                {
+                    var localPath = imagePath!;
+                    if (localPath.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                        || localPath.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                        || localPath.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                        localPath = await DownloadInputImageAsync(localPath, ct);
+
+                    if (!File.Exists(localPath))
+                        throw new Exception($"输入图片不存在: {imagePath}");
+
+                    var uploaded = await UploadImageToComfyUIAsync(
+                        NormalizeBaseUrl(cfg.BaseUrl), localPath, cfg, ct);
+                    parameters[imgParam] = uploaded;
+                    Log($"[APP-MCP] 已上传图片并注入模板输入 {imgParam}: {uploaded}");
+                }
+            }
+
+            var result = await AppMcpClient.ExecuteTemplateAsync(
+                apiBase, name, parameters, cfg.ApiToken, waitSeconds, ct);
+
+            if (!result.Success)
+            {
+                LogError($"[APP-MCP] 失败: {result.Error}");
+                interactor.Poke($"生图失败: {result.Error}");
+                return;
+            }
+
+            if (result.ImageUrls.Count == 0)
+            {
+                var textNote = result.Texts.Count > 0
+                    ? $"\n文本输出: {Truncate(result.Texts[0], 200)}" : "";
+                interactor.Poke($"生图完成但未找到输出图片，请检查模板的「输出」是否包含保存图片节点{textNote}");
+                return;
+            }
+
+            var saved = await DownloadTemplateImagesAsync(result.ImageUrls, saveDir, ct);
+            if (saved.Count == 0)
+            {
+                interactor.Poke("图片下载失败（模板返回了图片地址，但未能下载）");
+                return;
+            }
+
+            if (cfg.AutoOpenImage)
+            {
+                foreach (var path in saved)
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                        Log($"已打开图片: {Path.GetFileName(path)}");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWarn($"打开图片失败 {Path.GetFileName(path)}: {ex.Message}");
+                    }
+                }
+            }
+
+            interactor.Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
+        }
+        catch (OperationCanceledException)
+        {
+            LogWarn($"[APP-MCP] 生图超时（{waitSeconds}s）");
+            interactor.Poke(priorityMode
+                ? $"优先生图超时（{waitSeconds} 秒），已结束等待。可稍后重试或检查 ComfyUI；现在可以正常说话。"
+                : "生图超时，请检查 ComfyUI 是否在跑图，或增大 APP-MCP 超时秒数");
+        }
+        catch (Exception ex)
+        {
+            LogError($"[APP-MCP] 生图失败: {ex.Message}");
+            interactor.Poke($"生图失败: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeGens);
+            Volatile.Write(ref _lastActivityUtc, DateTime.UtcNow.Ticks);
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("查看可用的画风预设，以及 APP-MCP 模板模式下的模板输入明细；用于切换画风或填写模板参数")]
+    public async Task GetComfyuiStyle(
+        [Description("可选：画风预设名；传则返回该预设的完整参数，不传则列出所有画风预设")] string? name = null)
+    {
+        var cfg = Configuration ?? new ComfyuiConfig();
+        var styles = ParseStylePresets(cfg.StylePresets);
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var style = styles.FirstOrDefault(s =>
+                s.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (style == null)
+            {
+                interactor.Poke($"status: not_found\nname: {name}\n" +
+                    $"action: 画风预设不存在；可用: {string.Join("、", styles.Select(s => s.Name))}");
+                return;
+            }
+
+            var sb = new StringBuilder()
+                .AppendLine("status: found")
+                .Append("style: ").AppendLine(style.Name);
+            if (!string.IsNullOrWhiteSpace(style.Template))
+                sb.Append("template: ").AppendLine(style.Template);
+            if (!string.IsNullOrWhiteSpace(style.Prefix))
+                sb.Append("prefix: ").AppendLine(style.Prefix);
+            sb.Append("params: ").AppendLine(string.IsNullOrWhiteSpace(style.Params) ? "(空)" : style.Params);
+            sb.Append("usage: generateimage 传 style=\"").Append(style.Name).AppendLine("\" 即可套用");
+            interactor.Poke(sb.ToString());
+            return;
+        }
+
+        var output = new StringBuilder();
+        output.AppendLine("status: list");
+        output.Append("画风预设: ").AppendLine(styles.Count > 0
+            ? string.Join("、", styles.Select(s => s.Name))
+            : "(未配置)");
+
+        if (IsAppMcpMode(cfg))
+        {
+            var apiBase = ResolveAppMcpApiBase(cfg);
+            var templateName = (cfg.AppMcpTemplate ?? "").Trim();
+            output.Append("默认模板: ").AppendLine(templateName.Length > 0 ? templateName : "(未设置)");
+            if (templateName.Length > 0)
+            {
+                try
+                {
+                    var tpl = await AppMcpClient.GetTemplateAsync(apiBase, templateName, cfg.ApiToken);
+                    if (tpl != null)
+                    {
+                        output.Append("模板输入: ").AppendLine(tpl.Inputs.Count == 0
+                            ? "(无)"
+                            : string.Join("、", tpl.Inputs.Select(kv =>
+                                $"{kv.Key}({kv.Value.Type.ToLowerInvariant()}" +
+                                (string.IsNullOrWhiteSpace(kv.Value.DefaultJson)
+                                    ? ")" : $"，默认 {Truncate(kv.Value.DefaultJson, 60)})"))));
+
+                        var groups = ComfyuiWorkflowConverter.ListZmlLoraGroups(
+                            TryReadTemplateZmlData(tpl));
+                        if (groups.Count > 0)
+                            output.Append("ZML LoRA 组（可用画风）: ").AppendLine(string.Join("、", groups));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    output.Append("模板输入读取失败: ").AppendLine(ex.Message);
+                }
+            }
+        }
+        else
+        {
+            // 工作流模式：顺便列出当前工作流的 ZML LoRA 组，方便配置画风预设
+            try
+            {
+                var path = ResolveWorkflowPath(cfg);
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    var raw = await File.ReadAllTextAsync(path);
+                    var root = JsonNode.Parse(raw);
+                    if (root != null)
+                    {
+                        var groups = ComfyuiWorkflowConverter.ListZmlLoraGroups(
+                            ComfyuiWorkflowConverter.ToApiPrompt(root));
+                        output.Append("当前工作流 ZML LoRA 组（可用画风）: ").AppendLine(
+                            groups.Count > 0 ? string.Join("、", groups) : "(无)");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                output.Append("ZML LoRA 组读取失败: ").AppendLine(ex.Message);
+            }
+        }
+
+        interactor.Poke(output.ToString());
     }
 
     // ===================== 图片下载 & 上传 =====================
