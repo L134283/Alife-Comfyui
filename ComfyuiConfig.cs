@@ -58,6 +58,9 @@ public class ComfyuiConfig
     [Description("ComfyUI output 目录绝对路径（如 D:\\AI\\ComfyUI-aki-v1.6\\ComfyUI\\output）。填写后标准 SaveImage 的图片直接引用该目录，不再重复下载")]
     public string ComfyuiOutputPath { get; set; } = "";
 
+    [Description("自定义出图目录绝对路径（ZML_SaveImageV2 等自定义保存节点写出的目录）。与「ComfyUI output 目录」分开：填了哪个就去哪个目录找图直接引用，不重复下载；两者都留空才回退下载到「图片保存目录」")]
+    public string CustomOutputPath { get; set; } = "";
+
     [Description("可选：ComfyUI API 鉴权 Token（部分反代需要）")]
     public string ApiToken { get; set; } = "";
 
@@ -180,6 +183,9 @@ public class ComfyuiConfig
 
     [Description("模板默认参数（JSON 对象），例如 {\"参数名\": 值}；AI 未显式覆盖时使用。只有模板已声明的输入才会生效")]
     public string AppMcpDefaultParams { get; set; } = "{}";
+
+    [Description("模板自定义说明（自由文本）。填写后会随系统提示词一起注入给 AI，用于讲清模板各开关/参数的用法，例如：随机色色姿势玩法开关=开启后随机各种姿势；横屏开关=开启输出横屏")]
+    public string AppMcpTemplateNotes { get; set; } = "";
 
     [Description("APP-MCP 模板等待出图超时秒数（等待上限；超时后会继续轮询结果）。默认 300")]
     public int AppMcpTimeoutSeconds { get; set; } = 300;

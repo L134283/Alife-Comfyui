@@ -342,11 +342,18 @@ public class ComfyuiService(
                 ? ""
                 : $"- 模板默认参数已由插件配置：{defaultParams}（AI 可用 params 覆盖其中已声明的输入）。";
 
+            // 用户在 UI 填写的「模板自定义说明」：原样注入，供 AI 理解模板各开关/参数的用法
+            var templateNotesLine = string.IsNullOrWhiteSpace(cfg.AppMcpTemplateNotes)
+                ? ""
+                : "- 模板自定义说明（作者填写，调用模板 / 传 params 时参考）：\n"
+                  + cfg.AppMcpTemplateNotes.Trim();
+
             appMcpNote = $$"""
 
             【当前后端：APP-MCP 模板模式】
             - 调用方式：prompt 写画面（插件会自动写入模板输入「{{promptParam}}」）；用 template 选模板（不传则用默认模板）；用 params 传其它模板输入（JSON 对象，如 {"参数名": 值}）。
             - 可用模板：{{templateList}}；默认模板：{{defaultTemplate}}。{{templateDetail}}
+            {{templateNotesLine}}
             {{defaultParamsLine}}
             - params 中只有模板已声明的输入才生效（未声明的会被忽略）；需要输入明细时调用 getcomfyuistyle。
             {{imageLine}}
@@ -1790,6 +1797,10 @@ public class ComfyuiService(
 
             // 在提交前确定自定义输出目录；后续只认领本任务开始后新写入的文件。
             var customDirs = TryFindCustomSavePaths(apiPrompt);
+            // 用户在 UI 显式配置的「自定义出图目录」也纳入认领候选
+            var customCfgDir = cfgConfig.CustomOutputPath?.Trim() ?? "";
+            if (customCfgDir.Length > 0 && !customDirs.Contains(customCfgDir))
+                customDirs.Add(customCfgDir);
 
             // 5.6) 图生图：注入已上传的图片文件名到 LoadImage 节点
             if (!string.IsNullOrWhiteSpace(uploadedImageName))
@@ -1870,39 +1881,46 @@ public class ComfyuiService(
                     }
                 }
 
-                // 标准 SaveImage：如果配置了 ComfyUI output 目录，直接引用该目录下的文件
-                var comfyuiOutputDir = cfgConfig.ComfyuiOutputPath?.Trim() ?? "";
-                if (!string.IsNullOrWhiteSpace(comfyuiOutputDir))
+                // 标准 SaveImage：在「出图目录」（ComfyUI output / 自定义出图目录，填了哪个找哪个）里直接引用
+                var directDirs = new List<string>();
+                if (!string.IsNullOrWhiteSpace(cfgConfig.ComfyuiOutputPath))
+                    directDirs.Add(cfgConfig.ComfyuiOutputPath.Trim());
+                if (!string.IsNullOrWhiteSpace(cfgConfig.CustomOutputPath))
+                    directDirs.Add(cfgConfig.CustomOutputPath.Trim());
+
+                string? directPath = null;
+                foreach (var dir in directDirs)
                 {
-                    var directPath = string.IsNullOrWhiteSpace(img.Subfolder)
-                        ? Path.Combine(comfyuiOutputDir, img.Filename)
-                        : Path.Combine(comfyuiOutputDir, img.Subfolder, img.Filename);
-                    if (File.Exists(directPath))
+                    var p = string.IsNullOrWhiteSpace(img.Subfolder)
+                        ? Path.Combine(dir, img.Filename)
+                        : Path.Combine(dir, img.Subfolder, img.Filename);
+                    if (File.Exists(p)) { directPath = p; break; }
+                }
+                if (directPath != null)
+                {
+                    // ExtraSaveCopy 关闭：直接用出图目录路径，不下载不复制
+                    if (!cfgConfig.ExtraSaveCopy)
                     {
-                        // ExtraSaveCopy 关闭：直接用 ComfyUI output 路径，不下载不复制
-                        if (!cfgConfig.ExtraSaveCopy)
-                        {
-                            saved.Add(directPath);
-                            Log($"直接引用 ComfyUI output: {directPath}");
-                            continue;
-                        }
-                        // ExtraSaveCopy 开启：复制到 SaveDirectory（如果路径不同）
-                        if (!directPath.StartsWith(saveDir, StringComparison.OrdinalIgnoreCase))
-                        {
-                            var ext0 = Path.GetExtension(img.Filename);
-                            if (string.IsNullOrWhiteSpace(ext0)) ext0 = ".png";
-                            var dest0 = Path.Combine(saveDir,
-                                $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext0}");
-                            File.Copy(directPath, dest0, false);
-                            saved.Add(dest0);
-                            Log($"从 ComfyUI output 复制: {directPath} -> {dest0}");
-                            continue;
-                        }
-                        // SaveDirectory 就是 ComfyUI output 目录，直接用
                         saved.Add(directPath);
-                        Log($"SaveDirectory 即 ComfyUI output，直接引用: {directPath}");
+                        Log($"直接引用出图目录: {directPath}");
                         continue;
                     }
+                    // ExtraSaveCopy 开启：复制到 SaveDirectory（如果路径不同）
+                    if (!directPath.StartsWith(saveDir, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var ext0 = Path.GetExtension(img.Filename);
+                        if (string.IsNullOrWhiteSpace(ext0)) ext0 = ".png";
+                        var dest0 = Path.Combine(saveDir,
+                            $"comfyui_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}{ext0}");
+                        File.Copy(directPath, dest0, false);
+                        saved.Add(dest0);
+                        Log($"从出图目录复制: {directPath} -> {dest0}");
+                        continue;
+                    }
+                    // SaveDirectory 就是出图目录，直接用
+                    saved.Add(directPath);
+                    Log($"SaveDirectory 即出图目录，直接引用: {directPath}");
+                    continue;
                 }
 
                 byte[]? bytes = null;
@@ -2314,6 +2332,61 @@ public class ComfyuiService(
     }
 
     /// <summary>
+    /// 尝试把 APP-MCP 返回的 /view 图片地址解析为「候选出图目录」下的本地文件路径；
+    /// 命中时调用方可直接引用（不再下载复制），否则返回 null 表示需要下载。
+    /// 候选目录由调用方给出（ComfyUI output 目录 / 自定义出图目录），逐个尝试；
+    /// temp/input 属临时/输入文件不在出图目录，直接跳过；拒绝跨目录的 filename/subfolder。
+    /// </summary>
+    static string? TryResolveOutputPath(string url, IReadOnlyList<string> candidateDirs)
+    {
+        if (candidateDirs == null || candidateDirs.Count == 0)
+            return null;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return null;
+        if (!uri.AbsolutePath.EndsWith("/view", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        string? filename = null, subfolder = null, type = null;
+        foreach (var pair in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var eq = pair.IndexOf('=');
+            if (eq <= 0)
+                continue;
+            var key = Uri.UnescapeDataString(pair[..eq]);
+            var val = Uri.UnescapeDataString(pair[(eq + 1)..]);
+            switch (key.ToLowerInvariant())
+            {
+                case "filename": filename = val; break;
+                case "subfolder": subfolder = val; break;
+                case "type": type = val; break;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(filename))
+            return null;
+        // temp/input 是 ComfyUI 的临时/输入文件，不在出图目录；其余（output/未知）都在候选目录里找
+        if (!string.IsNullOrWhiteSpace(type)
+            && (type.Equals("temp", StringComparison.OrdinalIgnoreCase)
+                || type.Equals("input", StringComparison.OrdinalIgnoreCase)))
+            return null;
+        // 防目录穿越
+        if (filename.Contains("..") || (subfolder?.Contains("..") ?? false))
+            return null;
+
+        foreach (var dir in candidateDirs)
+        {
+            if (string.IsNullOrWhiteSpace(dir))
+                continue;
+            var path = string.IsNullOrWhiteSpace(subfolder)
+                ? Path.Combine(dir, filename)
+                : Path.Combine(dir, subfolder, filename);
+            if (File.Exists(path))
+                return path;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// APP-MCP 模板模式生图：选模板 → 组装模板输入 → 执行 → 下载图片。
     /// 与工作流模式互不影响（由 BackendMode 分流）。
     /// </summary>
@@ -2415,10 +2488,34 @@ public class ComfyuiService(
                 return;
             }
 
-            var saved = await DownloadTemplateImagesAsync(result.ImageUrls, saveDir, ct);
+            // 优先在「出图目录」里直接引用图片（电脑只留一份）；两个目录填了哪个就找哪个，都留空/找不到才下载
+            var candidateDirs = new List<string>();
+            if (!string.IsNullOrWhiteSpace(cfg.ComfyuiOutputPath))
+                candidateDirs.Add(cfg.ComfyuiOutputPath.Trim());
+            if (!string.IsNullOrWhiteSpace(cfg.CustomOutputPath))
+                candidateDirs.Add(cfg.CustomOutputPath.Trim());
+
+            var saved = new List<string>();
+            var toDownload = new List<string>();
+            foreach (var imageUrl in result.ImageUrls)
+            {
+                var directPath = TryResolveOutputPath(imageUrl, candidateDirs);
+                if (directPath != null)
+                {
+                    saved.Add(directPath);
+                    Log($"[APP-MCP] 直接引用出图目录: {Path.GetFileName(directPath)}");
+                }
+                else
+                {
+                    toDownload.Add(imageUrl);
+                }
+            }
+            if (toDownload.Count > 0)
+                saved.AddRange(await DownloadTemplateImagesAsync(toDownload, saveDir, ct));
+
             if (saved.Count == 0)
             {
-                interactor.Poke("图片下载失败（模板返回了图片地址，但未能下载）");
+                interactor.Poke("图片获取失败（模板返回了图片地址，但既无法直接引用也无法下载，请检查「ComfyUI output 目录」/「自定义出图目录」配置）");
                 return;
             }
 

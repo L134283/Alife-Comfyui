@@ -307,12 +307,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         AddInput(b, ref i, "图片保存目录（额外副本时用）", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
         AddInput(b, ref i, "ComfyUI output 目录（可选）", Configuration.ComfyuiOutputPath, v => Configuration.ComfyuiOutputPath = v);
+        AddInput(b, ref i, "自定义出图目录（可选）", Configuration.CustomOutputPath, v => Configuration.CustomOutputPath = v);
         b.CloseElement();
         b.CloseElement();
         AddHint(b, ref i,
             "地址例如 http://127.0.0.1:8188（端口不是 8188 就填你自己的）。\n"
             + "这个地址同时用于：在线状态检查、图生图上传、图片下载；开启模板模式且未填 APP-MCP 地址时，也会由它自动推导。\n"
             + "「ComfyUI output 目录」填绝对路径后，标准 SaveImage 的图片直接引用该文件，不再重复下载。\n"
+            + "「自定义出图目录」用于 ZML_SaveImageV2 等自定义保存节点写出的目录；填了它，模板模式也会去该目录直接引用图片。两个目录填其一即可，都留空才下载。\n"
             + "「API Token」只有你的 ComfyUI 藏在带鉴权的反代后面才需要，普通本地使用留空即可。");
         b.CloseElement();
 
@@ -327,7 +329,9 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         AddHint(b, ref i, Configuration.ExtraSaveCopy
             ? $"开启：出图后会把图片复制一份到「图片保存目录」（留空则用默认目录）。\n当前实际目录：{resolvedSaveDir}"
             : $"关闭：直接使用工作流/模板自带的保存路径，不额外复制。\n「图片保存目录」当前为：{resolvedSaveDir}");
-        AddHint(b, ref i, "提示：图片路径会被插件交给 AI 用于发图（QQ 环境用 qimage 标签），所以目录别设成需要权限的位置。");
+        AddHint(b, ref i,
+            "想「电脑只留一份」：在上面填「ComfyUI output 目录」或「自定义出图目录」，插件会直接引用该目录里的原图，不再复制到「图片保存目录」。\n"
+            + "图片路径会被插件交给 AI 用于发图（QQ 环境用 qimage 标签），所以目录别设成需要权限的位置。");
         b.CloseElement();
 
         if (appMcp)
@@ -668,6 +672,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 v => Configuration.AppMcpDefaultParams = v, 3);
             AddHint(b, ref i, "示例 {\"参数名\": 值}；只有模板已声明的输入才生效，AI 可用 params 覆盖。");
 
+            AddTextArea(b, ref i, "模板自定义说明（注入 AI 提示词）", Configuration.AppMcpTemplateNotes,
+                v => Configuration.AppMcpTemplateNotes = v, 5);
+            AddHint(b, ref i, "自由填写，会随系统提示词一起注入给 AI，用来讲清模板各开关/参数的用法（例如每个开关开/关分别是什么效果）。多个模板可自行按模板名分段标注。");
+
             AddInput(b, ref i, "等待出图超时（秒）", Configuration.AppMcpTimeoutSeconds.ToString(),
                 SetInt(v => Configuration.AppMcpTimeoutSeconds = Math.Clamp(v, 30, 1800)));
 
@@ -690,12 +698,19 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 b.CloseElement();
             }
             b.CloseElement();
+
+            // 画风预设 + 模型卸载：紧跟「APP-MCP 模板设置」，省得每次滑到最底
+            RenderStylePresetsSection(b, ref i);
+            RenderModelUnloadSection(b, ref i);
         }
         else
         {
             AddHint(b, ref i,
                 "原有模式：直连 ComfyUI /prompt，读取「工作流」页签里的 JSON，行为完全不变。\n"
                 + "想用「APP-MCP 模板模式」？它需要先在 ComfyUI 里安装第三方开源节点 ComfyUI-APP-MCP（免费开源）。点上面那个「APP-MCP 模板模式」按钮，本页就会出现完整安装教程、新手避坑清单与官方文档链接。");
+
+            // 工作流模式下模型卸载仍放在末尾
+            RenderModelUnloadSection(b, ref i);
         }
 
         // 模板模式的第三方节点：安装教程 + 避坑 + 文档链接（小白向，只在模板模式显示）
@@ -746,21 +761,26 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
 
-        // 画风预设只在 APP-MCP 模板模式下有意义（一个模板切换多种画风）；工作流模式不显示。
-        if (appMcp)
-        {
-            AddSection(b, ref i, "画风预设（一个模板切换多种画风）");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            AddTextArea(b, ref i, "画风预设（JSON 数组）", Configuration.StylePresets,
-                v => Configuration.StylePresets = v, 8);
-            AddHint(b, ref i,
-                "最简用法：只写 ZML 组名 —— [{\"n\":\"示例组名\",\"g\":\"示例组名\"}]（只开该组即一种画风，数据由插件从当前模板读取）。\n"
-                + "精细用法：可选 \"t\" 模板名、\"f\" 附加前缀、\"p\" 模板输入（如 {\"lora_loader_data\":\"……\"}）。\n"
-                + "AI 在 generateimage 里传 style=\"画风名\" 切换；它也能用 getcomfyuistyle 查看可用的 ZML 组名。");
-            b.CloseElement();
-        }
+    }
 
+    /// <summary>画风预设区块（仅 APP-MCP 模板模式显示）。</summary>
+    void RenderStylePresetsSection(RenderTreeBuilder b, ref int i)
+    {
+        AddSection(b, ref i, "画风预设（一个模板切换多种画风）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-panel");
+        AddTextArea(b, ref i, "画风预设（JSON 数组）", Configuration.StylePresets,
+            v => Configuration.StylePresets = v, 8);
+        AddHint(b, ref i,
+            "最简用法：只写 ZML 组名 —— [{\"n\":\"示例组名\",\"g\":\"示例组名\"}]（只开该组即一种画风，数据由插件从当前模板读取）。\n"
+            + "精细用法：可选 \"t\" 模板名、\"f\" 附加前缀、\"p\" 模板输入（如 {\"lora_loader_data\":\"……\"}）。\n"
+            + "AI 在 generateimage 里传 style=\"画风名\" 切换；它也能用 getcomfyuistyle 查看可用的 ZML 组名。");
+        b.CloseElement();
+    }
+
+    /// <summary>模型卸载与显存释放区块（两种后端模式共用）。</summary>
+    void RenderModelUnloadSection(RenderTreeBuilder b, ref int i)
+    {
         AddSection(b, ref i, "模型卸载与显存释放");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-panel");
