@@ -11,7 +11,7 @@
 - **固定负面提示词**：可选；填写则覆盖工作流负面并规范为英文逗号分隔
 - **多工作流**：可配置多个命名工作流，AI 通过 `workflow` 参数切换；每个工作流可独立设置固定提示词前缀
 - **角色提示词检索**：内置 8906 个角色的中文/英文/别名索引，支持错字、部分名称与作品名消歧
-- **在线角色检索扩充（可选，默认关）**：本地索引未收录或仍歧义时，`findcharacterprompt` 自动联网查 AnimaDex 在线角色库（约 3.6 万角色）；本地命中/消歧仍优先，失败自动回纯本地
+- **在线角色检索扩充（可选，默认关）**：本地索引未收录或仍歧义时，`findcharacterprompt` 自动联网查在线角色库；数据源默认 **DanbooruSearch 国内镜像**（0.3~1.5s、支持中文角色名，与在线标签检索同一服务），也可选 Danbooru 官方 API / AnimaDex / 自动回退；本地命中/消歧仍优先，失败自动回纯本地
 - **提示词预设**：可保存常用提示词片段（角色人设/动作/背景），AI 按需调用 `getpromptpreset` 检索复用；数据存于 `Storage/Config/Alife.Plugin.Comfyui/`，**插件更新不会清空**
 - **在线标签检索（可选，默认关）**：自然语言 → 标准 Danbooru 标签（`searchdanboorutags`）、关联标签、可选画师推荐；多源故障转移
 - **隐式注入（4.0 新特性，UI 可切换）**：默认显式注入（函数文档直接进系统提示词）；开启隐式注入后文档不直接注入，AI 先调用 `<comfyuiimagegeneration/>` 按需加载（省 token，渐进式）
@@ -41,7 +41,9 @@
 
 例如"雷姆穿哥特萝莉服"：保留雷姆的 `trigger_tags_xml` 和 `appearance_tags_xml`，舍弃默认女仆装，追加哥特萝莉服、当前动作、构图与场景。这样角色身份稳定，但服装和画面仍可自由变化。
 
-若本地未收录该角色（返回 `status: not_found`）、或带作品名仍歧义，可在插件 UI 开启「在线角色检索扩充」：`findcharacterprompt` 会自动联网查 AnimaDex 在线角色库（约 3.6 万角色），返回 `source: animadex` 的 trigger 与特征标签（无默认服装段，换装需自写）。本地命中/消歧仍优先，不影响离线质量。
+若本地未收录该角色（返回 `status: not_found`）、或带作品名仍歧义，可在插件 UI 开启「在线角色检索扩充」：`findcharacterprompt` 会自动联网查在线角色库，返回 `source: mirror`（默认）/`source: danbooru`/`source: animadex` 的 trigger、外貌与默认服装标签。
+
+数据源默认是 **DanbooruSearch 国内镜像**（约 0.3~1.5s，与「在线标签检索」同一个服务）：它自带中文角色名与 wiki，所以**中文名也能直接查**——例如「薇薇安」→ `vivian_banshee`（作品《绝区零》）、「酒寄彩葉」→ `sakayori_iroha`（《超辉夜姬！》）。也可切到 Danbooru 官方 API（国内常 20s 超时，需自建反代）或 AnimaDex，或选「自动」按 镜像 → 官方 → AnimaDex 回退。本地命中/消歧仍优先，不影响离线质量。
 
 - 中文常用名、英文 Danbooru Tag 和当前两个词库可验证的别名都会参与搜索
 - 无当前来源佐证的旧译名不进入运行时索引；已验证别名的权重仍低于规范名
@@ -70,7 +72,7 @@
 | **工作流** | 默认工作流路径 + 目录扫描、自动识别节点、节点映射（正向/负面/分辨率/LoadImage）、多工作流卡片 |
 | **后端 · 画风** | 生图后端切换（工作流 / APP-MCP 模板）、APP-MCP 设置与连通测试、画风预设、模型卸载与显存释放 |
 | **提示词** | 提示词种类、固定正向前缀、固定负面、提示词预设卡片 |
-| **检索** | 在线 Danbooru 标签检索（含画师推荐、双源、超时、SFW/NSFW）、AnimaDex 在线角色检索 |
+| **检索** | 在线 Danbooru 标签检索（含画师推荐、双源、超时、SFW/NSFW）、在线角色检索（国内镜像 / Danbooru 官方 / AnimaDex 可选，镜像支持中文名） |
 | **高级** | AI 节点控制、隐式注入、工作流节点概览 |
 
 说明：
@@ -254,7 +256,7 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 | 提示词种类（tag / natural / hybrid） | 三档模式规则，两模式同一套 |
 | 提示词预设 | `savepromptpreset` / `getpromptpreset` |
 | 画风预设 `style` | `g`（ZML 组名）两模式都支持；`p` 语义不同：工作流=节点覆盖，模板=模板输入 |
-| 角色检索 `findcharacterprompt` | 含 AnimaDex 在线扩充 |
+| 角色检索 `findcharacterprompt` | 含在线扩充（Danbooru / AnimaDex） |
 | 在线 Danbooru 标签检索 / 画师推荐 | 两模式同一套 |
 | 图片落盘：保存目录 / 额外副本 / ComfyUI output 目录 / 自定义出图目录 / 自动打开 | — |
 | 优先生图 + 硬超时 | 模板模式取 `min(APP-MCP 超时, 硬超时)` |
@@ -354,19 +356,31 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 
 | 配置 | 建议 | 说明 |
 |------|------|------|
-| **优先生图** `PriorityImageGen` | **开** | 生图请求开始后阻塞到出图结束，同轮不会先 Speak 抢 GPU |
+| **优先生图（语音避让）** `PriorityImageGen` | **开** | AI 调用 `generateimage` 后先排队，等本轮语音播完再提交 ComfyUI；出图期间下一轮消息会等待 |
 | 默认 | 关 | 纯生图 / 边聊边画用户保持异步 |
+
+为什么不是在生图函数里直接阻塞：Alife 5.x 的 `<speak>` 是**并行内容函数**，而且 AI 通常把说话标签写在生图标签前面——函数内阻塞只能挡住「生图之后」的语音，挡不住已经开始合成/播放的 TTS。排队到本轮结束（`ChatCalledAsync`）才可靠，此时语音已播完，Comfy 不会和 TTS 抢 GPU。
 
 策略对齐（个人用法示例）：
 
 1. 平时以说话为优先  
-2. **一旦开始生图** → 等图完成再允许桌宠说话（靠本插件「优先生图」）  
-3. 图完后正常说话；若 TTS 一直出不来，语音侧可能 soft interrupt / 结束 Comfy 进程腾 GPU  
+2. AI 先说话 → 说话结束后插件自动开始生图（靠本插件「优先生图」）  
+3. 图完后下一轮正常说话；若 TTS 一直出不来，语音侧可能 soft interrupt / 结束 Comfy 进程腾 GPU  
 4. 能正常说话则两者互不打扰  
 
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v5.0.0（2026-11-02）
+
+- **修复「优先生图」在 Alife 5.x 失效**：`<speak>` 是并行内容函数，AI 又习惯先说话后生图，旧实现（在 `generateimage` 内阻塞）挡不住已经开始的 TTS 合成/播放。现改为**语音避让**——生图请求先排队，等本轮函数与语音收尾（`XmlFunctionCaller.ChatCalledAsync`）后再提交 ComfyUI，出图期间下一轮消息等待，语义与旧版一致且真正不与 TTS 抢 GPU
+- **新增 Danbooru 在线角色库（AnimaDex 的替代）**：AnimaDex 在部分地区无法直连后，在线角色检索改为联网查 Danbooru 体系；一次查询约 2 个请求（名字搜索 + 特征标签），带 10 分钟缓存与 soft-fail
+- **默认走国内镜像**：Danbooru 官方 API 在国内实测 19~21s 甚至直接超时，因此默认改用 **DanbooruSearch 镜像**（与「在线标签检索」同一服务，0.3~1.5s），且镜像返回自带 `cn_name` 与 wiki——**中文角色名可直接检索**（「薇薇安」→ `vivian_banshee`、《绝区零》；「酒寄彩葉」→ `sakayori_iroha`、《超辉夜姬！》），中文作品名同样能带出
+- **数据源可选**：UI「检索」页新增 `镜像 / Danbooru 官方 / 自动 / AnimaDex` 下拉；镜像与官方各自可配地址、超时、最少图片数（过滤冷门/背景角色），并有独立连通测试；`auto` 按 镜像 → 官方 → AnimaDex 依次回退
+- **在线角色特征更完整**：返回 trigger、外貌、默认服装三段；标签自动做下划线→空格、发色/瞳色冲突去重、表情/构图/NSFW 过滤；角色标签无作品限定符时自动补一次 copyright，减少画错作品
+- **本地角色库扩充**：`character-prompts.json` 从 8906 条扩充至新增近一年热门角色（Danbooru `created_at` 过滤 + 热度排序，按现有库分类器拆分外貌/服装），生成脚本见开发目录 `gen_new_characters.py`
+- 适配 Alife 5.2.1 客户端；全量源码编译 0 错误
 
 ### v4.5.1（2026-09-19）
 

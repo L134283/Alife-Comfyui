@@ -71,12 +71,14 @@ public class ComfyuiConfig
     public bool AutoOpenImage { get; set; } = false;
 
     /// <summary>
-    /// 优先生图：GenerateImage 会阻塞到出图结束（或超时）才返回，
-    /// 避免同轮对话里桌宠先 TTS 说话、与 Comfy 抢 GPU 导致卡死无声。
+    /// 优先生图（语音避让）：生图请求先排队，等本轮对话的语音播报结束后再提交 ComfyUI，
+    /// 出图期间占用对话（下一轮消息会等出图完成），避免本地 TTS 与 Comfy 同时抢 GPU 导致卡死无声。
+    /// 之所以不在函数内直接阻塞：Alife 5.x 的 Speak 是并行内容函数，AI 的说话标签通常排在生图标签之前，
+    /// 在函数里阻塞只能挡住「生图之后」的语音，挡不住已经开始的合成/播放；推迟到本轮结束才可靠。
     /// 默认关（纯生图用户不受影响）；与本地 TTS 同机时建议开启。
-    /// 本插件不依赖任何语音插件。
+    /// 本插件不依赖任何语音插件（不引用语音程序集，靠框架「本轮结束」时机保证语音已收尾）。
     /// </summary>
-    [Description("优先生图：生图请求开始后阻塞到出图结束再返回（期间勿语音）。同机有本地 TTS 时建议开；纯生图可关。超时自动结束")]
+    [Description("优先生图（语音避让）：生图请求排队，等本轮语音播完后再提交；出图期间下一轮消息会等待，避免 TTS 与 Comfy 抢 GPU。同机本地 TTS 建议开；纯生图可关。超时自动结束")]
     public bool PriorityImageGen { get; set; } = false;
 
     /// <summary>
@@ -145,12 +147,30 @@ public class ComfyuiConfig
     [Description("在线检索是否返回/优先 NSFW 标签。默认关，使用 SFW 结果")]
     public bool DanbooruSearchShowNsfw { get; set; } = false;
 
-    // ---------- 在线角色检索扩充（AnimaDex，默认关，保持零外网） ----------
+    // ---------- 在线角色检索扩充（默认关，保持零外网） ----------
 
-    [Description("启用在线角色检索扩充：本地角色索引（character-prompts.json）未命中或带作品名仍歧义时，自动联网查 AnimaDex 在线角色库（约 3.6 万角色）。仅扩充不替换：本地命中/歧义处理仍优先")]
+    [Description("启用在线角色检索扩充：本地角色索引（character-prompts.json）未命中或带作品名仍歧义时，自动联网查在线角色库。仅扩充不替换：本地命中/歧义处理仍优先")]
     public bool EnableAnimadexCharacterSearch { get; set; } = false;
 
-    [Description("AnimaDex 在线角色库服务地址。默认官方站点（大陆直连通常约 1s）；可填本地自建地址")]
+    [Description("在线角色库数据源：mirror=DanbooruSearch 国内镜像（推荐，约 0.3~1.5s，自带中文角色名）；danbooru=Danbooru 官方 API（国内常超时，可填反代）；animadex=AnimaDex（部分网络无法直连）；auto=先镜像，失败依次试官方/AnimaDex")]
+    public string CharacterLookupProvider { get; set; } = "mirror";
+
+    [Description("DanbooruSearch 镜像地址（角色检索主源）。默认 https://sakizuki-danboorusearchonline.ms.show，与在线标签检索同一服务；可填自建/备用域名")]
+    public string CharacterMirrorUrl { get; set; } = "https://sakizuki-danboorusearchonline.ms.show";
+
+    [Description("镜像角色查询超时秒数（通常 0.3~1.5s）。失败会自动降级，不阻塞生图")]
+    public int CharacterMirrorTimeoutSeconds { get; set; } = 12;
+
+    [Description("Danbooru 角色库 API 地址（仅数据源选 danbooru/auto 时使用）。默认 https://danbooru.donmai.us；国内常连不上，可填自建反向代理")]
+    public string DanbooruCharacterBaseUrl { get; set; } = "https://danbooru.donmai.us";
+
+    [Description("单次 Danbooru 角色查询超时秒数（一次查询约 2 个请求）。失败会自动降级回纯本地行为，不阻塞生图")]
+    public int DanbooruCharacterTimeoutSeconds { get; set; } = 15;
+
+    [Description("Danbooru 角色检索最少图片数：热度低于该值的角色不返回（过滤背景角色/同人原创）。默认 100")]
+    public int DanbooruCharacterMinPosts { get; set; } = 100;
+
+    [Description("AnimaDex 在线角色库服务地址。默认官方站点（部分网络无法直连）；可填自建地址")]
     public string AnimadexBaseUrl { get; set; } = "https://animadex.net";
 
     [Description("单次 AnimaDex 在线查询超时秒数。失败会自动降级回纯本地行为，不阻塞生图")]

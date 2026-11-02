@@ -52,6 +52,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     string? _animadexTestMessage;
     bool _animadexTesting;
 
+    // 在线角色检索（Danbooru）连通测试
+    string? _booruCharTestMessage;
+    bool _booruCharTesting;
+
+    // 在线角色检索（DanbooruSearch 镜像）连通测试
+    string? _mirrorCharTestMessage;
+    bool _mirrorCharTesting;
+
     // 模型卸载与空闲自动释放
     bool _unloadingModel;
     string? _unloadMessage;
@@ -394,7 +402,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(i++, "class", "cu-panel");
         AddCheck(b, ref i, "生完图自动用系统默认图片查看器打开（仅桌面端）", Configuration.AutoOpenImage,
             v => Configuration.AutoOpenImage = v);
-        AddCheck(b, ref i, "优先生图：生图开始后等图完再返回（同机本地 TTS 建议开）", Configuration.PriorityImageGen,
+        AddCheck(b, ref i, "优先生图（语音避让）：本轮语音播完后再提交生图（同机本地 TTS 建议开）", Configuration.PriorityImageGen,
             v => Configuration.PriorityImageGen = v);
         if (Configuration.PriorityImageGen)
         {
@@ -402,7 +410,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 SetInt(v => Configuration.PriorityMaxWaitSeconds = Math.Clamp(v, 30, 1800)));
             AddHint(b, ref i, "实际等待 = min(等待出图超时, 本上限)，超时强制结束避免卡死对话。");
         }
-        AddHint(b, ref i, "本插件不依赖任何语音插件；优先生图只是避免同机 TTS 与 Comfy 抢 GPU。");
+        AddHint(b, ref i,
+            "开启后：AI 调用 generateimage 时先排队，等本轮 <speak> 的语音合成/播放结束再提交 ComfyUI，出图期间下一轮消息会等待；"
+            + "这样 TTS 与 Comfy 不会同时抢 GPU。\n"
+            + "为什么不在函数里直接阻塞：Alife 5.x 的 Speak 是并行内容函数，而 AI 通常先说话后生图，函数内阻塞挡不住已经开始播放的语音。\n"
+            + "本插件不依赖任何语音插件（不引用语音程序集，靠框架「本轮结束」时机保证语音已收尾）。");
         b.CloseElement();
     }
 
@@ -1011,46 +1023,145 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         }
         b.CloseElement();
 
-        AddSection(b, ref i, "在线角色检索扩充（AnimaDex）");
+        AddSection(b, ref i, "在线角色检索扩充");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-panel");
-        AddCheck(b, ref i, "启用 AnimaDex 在线角色检索", Configuration.EnableAnimadexCharacterSearch,
+        AddCheck(b, ref i, "启用在线角色检索（本地未命中时联网补查）", Configuration.EnableAnimadexCharacterSearch,
             v => Configuration.EnableAnimadexCharacterSearch = v);
-        AddHint(b, ref i, "仅作本地索引补充：本地未命中、或带作品名仍歧义时联网查约 3.6 万角色。本地命中仍优先，默认关=零外网。");
+        AddHint(b, ref i, "仅作本地索引补充：本地未命中、或带作品名仍歧义时联网查在线角色库。本地命中仍优先，默认关=零外网。");
 
         if (Configuration.EnableAnimadexCharacterSearch)
         {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-grid2");
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "服务地址", Configuration.AnimadexBaseUrl, v => Configuration.AnimadexBaseUrl = v);
-            AddHint(b, ref i, "默认 animadex.net（大陆直连通常约 1s）。");
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(),
-                SetInt(v => Configuration.AnimadexTimeoutSeconds = Math.Clamp(v, 5, 60)));
-            b.CloseElement();
-            b.CloseElement();
+            var provider = (Configuration.CharacterLookupProvider ?? "").Trim().ToLowerInvariant();
+            if (provider is not ("mirror" or "danbooru" or "auto" or "animadex"))
+                provider = "mirror";
+            AddSelect(b, ref i, "数据源", provider,
+                v => Configuration.CharacterLookupProvider = v,
+                new[]
+                {
+                    ("mirror", "DanbooruSearch 国内镜像（推荐：0.3~1.5s，支持中文角色名）"),
+                    ("danbooru", "Danbooru 官方 API（国内常超时，需代理/反代）"),
+                    ("auto", "自动：镜像 → 官方 → AnimaDex 依次回退"),
+                    ("animadex", "AnimaDex（部分网络无法直连）")
+                });
 
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-row");
-            b.AddAttribute(i++, "style", "margin-top:10px;");
-            b.OpenElement(i++, "button");
-            b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cu-btn");
-            b.AddAttribute(i++, "disabled", _animadexTesting);
-            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAnimadexConnectivity));
-            b.AddContent(i++, _animadexTesting ? "测试中…" : "测试连通");
-            b.CloseElement();
-            b.CloseElement();
-            if (!string.IsNullOrWhiteSpace(_animadexTestMessage))
+            var useMirror = provider is "mirror" or "auto";
+            var useBooru = provider is "danbooru" or "auto";
+            var useAnimadex = provider is "animadex" or "auto";
+
+            if (useMirror)
             {
                 b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-detect");
-                b.AddContent(i++, _animadexTestMessage);
+                b.AddAttribute(i++, "class", "cu-grid2");
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "镜像地址", Configuration.CharacterMirrorUrl, v => Configuration.CharacterMirrorUrl = v);
+                AddHint(b, ref i, "默认与「在线标签检索」同一个 DanbooruSearch 服务（国内可直连）。");
                 b.CloseElement();
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "超时秒数", Configuration.CharacterMirrorTimeoutSeconds.ToString(),
+                    SetInt(v => Configuration.CharacterMirrorTimeoutSeconds = Math.Clamp(v, 3, 60)));
+                AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
+                    SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
+                b.CloseElement();
+                b.CloseElement();
+
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-row");
+                b.AddAttribute(i++, "style", "margin-top:10px;");
+                b.OpenElement(i++, "button");
+                b.AddAttribute(i++, "type", "button");
+                b.AddAttribute(i++, "class", "cu-btn");
+                b.AddAttribute(i++, "disabled", _mirrorCharTesting);
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestMirrorCharacterConnectivity));
+                b.AddContent(i++, _mirrorCharTesting ? "测试中…" : "测试镜像连通");
+                b.CloseElement();
+                b.CloseElement();
+                if (!string.IsNullOrWhiteSpace(_mirrorCharTestMessage))
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-detect");
+                    b.AddContent(i++, _mirrorCharTestMessage);
+                    b.CloseElement();
+                }
+                AddHint(b, ref i,
+                    "镜像返回带中文角色名与作品名，中文查询可直接命中（如「薇薇安」「酒寄彩葉」）；"
+                    + "同时给出英文 trigger / 外貌 / 默认服装，10 分钟缓存。");
             }
-            AddHint(b, ref i, "AnimaDex 不支持中文检索：中文角色名本地未收录时会提示改用英文/罗马字。");
+
+            if (useBooru)
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-grid2");
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "Danbooru API 地址", Configuration.DanbooruCharacterBaseUrl,
+                    v => Configuration.DanbooruCharacterBaseUrl = v);
+                AddHint(b, ref i, "默认 https://danbooru.donmai.us。连不上可填自建反向代理；不要填网页版路径。");
+                b.CloseElement();
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "超时秒数", Configuration.DanbooruCharacterTimeoutSeconds.ToString(),
+                    SetInt(v => Configuration.DanbooruCharacterTimeoutSeconds = Math.Clamp(v, 5, 60)));
+                AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
+                    SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
+                b.CloseElement();
+                b.CloseElement();
+
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-row");
+                b.AddAttribute(i++, "style", "margin-top:10px;");
+                b.OpenElement(i++, "button");
+                b.AddAttribute(i++, "type", "button");
+                b.AddAttribute(i++, "class", "cu-btn");
+                b.AddAttribute(i++, "disabled", _booruCharTesting);
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestBooruCharacterConnectivity));
+                b.AddContent(i++, _booruCharTesting ? "测试中…" : "测试 Danbooru 连通");
+                b.CloseElement();
+                b.CloseElement();
+                if (!string.IsNullOrWhiteSpace(_booruCharTestMessage))
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-detect");
+                    b.AddContent(i++, _booruCharTestMessage);
+                    b.CloseElement();
+                }
+                AddHint(b, ref i,
+                    "Danbooru 数据实时更新，新番/新游角色基本都能查到；返回 source: danbooru 时会带外貌与默认服装。\n"
+                    + "单次查询约 2 个请求（名字搜索 + 特征标签），有 10 分钟缓存；不支持中文角色名，中文会先查本地库。");
+            }
+
+            if (useAnimadex)
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-grid2");
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "AnimaDex 服务地址", Configuration.AnimadexBaseUrl, v => Configuration.AnimadexBaseUrl = v);
+                AddHint(b, ref i, "默认 animadex.net。部分地区/网络无法直连时会超时，建议改用 Danbooru。");
+                b.CloseElement();
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(),
+                    SetInt(v => Configuration.AnimadexTimeoutSeconds = Math.Clamp(v, 5, 60)));
+                b.CloseElement();
+                b.CloseElement();
+
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-row");
+                b.AddAttribute(i++, "style", "margin-top:10px;");
+                b.OpenElement(i++, "button");
+                b.AddAttribute(i++, "type", "button");
+                b.AddAttribute(i++, "class", "cu-btn");
+                b.AddAttribute(i++, "disabled", _animadexTesting);
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAnimadexConnectivity));
+                b.AddContent(i++, _animadexTesting ? "测试中…" : "测试 AnimaDex 连通");
+                b.CloseElement();
+                b.CloseElement();
+                if (!string.IsNullOrWhiteSpace(_animadexTestMessage))
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-detect");
+                    b.AddContent(i++, _animadexTestMessage);
+                    b.CloseElement();
+                }
+                AddHint(b, ref i, "AnimaDex 不支持中文检索：中文角色名本地未收录时会提示改用英文/罗马字。");
+            }
         }
         b.CloseElement();
     }
@@ -1457,6 +1568,66 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         finally
         {
             _danbooruTesting = false;
+            StateHasChanged();
+        }
+    }
+
+    async Task TestMirrorCharacterConnectivity()
+    {
+        if (_mirrorCharTesting) return;
+        _mirrorCharTesting = true;
+        _mirrorCharTestMessage = "探测中…";
+        StateHasChanged();
+        try
+        {
+            var baseUrl = Configuration.CharacterMirrorUrl?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                _mirrorCharTestMessage = "未填写镜像地址";
+            }
+            else
+            {
+                var (ok, msg, ms) = await MirrorCharacterClient.HealthAsync(baseUrl, 20);
+                _mirrorCharTestMessage = $"{(ok ? "OK" : "FAIL")} {ms}ms — {msg}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _mirrorCharTestMessage = "测试异常: " + ex.Message;
+        }
+        finally
+        {
+            _mirrorCharTesting = false;
+            StateHasChanged();
+        }
+    }
+
+    async Task TestBooruCharacterConnectivity()
+    {
+        if (_booruCharTesting) return;
+        _booruCharTesting = true;
+        _booruCharTestMessage = "探测中…";
+        StateHasChanged();
+        try
+        {
+            var baseUrl = Configuration.DanbooruCharacterBaseUrl?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                _booruCharTestMessage = "未填写 API 地址";
+            }
+            else
+            {
+                var (ok, msg, ms) = await BooruCharacterClient.HealthAsync(baseUrl, 20);
+                _booruCharTestMessage = $"{(ok ? "OK" : "FAIL")} {ms}ms — {msg}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _booruCharTestMessage = "测试异常: " + ex.Message;
+        }
+        finally
+        {
+            _booruCharTesting = false;
             StateHasChanged();
         }
     }

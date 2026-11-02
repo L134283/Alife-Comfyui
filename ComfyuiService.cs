@@ -85,6 +85,32 @@ public class ComfyuiService(
     CancellationTokenSource? _unloadLoopCts;
     Task? _unloadLoopTask;
 
+    // 优先生图（语音避让）：本轮内先排队，等 ChatCalledAsync（函数与语音都收尾）再提交 ComfyUI。
+    // 用实例字段而非 static：每个角色各自一份，互不串扰。
+    readonly object _pendingGenLock = new();
+    readonly List<PendingGeneration> _pendingGenerations = new();
+    bool _runningPendingGenerations;
+
+    /// <summary>一次被推迟到本轮结束的生图请求（字段与 GenerateImage 参数一一对应）。</summary>
+    record PendingGeneration(
+        string Prompt,
+        string? Orientation,
+        string? ImagePath,
+        int? Width,
+        int? Height,
+        string? Workflow,
+        int? Steps,
+        double? Cfg,
+        string? Sampler,
+        string? Scheduler,
+        string? Model,
+        double? Denoise,
+        int? BatchSize,
+        string? NodeOverrides,
+        string? Style,
+        string? Template,
+        string? TemplateParams);
+
     record PromptPresetEntry(string Name, string Content);
 
     protected override async Task OnAwake()
@@ -230,7 +256,7 @@ public class ComfyuiService(
             var hardCap = Math.Clamp(cfg.PriorityMaxWaitSeconds, 30, 1800);
             priorityNote = $"""
 
-            【优先生图】调用 generateimage 后等待结果再继续；等待期间不要调用语音功能。最长约 {hardCap} 秒。
+            【优先生图】generateimage 会先排队，等本轮说话（语音）结束后自动提交；不要重复调用，也不要给该标签加 #parallel/#background，出图后插件会主动把图发给你。最长约 {hardCap} 秒。
             """;
         }
 
@@ -256,7 +282,7 @@ public class ComfyuiService(
             ? "\n【角色检索】\n"
               + "- findcharacterprompt 只认 status: matched；ambiguous 返回候选时带作品名重查，禁止直接猜 tag；组合时保持 &amp; 等转义原文。\n"
               + (cfg.EnableAnimadexCharacterSearch
-                  ? "- 已开在线扩充：本地未收录时该函数会自动联网查 AnimaDex；返回 source: animadex 时无默认服装段，服装按请求自写；在线查询失败会自动回到纯本地提示。\n"
+                  ? "- 已开在线扩充：本地未收录时该函数会自动联网查在线角色库（默认 DanbooruSearch 镜像，支持中文名；也可配 Danbooru / AnimaDex）；返回 source: mirror/danbooru/animadex，服装段缺失时按请求自写；在线查询失败会自动回到纯本地提示。\n"
                   : "")
             : "";
 
@@ -419,11 +445,18 @@ public class ComfyuiService(
 
         // 空闲自动卸载后台循环（热重载/销毁时随 OnDestroy 取消）
         StartUnloadLoop();
+
+        // 优先生图（语音避让）：本轮所有函数/语音结束后统一提交排队中的生图
+        functionService.ChatCalledAsync -= OnChatCalledAsync;
+        functionService.ChatCalledAsync += OnChatCalledAsync;
     }
 
     /// <summary>热重载/活动销毁时注销本模块注册的 XmlHandler，避免旧 handler 残留在函数表中。</summary>
     protected override Task OnDestroy()
     {
+        functionService.ChatCalledAsync -= OnChatCalledAsync;
+        lock (_pendingGenLock)
+            _pendingGenerations.Clear();
         if (_registeredHandler != null)
         {
             functionService.UnregisterHandler(_registeredHandler);
@@ -674,30 +707,17 @@ public class ComfyuiService(
             LogWarn($"优先生图未生效：运行时 PriorityImageGen=false（Configuration={(Configuration is null ? "null" : "已注入")}）。请确认 UI 已开启并保存（注意区分「应用到角色/应用到全局」，角色级旧配置会覆盖全局新值），必要时重启活动。");
         if (cfgConfig.PriorityImageGen)
         {
-            // 阻塞到出图结束：同轮 Speak 等函数返回后再执行，避免 TTS 与 Comfy 抢 GPU
-            Log("优先生图：等待出图完成后再返回…");
-            bool entered = false;
-            try
+            // 语音避让：AI 的 <speak> 通常排在 <generateimage> 之前，且 Speak 是并行内容函数，
+            // 在函数里阻塞只能挡住「生图之后」的语音，挡不住已经开始的 TTS 合成/播放。
+            // 因此这里只排队，等本轮所有函数与语音收尾（ChatCalledAsync）后再提交，此时 TTS 已播完，不会抢 GPU。
+            lock (_pendingGenLock)
             {
-                // 若已有任务在跑，短等；超时则拒绝，避免对话永久挂起
-                entered = await PriorityGate.WaitAsync(TimeSpan.FromSeconds(3));
-                if (!entered)
-                {
-                    interactor.Poke("已有生图任务进行中，请稍后再试（优先生图模式不叠任务）");
-                    return;
-                }
-
-                await RunGenerationSafelyAsync(
+                _pendingGenerations.Add(new PendingGeneration(
                     prompt, orientation, imagePath, width, height,
                     workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
-                    style, template, templateParams,
-                    priorityMode: true);
+                    style, template, templateParams));
             }
-            finally
-            {
-                if (entered)
-                    PriorityGate.Release();
-            }
+            Log("优先生图（语音避让）：已排队，等本轮语音播完后再提交 ComfyUI…");
         }
         else
         {
@@ -707,6 +727,65 @@ public class ComfyuiService(
                 workflow, steps, cfg, sampler, scheduler, model, denoise, batch_size, nodeOverrides,
                 style, template, templateParams,
                 priorityMode: false);
+        }
+    }
+
+    /// <summary>
+    /// 优先生图的真正提交点：本轮所有 Xml 函数执行完、语音播报也收尾后触发。
+    /// 依次执行排队中的请求（串行），期间 chatSemaphore 仍被框架持有——下一轮消息会等到出图完成，与旧行为一致。
+    /// </summary>
+    async Task OnChatCalledAsync()
+    {
+        PendingGeneration[] batch;
+        lock (_pendingGenLock)
+        {
+            if (_runningPendingGenerations || _pendingGenerations.Count == 0)
+                return;
+            _runningPendingGenerations = true;
+            batch = _pendingGenerations.ToArray();
+            _pendingGenerations.Clear();
+        }
+
+        try
+        {
+            // 语音 Closing 已在 EndFeeding 前等过播放结束；留一小段时间给音频设备收尾，避免最后一段与 Comfy 加载模型重叠
+            await Task.Delay(300);
+
+            foreach (var req in batch)
+            {
+                var entered = false;
+                try
+                {
+                    entered = await PriorityGate.WaitAsync(TimeSpan.FromSeconds(3));
+                    if (!entered)
+                    {
+                        interactor.Poke("已有生图任务进行中，请稍后再试（优先生图模式不叠任务）");
+                        return;
+                    }
+
+                    await RunGenerationSafelyAsync(
+                        req.Prompt, req.Orientation, req.ImagePath, req.Width, req.Height,
+                        req.Workflow, req.Steps, req.Cfg, req.Sampler, req.Scheduler, req.Model,
+                        req.Denoise, req.BatchSize, req.NodeOverrides,
+                        req.Style, req.Template, req.TemplateParams,
+                        priorityMode: true);
+                }
+                finally
+                {
+                    if (entered)
+                        PriorityGate.Release();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError($"优先生图（排队提交）失败: {ex.Message}");
+            interactor.Poke($"生图失败: {ex.Message}");
+        }
+        finally
+        {
+            lock (_pendingGenLock)
+                _runningPendingGenerations = false;
         }
     }
 
@@ -910,8 +989,14 @@ public class ComfyuiService(
         [Description("可选作品名；同名角色或短名称时建议填写")] string? work = null)
     {
         var cfg = Configuration ?? new ComfyuiConfig();
-        var onlineEnabled = cfg.EnableAnimadexCharacterSearch
-            && !string.IsNullOrWhiteSpace(cfg.AnimadexBaseUrl);
+        var provider = NormalizeCharacterProvider(cfg.CharacterLookupProvider);
+        var onlineEnabled = cfg.EnableAnimadexCharacterSearch && provider switch
+        {
+            "animadex" => !string.IsNullOrWhiteSpace(cfg.AnimadexBaseUrl),
+            "auto" => true,
+            "danbooru" => !string.IsNullOrWhiteSpace(cfg.DanbooruCharacterBaseUrl),
+            _ => !string.IsNullOrWhiteSpace(cfg.CharacterMirrorUrl)
+        };
 
         // 本地检索（优先）：中文/别名/错字消歧质量高且离线
         IReadOnlyList<CharacterPromptMatch> localMatches = Array.Empty<CharacterPromptMatch>();
@@ -951,7 +1036,7 @@ public class ComfyuiService(
         // 在线扩充（默认关）：本地无命中，或带 work 仍歧义
         if (onlineEnabled)
         {
-            var onlineText = await TryAnimadexLookupAsync(cfg, name, work);
+            var onlineText = await TryOnlineCharacterLookupAsync(cfg, name, work);
             if (onlineText != null)
             {
                 interactor.Poke(onlineText);
@@ -968,7 +1053,172 @@ public class ComfyuiService(
         interactor.Poke("status: not_found\nquery: " + name
              + (string.IsNullOrWhiteSpace(work) ? "" : $"\nwork: {work}")
              + "\naction: 不要编造角色 Tag；检查角色名或作品名后再查询"
-             + (onlineEnabled ? "；在线库也未命中，可尝试英文/罗马字角色名与作品名（AnimaDex 不支持中文检索）" : ""));
+             + (onlineEnabled ? "；在线库也未命中，可尝试英文/罗马字角色名与作品名（镜像支持中文，官方/AnimaDex 只支持英文）" : ""));
+    }
+
+    /// <summary>数据源归一化：未知值按 mirror 处理（国内直连、自带中文名，体验最好）。</summary>
+    static string NormalizeCharacterProvider(string? provider)
+    {
+        return (provider ?? "").Trim().ToLowerInvariant() switch
+        {
+            "animadex" => "animadex",
+            "auto" => "auto",
+            "mirror" => "mirror",
+            "danbooru" => "danbooru",
+            _ => "mirror"
+        };
+    }
+
+    /// <summary>
+    /// 在线角色检索分派：默认 DanbooruSearch 国内镜像（0.3~1.5s，自带中文名）；
+    /// danbooru 只查官方 API；animadex 只查 AnimaDex；auto 按 镜像 → 官方 → AnimaDex 依次回退。
+    /// </summary>
+    async Task<string?> TryOnlineCharacterLookupAsync(ComfyuiConfig cfg, string name, string? work)
+    {
+        var provider = NormalizeCharacterProvider(cfg.CharacterLookupProvider);
+        var tried = new List<string>();
+
+        if (provider is "mirror" or "auto")
+        {
+            var text = await TryMirrorLookupAsync(cfg, name, work);
+            if (text != null)
+                return text;
+            if (provider == "mirror")
+                return null;
+            tried.Add("镜像");
+        }
+
+        if (provider is "danbooru" or "auto")
+        {
+            var text = await TryBooruLookupAsync(cfg, name, work);
+            if (text != null)
+                return text;
+            if (provider == "danbooru")
+                return null;
+            tried.Add("官方");
+        }
+
+        return await TryAnimadexLookupAsync(cfg, name, work);
+    }
+
+    /// <summary>
+    /// DanbooruSearch 镜像角色检索（国内直连，支持中文查询）。
+    /// 返回可 Poke 文本；null 表示未能给出结果（服务不可用或未找到），由调用方走原本地提示。
+    /// </summary>
+    async Task<string?> TryMirrorLookupAsync(ComfyuiConfig cfg, string name, string? work)
+    {
+        // 镜像自带中文检索层，中文名不必先转英文
+        var res = await MirrorCharacterClient.SearchCharactersAsync(
+            name, work,
+            string.IsNullOrWhiteSpace(cfg.CharacterMirrorUrl)
+                ? MirrorCharacterClient.DefaultBaseUrl
+                : cfg.CharacterMirrorUrl.Trim(),
+            cfg.CharacterMirrorTimeoutSeconds,
+            cfg.DanbooruCharacterMinPosts);
+
+        if (res.Unavailable)
+        {
+            LogWarn($"镜像角色检索不可用({name}): {res.Error}");
+            return null;
+        }
+        if (res.Matches.Count == 0)
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(work) && !res.WorkMatched)
+        {
+            Log($"角色检索(镜像): {name} 名称命中但作品「{work}」下未收录，判定未找到");
+            return null;
+        }
+
+        var hit = res.Matches[0];
+        var appearance = string.IsNullOrWhiteSpace(hit.Appearance)
+            ? "（按角色名自写标准特征）"
+            : hit.Appearance;
+        var outfit = string.IsNullOrWhiteSpace(hit.Outfit)
+            ? "（在线库未给出服装，按请求自写）"
+            : hit.Outfit;
+        var others = res.Matches.Count > 1
+            ? "\n其他候选: " + string.Join("；", res.Matches.Skip(1).Take(5)
+                .Select(m => $"{m.Name} [{m.Tag}] ({m.Count} 图)"))
+            : "";
+
+        var sb = new StringBuilder()
+            .AppendLine("status: matched")
+            .AppendLine("source: mirror")
+            .Append("character: ").Append(hit.Name)
+            .Append(" [").Append(hit.Tag).Append("] | 作品: ")
+            .AppendLine(string.IsNullOrWhiteSpace(hit.Copyright) ? "-" : hit.Copyright)
+            .Append("images: ").AppendLine(hit.Count.ToString("N0", System.Globalization.CultureInfo.InvariantCulture))
+            .Append("trigger_tags_xml: ").AppendLine(XmlSafe(hit.Trigger))
+            .Append("appearance_tags_xml: ").AppendLine(XmlSafe(appearance))
+            .Append("default_outfit_tags_xml: ").AppendLine(XmlSafe(outfit))
+            .AppendLine("usage: 必须保留 trigger 与外貌 Tag；服装可沿用默认服装段，或按请求替换；动作、构图和场景自由组合")
+            .Append(others);
+        Log($"角色检索(镜像): {name} -> {hit.Tag}（{hit.Name}，{hit.Count} 图）");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Danbooru 在线角色库查询。返回可 Poke 文本；null 表示未能给出结果（服务不可用或未找到），由调用方走原本地提示。
+    /// </summary>
+    async Task<string?> TryBooruLookupAsync(ComfyuiConfig cfg, string name, string? work)
+    {
+        var enName = ResolveEnCandidate(name, _animadexCnNameToEn);
+        if (string.IsNullOrEmpty(enName))
+            return null;
+        var enWork = string.IsNullOrWhiteSpace(work)
+            ? null
+            : ResolveEnCandidate(work, _animadexCnWorkToEn);
+
+        var res = await BooruCharacterClient.SearchCharactersAsync(
+            enName, enWork,
+            string.IsNullOrWhiteSpace(cfg.DanbooruCharacterBaseUrl)
+                ? BooruCharacterClient.DefaultBaseUrl
+                : cfg.DanbooruCharacterBaseUrl.Trim(),
+            cfg.DanbooruCharacterTimeoutSeconds,
+            cfg.DanbooruCharacterMinPosts);
+
+        if (res.Unavailable)
+        {
+            LogWarn($"Danbooru 在线角色检索不可用({enName}): {res.Error}");
+            return null;
+        }
+        if (res.Matches.Count == 0)
+            return null;
+
+        // 明确给了作品名，但结果里没有一个角色属于该作品：判定为该作品下未收录，避免拿同名异作品角色冒充
+        if (!string.IsNullOrEmpty(enWork) && !res.WorkMatched)
+        {
+            Log($"角色检索(在线 Danbooru): {name} 名称命中但作品「{enWork}」下未收录，判定未找到");
+            return null;
+        }
+
+        var hit = res.Matches[0];
+        var appearance = string.IsNullOrWhiteSpace(hit.Appearance)
+            ? "（按角色名自写标准特征）"
+            : hit.Appearance;
+        var outfit = string.IsNullOrWhiteSpace(hit.Outfit)
+            ? "（在线库未给出服装，按请求自写）"
+            : hit.Outfit;
+        var others = res.Matches.Count > 1
+            ? "\n其他候选: " + string.Join("；", res.Matches.Skip(1).Take(5)
+                .Select(m => $"{m.Name} [{m.Tag}] ({m.Count} 图)"))
+            : "";
+
+        var sb = new StringBuilder()
+            .AppendLine("status: matched")
+            .AppendLine("source: danbooru")
+            .Append("character: ").Append(hit.Name)
+            .Append(" [").Append(hit.Tag).Append("] | 作品: ")
+            .AppendLine(string.IsNullOrWhiteSpace(hit.Copyright) ? "-" : hit.Copyright.Replace('_', ' '))
+            .Append("images: ").AppendLine(hit.Count.ToString("N0", System.Globalization.CultureInfo.InvariantCulture))
+            .Append("trigger_tags_xml: ").AppendLine(XmlSafe(hit.Trigger))
+            .Append("appearance_tags_xml: ").AppendLine(XmlSafe(appearance))
+            .Append("default_outfit_tags_xml: ").AppendLine(XmlSafe(outfit))
+            .AppendLine("usage: 必须保留 trigger 与外貌 Tag；服装可沿用默认服装段，或按请求替换；动作、构图和场景自由组合")
+            .Append(others);
+        Log($"角色检索(在线 Danbooru): {name} -> {hit.Tag} ({hit.Count} 图)");
+        return sb.ToString();
     }
 
     void PokeLocalMatched(string name, CharacterPromptMatch best)
@@ -1013,7 +1263,9 @@ public class ComfyuiService(
 
         var res = await AnimadexClient.SearchCharactersAsync(
             enName, enWork,
-            cfg.AnimadexBaseUrl?.Trim() ?? AnimadexClient.DefaultBaseUrl,
+            string.IsNullOrWhiteSpace(cfg.AnimadexBaseUrl)
+                ? AnimadexClient.DefaultBaseUrl
+                : cfg.AnimadexBaseUrl.Trim(),
             cfg.AnimadexTimeoutSeconds);
 
         if (res.Unavailable)
@@ -1650,7 +1902,7 @@ public class ComfyuiService(
         try
         {
             if (priorityMode)
-                interactor.Poke($"优先生图进行中（最长约 {pollTimeoutSec} 秒），请稍候，期间不要语音…");
+                interactor.Poke($"优先生图进行中（最长约 {pollTimeoutSec} 秒）：语音已结束，正在使用 GPU 生图…");
             Log($"{(priorityMode ? "[优先] " : "")}开始生图: {Truncate(finalPositive, 80)}");
             if (w.HasValue || h.HasValue)
                 Log($"分辨率: {w ?? 0}x{h ?? 0}");
@@ -2431,7 +2683,7 @@ public class ComfyuiService(
         try
         {
             if (priorityMode)
-                interactor.Poke($"优先生图进行中（最长约 {waitSeconds} 秒），请稍候，期间不要语音…");
+                interactor.Poke($"优先生图进行中（最长约 {waitSeconds} 秒）：语音已结束，正在使用 GPU 生图…");
 
             var style = ResolveStyleOrThrow(cfg, styleName);
             if (!string.IsNullOrWhiteSpace(style?.Template))
