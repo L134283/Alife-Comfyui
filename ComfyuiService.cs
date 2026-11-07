@@ -11,7 +11,6 @@ using System.Security;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
@@ -32,10 +31,42 @@ public class ComfyuiService(
     ConfigurationSystem configurationSystem
 ) : ChatBehaviour, IConfigurable<ComfyuiConfig>
 {
-    static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(10) };
+    // 超时统一由各调用点的 CancellationTokenSource 控制（生图/轮询/探测各有自己的预算）；
+    // 这里设无限，避免 10 分钟兜底把长任务（如 30 分钟的自定义超时）提前掐断并被误报成网络错误。
+    static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
 
     // 图片下载专用客户端（复用 UniversalImageGen 模式，60s 超时）
     static readonly HttpClient _dlHttp = new() { Timeout = TimeSpan.FromSeconds(60) };
+
+    // ---------- 工作流 / object_info 缓存 ----------
+    // 工作流 JSON：按「路径 + 修改时间 + 大小」缓存解析结果。转换前 ToApiPrompt 会 DeepClone，不会污染缓存。
+    sealed record WorkflowCacheEntry(DateTime MtimeUtc, long Length, JsonNode Root, bool IsApi);
+    static readonly ConcurrentDictionary<string, WorkflowCacheEntry> _workflowCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // object_info：ComfyUI 节点定义（常达数 MB），按地址缓存，默认 5 分钟
+    static readonly ConcurrentDictionary<string, (DateTime FetchedUtc, JsonObject Info)> _objectInfoCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    static readonly TimeSpan ObjectInfoTtl = TimeSpan.FromMinutes(5);
+
+    /// <summary>读取工作流（命中缓存则不重复读盘/解析）。返回值只读，请勿原地修改。</summary>
+    static async Task<(JsonNode Root, bool IsApi)> LoadWorkflowCachedAsync(
+        string path, CancellationToken ct)
+    {
+        var fi = new FileInfo(path);
+        var mtime = fi.LastWriteTimeUtc;
+        var length = fi.Length;
+
+        if (_workflowCache.TryGetValue(path, out var cached)
+            && cached.MtimeUtc == mtime && cached.Length == length)
+            return (cached.Root, cached.IsApi);
+
+        var raw = await File.ReadAllTextAsync(path, ct);
+        var root = JsonNode.Parse(raw) ?? throw new Exception("工作流 JSON 解析失败");
+        var isApi = ComfyuiWorkflowConverter.IsApiFormat(root);
+        _workflowCache[path] = new WorkflowCacheEntry(mtime, length, root, isApi);
+        return (root, isApi);
+    }
     const int MaxInputImageBytes = 20 * 1024 * 1024; // 20MB
     static readonly HashSet<string> AllowedImageContentTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -873,7 +904,8 @@ public class ComfyuiService(
             req.Content = new StringContent(
                 "{\"unload_models\": true, \"free_memory\": true}",
                 Encoding.UTF8, "application/json");
-            using var resp = await Http.SendAsync(req);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            using var resp = await Http.SendAsync(req, cts.Token);
             if (!resp.IsSuccessStatusCode)
             {
                 var raw = await resp.Content.ReadAsStringAsync();
@@ -1445,7 +1477,10 @@ public class ComfyuiService(
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            LogWarn($"创建用户数据目录失败: {ex.Message}");
+        }
         return dir;
     }
 
@@ -1489,7 +1524,10 @@ public class ComfyuiService(
             if (!string.IsNullOrWhiteSpace(loc))
                 asmDir = Path.GetDirectoryName(loc);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            LogWarn($"读取程序集目录失败: {ex.Message}");
+        }
 
         if (!string.IsNullOrWhiteSpace(asmDir))
             yield return Path.Combine(asmDir, "prompt-presets.json");
@@ -1747,8 +1785,7 @@ public class ComfyuiService(
             if (string.IsNullOrWhiteSpace(workflowPath) || !File.Exists(workflowPath))
                 throw new FileNotFoundException("工作流文件不存在", workflowPath);
 
-            var raw = await File.ReadAllTextAsync(workflowPath);
-            var root = JsonNode.Parse(raw) ?? throw new InvalidDataException("工作流 JSON 为空");
+            var (root, _) = await LoadWorkflowCachedAsync(workflowPath, CancellationToken.None);
             var prompt = ComfyuiWorkflowConverter.ToApiPrompt(root);
             var label = string.IsNullOrWhiteSpace(workflow) ? "默认工作流" : workflow.Trim();
             interactor.Poke($"workflow: {label}\n{ComfyuiWorkflowConverter.BuildNodeControlDescription(prompt)}");
@@ -1767,8 +1804,9 @@ public class ComfyuiService(
             var cfg = Configuration ?? new ComfyuiConfig();
             var baseUrl = NormalizeBaseUrl(cfg.BaseUrl);
             using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/system_stats", cfg);
-            using var resp = await Http.SendAsync(req);
-            var raw = await resp.Content.ReadAsStringAsync();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var resp = await Http.SendAsync(req, cts.Token);
+            var raw = await resp.Content.ReadAsStringAsync(cts.Token);
             if (!resp.IsSuccessStatusCode)
             {
                 interactor.Poke($"ComfyUI 不可用 (HTTP {(int)resp.StatusCode})");
@@ -1830,10 +1868,8 @@ public class ComfyuiService(
 
             try
             {
-                var raw = await File.ReadAllTextAsync(path);
-                var root = JsonNode.Parse(raw);
-                if (root == null)
-                    continue;
+                // 走同一份缓存：启动自检与生图不重复读盘/解析
+                var (root, _) = await LoadWorkflowCachedAsync(path, CancellationToken.None);
                 var prompt = ComfyuiWorkflowConverter.ToApiPrompt(root);
                 if (ComfyuiWorkflowConverter.FindLoadImageNodeId(prompt) != null)
                     return true;
@@ -1870,15 +1906,13 @@ public class ComfyuiService(
         // 画风预设（用户自带）：可覆盖正向前缀，并可向工作流注入节点覆盖（如 ZML LoRA 组）
         var styleEntry = ResolveStyleOrThrow(cfgConfig, style);
 
-        // 正向提示词 = 固定前缀 + AI 提示词，合并后自动去重；分隔符强制英文逗号+空格 ", "
+        // 正向提示词 = 固定前缀 + AI 提示词，内容原样透传（不去重、不改写）
         var effectivePrefix = !string.IsNullOrWhiteSpace(styleEntry?.Prefix)
             ? styleEntry!.Prefix
             : ResolvePositivePromptPrefix(cfgConfig, workflow);
         var finalPositive = BuildPositivePrompt(prompt, effectivePrefix);
-        // 固定负面：同样规范为英文逗号分隔（若配置了才覆盖工作流负面）
-        var finalNegative = string.IsNullOrWhiteSpace(cfgConfig.NegativePrompt)
-            ? cfgConfig.NegativePrompt
-            : DeduplicateAndJoinPromptSegments(new[] { cfgConfig.NegativePrompt });
+        // 固定负面：原样透传（若配置了才覆盖工作流负面）
+        var finalNegative = cfgConfig.NegativePrompt;
 
         // 图生图：临时图片文件路径（用完清理）
         string? tempImageFile = null;
@@ -1962,13 +1996,12 @@ public class ComfyuiService(
             if (!string.IsNullOrWhiteSpace(workflow))
                 Log($"切换工作流: {workflow} -> {Path.GetFileName(workflowPath)}");
 
-            var rawJson = await File.ReadAllTextAsync(workflowPath, ct);
-            var root = JsonNode.Parse(rawJson)
-                ?? throw new Exception("工作流 JSON 解析失败");
+            // 工作流解析结果按 mtime 缓存，重复生图不再读盘/重解析
+            var (root, isApiWorkflow) = await LoadWorkflowCachedAsync(workflowPath, ct);
 
             // 3) UI 工作流才需要 object_info 辅助转换；API 格式直接使用。
             JsonObject? objectInfo = null;
-            if (!ComfyuiWorkflowConverter.IsApiFormat(root))
+            if (!isApiWorkflow)
             {
                 try
                 {
@@ -1987,7 +2020,7 @@ public class ComfyuiService(
             // 4) 转 API（有 object_info 时做 required/combo 轻量校验，错误更可读）
             var apiPrompt = ComfyuiWorkflowConverter.ToApiPrompt(
                 root, objectInfo, validate: objectInfo != null);
-            Log($"工作流节点数: {apiPrompt.Count} ({(ComfyuiWorkflowConverter.IsApiFormat(root) ? "API格式" : "UI转API")})");
+            Log($"工作流节点数: {apiPrompt.Count} ({(isApiWorkflow ? "API格式" : "UI转API")})");
 
             // 5) 注入基本参数（原有简单模式不变）
             ComfyuiWorkflowConverter.ApplyRuntimeOverrides(
@@ -2233,24 +2266,8 @@ public class ComfyuiService(
                 return;
             }
 
-            // 桌面端自动打开图片
-            if (cfgConfig.AutoOpenImage)
-            {
-                foreach (var path in saved)
-                {
-                    try
-                    {
-                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-                        Log($"已打开图片: {Path.GetFileName(path)}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogWarn($"打开图片失败 {Path.GetFileName(path)}: {ex.Message}");
-                    }
-                }
-            }
-
-            interactor.Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
+            OpenSavedImages(saved, cfgConfig);
+            AnnounceSavedImages(saved);
         }
         catch (OperationCanceledException)
         {
@@ -2521,7 +2538,7 @@ public class ComfyuiService(
             var negParam = tpl.HasInput("negative") ? "negative"
                 : tpl.HasInput("负面提示词") ? "负面提示词" : null;
             if (negParam != null)
-                filtered[negParam] = DeduplicateAndJoinPromptSegments(new[] { cfg.NegativePrompt });
+                filtered[negParam] = cfg.NegativePrompt;
         }
 
         return filtered;
@@ -2582,6 +2599,30 @@ public class ComfyuiService(
         }
         return saved;
     }
+
+    /// <summary>按配置用系统默认查看器打开生成结果（桌面端）。</summary>
+    void OpenSavedImages(IReadOnlyList<string> saved, ComfyuiConfig cfg)
+    {
+        if (!cfg.AutoOpenImage)
+            return;
+
+        foreach (var path in saved)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                Log($"已打开图片: {Path.GetFileName(path)}");
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"打开图片失败 {Path.GetFileName(path)}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>统一的出图结果提示（工作流 / 模板两条路径共用）。</summary>
+    void AnnounceSavedImages(IReadOnlyList<string> saved)
+        => interactor.Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
 
     /// <summary>
     /// 尝试把 APP-MCP 返回的 /view 图片地址解析为「候选出图目录」下的本地文件路径；
@@ -2771,23 +2812,8 @@ public class ComfyuiService(
                 return;
             }
 
-            if (cfg.AutoOpenImage)
-            {
-                foreach (var path in saved)
-                {
-                    try
-                    {
-                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-                        Log($"已打开图片: {Path.GetFileName(path)}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogWarn($"打开图片失败 {Path.GetFileName(path)}: {ex.Message}");
-                    }
-                }
-            }
-
-            interactor.Poke($"图片已生成（{saved.Count} 张）\n{string.Join("\n", saved)}");
+            OpenSavedImages(saved, cfg);
+            AnnounceSavedImages(saved);
         }
         catch (OperationCanceledException)
         {
@@ -3035,11 +3061,19 @@ public class ComfyuiService(
     async Task<JsonObject?> FetchObjectInfoAsync(
         string baseUrl, ComfyuiConfig cfg, CancellationToken ct)
     {
+        // 节点定义很少变、体积又大（常数 MB）：5 分钟内复用上次结果
+        if (_objectInfoCache.TryGetValue(baseUrl, out var cached)
+            && DateTime.UtcNow - cached.FetchedUtc < ObjectInfoTtl)
+            return cached.Info;
+
         using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/object_info", cfg);
         using var resp = await Http.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
         var raw = await resp.Content.ReadAsStringAsync(ct);
-        return JsonNode.Parse(raw) as JsonObject;
+        var info = JsonNode.Parse(raw) as JsonObject;
+        if (info != null)
+            _objectInfoCache[baseUrl] = (DateTime.UtcNow, info);
+        return info;
     }
 
     async Task<string> QueuePromptAsync(
@@ -3148,6 +3182,7 @@ public class ComfyuiService(
         CancellationToken cancellationToken = default)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var badStatusLogged = false;
         while (sw.Elapsed < timeout)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -3155,7 +3190,20 @@ public class ComfyuiService(
             using var req = CreateRequest(HttpMethod.Get, $"{baseUrl}/history/{promptId}", cfg);
             using var resp = await Http.SendAsync(req, cancellationToken);
             var raw = await resp.Content.ReadAsStringAsync(cancellationToken);
-            if (resp.IsSuccessStatusCode)
+            if (!resp.IsSuccessStatusCode)
+            {
+                var code = (int)resp.StatusCode;
+                // 鉴权失败 / 路由不存在属于配置错误：继续轮询只会白等到超时
+                if (code is 401 or 403 or 404)
+                    throw new Exception(
+                        $"查询 history 失败 (HTTP {code})：请确认 ComfyUI 地址 {baseUrl} 正确、API Token 有效");
+                if (!badStatusLogged)
+                {
+                    badStatusLogged = true;
+                    LogWarn($"history 返回 HTTP {code}，继续等待…");
+                }
+            }
+            else
             {
                 var node = JsonNode.Parse(raw);
                 if (node is JsonObject obj && obj.ContainsKey(promptId))
@@ -3284,7 +3332,10 @@ public class ComfyuiService(
                     if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
                         resolved = dir;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    LogWarn($"解析出图目录失败: {ex.Message}");
+                }
             }
 
             if (resolved != null && !dirs.Contains(resolved, StringComparer.OrdinalIgnoreCase))
@@ -3425,146 +3476,20 @@ public class ComfyuiService(
     }
 
     /// <summary>
-    /// 拼接固定正向提示词前缀，并与 AI 提示词合并去重。
-    /// 最终格式：segment, segment, segment（仅英文逗号 ","，且逗号后一个空格）。
-    /// 前缀片段优先保留；AI 侧与前缀/自身重复的 tag 或短句会被去掉。
-    /// 无前缀时也会对 AI 提示词自身做去重与格式规范化。
+    /// 拼接固定正向提示词前缀与 AI 提示词，原样透传（不去重、不改写内容）。
+    /// 只有前缀非空时才用 ", " 连接；两者皆空返回空串。
     /// </summary>
     static string BuildPositivePrompt(string prompt, string? prefix)
     {
-        var chunks = new List<string>(2);
-        if (!string.IsNullOrWhiteSpace(prefix))
-            chunks.Add(prefix);
-        if (!string.IsNullOrWhiteSpace(prompt))
-            chunks.Add(prompt);
+        var body = prompt ?? "";
+        if (string.IsNullOrWhiteSpace(prefix))
+            return body;
 
-        if (chunks.Count == 0)
-            return "";
+        var head = prefix!.Trim();
+        if (string.IsNullOrWhiteSpace(body))
+            return head;
 
-        return DeduplicateAndJoinPromptSegments(chunks);
-    }
-
-    /// <summary>
-    /// 按逗号/换行拆段、忽略大小写与权重包装去重。
-    /// 输出只使用英文逗号，例如：
-    /// masterpiece, best quality, a girl on the bed, a man sit in the desk
-    /// </summary>
-    static string DeduplicateAndJoinPromptSegments(IEnumerable<string> chunks)
-    {
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var result = new List<string>();
-        var removed = 0;
-
-        foreach (var chunk in chunks)
-        {
-            if (string.IsNullOrWhiteSpace(chunk))
-                continue;
-
-            foreach (var raw in SplitPromptSegments(chunk))
-            {
-                var segment = CleanPromptSegment(raw);
-                if (segment.Length == 0)
-                    continue;
-
-                var key = NormalizePromptSegmentKey(segment);
-                if (key.Length == 0)
-                    continue;
-
-                if (!seen.Add(key))
-                {
-                    removed++;
-                    continue;
-                }
-
-                result.Add(segment);
-            }
-        }
-
-        if (removed > 0)
-            Log($"提示词去重: 移除 {removed} 个重复片段，保留 {result.Count} 个");
-
-        // 强制英文逗号 + 空格；绝不输出中文逗号
-        return string.Join(", ", result);
-    }
-
-    /// <summary>
-    /// 按英文逗号/中文逗号/顿号/换行/分号拆分。中文标点仅作输入兼容，最终全部换成英文逗号。
-    /// </summary>
-    static IEnumerable<string> SplitPromptSegments(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            yield break;
-
-        var normalized = text
-            .Replace('，', ',')
-            .Replace('\u3001', ',') // 顿号
-            .Replace('；', ';');
-
-        var sb = new StringBuilder(normalized.Length);
-        for (var i = 0; i < normalized.Length; i++)
-        {
-            var c = normalized[i];
-            if (c is ',' or ';' or '\r' or '\n')
-            {
-                if (sb.Length > 0)
-                {
-                    yield return sb.ToString();
-                    sb.Clear();
-                }
-                continue;
-            }
-            sb.Append(c);
-        }
-
-        if (sb.Length > 0)
-            yield return sb.ToString();
-    }
-
-    static string CleanPromptSegment(string raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return "";
-
-        // 片段内残留的中文/全角标点清掉，避免进工作流
-        var s = raw
-            .Replace('，', ' ')
-            .Replace('\u3001', ' ')
-            .Replace('；', ' ')
-            .Replace(';', ' ')
-            .Replace(',', ' ')
-            .Trim();
-
-        s = Regex.Replace(s, @"\s+", " ");
-        s = s.Trim().Trim(',', '，', ';', '；', '、');
-        s = Regex.Replace(s, @"\s+", " ").Trim();
-        return s;
-    }
-
-    /// <summary>
-    /// 去重键：忽略大小写、下划线/空格差异，并剥离简单权重括号如 (tag:1.2) / ((tag))。
-    /// 先出现的原文形式保留（通常是前缀里的写法）。
-    /// </summary>
-    static string NormalizePromptSegmentKey(string segment)
-    {
-        var s = segment.Trim();
-        if (s.Length == 0)
-            return "";
-
-        // 反复剥掉最外层权重/强调括号：(foo:1.2) / (foo) / ((foo))
-        // 不处理 <lora:...>，避免误伤
-        for (var guard = 0; guard < 8; guard++)
-        {
-            var m = Regex.Match(
-                s,
-                @"^\(\s*(.+?)\s*(?::\s*[\d.]+\s*)?\)$");
-            if (!m.Success)
-                break;
-            s = m.Groups[1].Value.Trim();
-        }
-
-        s = Regex.Replace(s, @"\s+", " ");
-        s = s.Replace('_', ' ');
-        return s.ToLowerInvariant();
+        return head + ", " + body.Trim();
     }
 
     static string NormalizeBaseUrl(string? url)
@@ -3735,7 +3660,10 @@ public class ComfyuiService(
                     return dir;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            LogWarn($"读取插件目录失败: {ex.Message}");
+        }
 
         // 回退：Storage/Plugins/Alife.Plugin.Comfyui
         var fallback = Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.Comfyui");

@@ -11,16 +11,18 @@ namespace Alife.Plugin.Comfyui;
 sealed class CharacterPromptIndex
 {
     readonly List<IndexedEntry> _entries;
+    readonly CharacterPromptEntry[] _rawEntries;
 
     CharacterPromptIndex(List<CharacterPromptEntry> entries)
     {
-        _entries = entries.Select(entry => new IndexedEntry(entry)).ToList();
+        _rawEntries = entries.ToArray();
+        _entries = _rawEntries.Select(entry => new IndexedEntry(entry)).ToList();
     }
 
     public int Count => _entries.Count;
 
     /// <summary>全部条目（仅用于启动时构建 AnimaDex 中→英查询映射，避免重复解析大 JSON）。</summary>
-    public IReadOnlyList<CharacterPromptEntry> Entries => _entries.Select(entry => entry.Entry).ToArray();
+    public IReadOnlyList<CharacterPromptEntry> Entries => _rawEntries;
 
     public static CharacterPromptIndex Load(string path)
     {
@@ -117,7 +119,13 @@ sealed class CharacterPromptIndex
             }
             else
             {
-                score = Math.Max(DiceSimilarity(query, candidate), EditSimilarity(query, candidate));
+                var dice = DiceSimilarity(query, candidate);
+                // 编辑距离相似度的上限 = 1 - 长度差/较长长度；上限都不如 Dice 时无需跑 DP
+                var maxLength = Math.Max(query.Length, candidate.Length);
+                var editUpperBound = 1.0 - (double)Math.Abs(query.Length - candidate.Length) / maxLength;
+                score = editUpperBound > dice
+                    ? Math.Max(dice, EditSimilarity(query, candidate))
+                    : dice;
             }
 
             if (score > best)

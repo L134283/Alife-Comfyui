@@ -39,7 +39,7 @@ public static class ComfyuiWorkflowConverter
             "UPSCALE_MODEL", "AUDIO", "WEBCAM", "PHOTOMAKER", "*"
         };
 
-    public     static bool IsApiFormat(JsonNode root)
+    public static bool IsApiFormat(JsonNode root)
     {
         if (root is not JsonObject obj)
             return false;
@@ -963,61 +963,14 @@ public static class ComfyuiWorkflowConverter
             {
                 if (input.Value is not JsonArray arr || arr.Count == 0)
                     continue;
-                string? linkedId = null;
-                try { linkedId = arr[0]?.GetValue<string>(); }
-                catch { }
+                // 用类型判定代替 try/catch（数字型链接直接忽略，与旧行为一致）
+                var linkedId = arr[0] is JsonValue lv && lv.TryGetValue<string>(out var s) ? s : null;
                 if (!string.IsNullOrWhiteSpace(linkedId) && !visited.Contains(linkedId))
                     queue.Enqueue(linkedId);
             }
         }
 
         return result;
-    }
-
-    /// <summary>兼容旧调用：返回第一个追溯到的提示词节点。</summary>
-    static string? TraceToPromptNode(
-        JsonObject prompt, string? startId, bool preferNegative)
-    {
-        if (string.IsNullOrWhiteSpace(startId))
-            return null;
-
-        var queue = new Queue<string>();
-        var visited = new HashSet<string>(StringComparer.Ordinal);
-        queue.Enqueue(startId);
-
-        while (queue.Count > 0)
-        {
-            var currentId = queue.Dequeue();
-            if (!visited.Add(currentId) || prompt[currentId] is not JsonObject node)
-                continue;
-
-            var classType = node["class_type"]?.GetValue<string>() ?? "";
-            if (IsPromptTextNode(classType))
-                return currentId;
-
-            if (node["inputs"] is not JsonObject inputs)
-                continue;
-
-            // Conditioning 组合节点常同时包含 positive/negative，优先沿语义相符的分支追踪。
-            var linkedInputs = inputs
-                .Where(kv => kv.Value is JsonArray arr
-                             && arr.Count > 0
-                             && arr[0] is JsonValue)
-                .OrderByDescending(kv => IsPreferredConditioningInput(kv.Key, preferNegative));
-
-            foreach (var input in linkedInputs)
-            {
-                if (input.Value is not JsonArray arr || arr.Count == 0)
-                    continue;
-                string? linkedId = null;
-                try { linkedId = arr[0]?.GetValue<string>(); }
-                catch { }
-                if (!string.IsNullOrWhiteSpace(linkedId) && !visited.Contains(linkedId))
-                    queue.Enqueue(linkedId);
-            }
-        }
-
-        return null;
     }
 
     static bool IsPreferredConditioningInput(string name, bool preferNegative)

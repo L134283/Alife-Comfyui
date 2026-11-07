@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -16,14 +16,16 @@ namespace Alife.Plugin.Comfyui;
 /// <summary>
 /// ComfyUI 配置面板。
 ///
-/// 重构要点（v4.5.0）：
-/// 1) 分页签，**只渲染当前页签**——原来一次性构建全部区块，任何交互都整页重建；
-/// 2) 文本输入改为 onchange（失焦/回车提交），不再每敲一个字符整页重建（原为 oninput）；
-/// 3) 去掉毛玻璃(backdrop-filter)、keyframes 动画、超大 conic-gradient、模糊滤镜与多层阴影——
-///    这些是面板闪烁/掉帧的主因，且与渲染树无关；
-/// 4) 事件回调不再手写 StateHasChanged（Blazor 事件后自动重渲染）；
-/// 5) 卡片列表改为进入页签时惰性加载，不在渲染过程中改状态。
-/// 所有业务方法（扫描/识别/连通测试/卡片增删改/节点概览等）保持原实现不变。
+/// 结构（2026-11 精简版）：
+/// 1) 4 个页签：生图 / 后端 · 画风 / 提示词 / 进阶，**只渲染当前页签**；
+/// 2) 页签内分区用原生 &lt;details&gt; 折叠：默认只展开主分区，标题右侧带当前值摘要，
+///    长解释收进「?」折叠块，避免一屏铺满说明文字；
+/// 3) 默认精简模式：节点映射、Token、图目录、兜底宽高、轮询、在线地址/超时等低频项
+///    由「进阶 → 显示专家选项」控制；
+/// 4) 文本输入 onchange（失焦/回车提交），避免每敲一个字符整页重建；
+/// 5) 纯静态轻量 CSS（无动画/滤镜/毛玻璃/多层阴影），避免宿主每帧重绘闪烁；
+/// 6) 卡片列表进入页签时惰性加载，不在渲染过程中改状态。
+/// 业务方法（扫描/识别/连通测试/卡片增删改/节点概览等）保持原实现不变。
 /// </summary>
 public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConfig>
 {
@@ -43,6 +45,16 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     int _activePresetIndex = -1; // 当前展开编辑的预设索引
     string _newPresetName = "";
     string _newPresetContent = "";
+
+    // 画风预设卡片管理
+    List<StyleCard> _styleCards = new();
+    int _activeStyleIndex = -1;
+    string _newStyleName = "";
+    bool _loadedStyleCards;
+
+    // 顶部状态：有未保存改动 / 刚切过后端（需重载）
+    bool _dirty;
+    bool _backendSwitched;
 
     // 在线标签检索连通测试
     string? _danbooruTestMessage;
@@ -68,25 +80,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     string? _appMcpTestMessage;
     bool _appMcpTesting;
 
-    // 页签（只渲染当前页签）。页签列表按后端模式生成：模板模式隐藏「工作流」整页
+    // 页签（只渲染当前页签）。4 个页签：生图 / 后端·画风 / 提示词 / 进阶
     int _tab = 0;
     static readonly (int Id, string Title)[] AllTabs =
     {
-        (0, "基础"), (1, "工作流"), (2, "后端 · 画风"), (3, "提示词"), (4, "检索"), (5, "高级")
+        (0, "生图"), (1, "后端 · 画风"), (2, "提示词"), (3, "进阶")
     };
     bool _loadedWorkflowCards;
     bool _loadedPresetCards;
-
-    IEnumerable<(int Id, string Title)> EffectiveTabs()
-    {
-        var appMcp = IsAppMcp();
-        foreach (var t in AllTabs)
-        {
-            if (appMcp && t.Id == 1)
-                continue; // 模板模式：工作流配置整体不可用，隐藏该页签
-            yield return t;
-        }
-    }
 
     record WorkflowCard
     {
@@ -102,33 +103,65 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         public string Content { get; set; } = "";
     }
 
+    record StyleCard
+    {
+        public string Name { get; set; } = "";
+        public string Template { get; set; } = "";
+        public string Prefix { get; set; } = "";
+        public string Group { get; set; } = "";
+        public string Params { get; set; } = "";
+    }
+
     // ============================================================
     // 样式：纯静态、无动画、无滤镜、无毛玻璃。避免宿主每帧重绘导致闪烁/掉帧。
     // ============================================================
     const string Css = @"
-.cu-root { width:100%; box-sizing:border-box; color:#3f2a38; font-size:13px; }
+.cu-root { width:100%; box-sizing:border-box; color:#3f2a38; font-size:13px;
+  --pink:#ec4899; --pink-d:#9d174d; --line:#f2d9e7; --line-2:#f9ecf3; --soft:#fff9fc;
+  --hint:#8a4f6b; --muted:#a8728f; }
 .cu-card { background:#fff; border:1px solid #f2d7e5; border-radius:14px; box-shadow:0 1px 2px rgba(190,24,93,.06); overflow:hidden; }
-.cu-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:13px 16px; border-bottom:1px solid #f7e3ee; background:#fff8fb; }
-.cu-title { font-weight:800; font-size:15px; color:#9d174d; }
+.cu-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:11px 16px; border-bottom:1px solid #f7e3ee; background:#fff8fb; }
+.cu-title { font-weight:800; font-size:14.5px; color:#9d174d; }
 .cu-spacer { flex:1; }
+.cu-state { font-size:11px; font-weight:700; color:#8a4f6b; background:#fff; border:1px dashed #f0cfe1; border-radius:999px; padding:2px 9px; }
+.cu-state.warn { color:#b45309; background:#fffbeb; border-color:#fbd38d; }
 .cu-chip { font-size:11px; font-weight:700; padding:2px 9px; border-radius:999px; border:1px solid #f4c8dd; color:#9d174d; background:#fff; white-space:nowrap; }
 .cu-chip.on { background:#ec4899; border-color:#ec4899; color:#fff; }
-.cu-tabs { display:flex; gap:4px; flex-wrap:wrap; padding:8px 10px; border-bottom:1px solid #f7e3ee; background:#fff; }
-.cu-tab { border:1px solid transparent; background:transparent; color:#9d4b74; font-weight:700; font-size:12.5px; padding:6px 13px; border-radius:999px; cursor:pointer; font-family:inherit; }
+.cu-tabs { display:flex; gap:4px; flex-wrap:wrap; padding:7px 12px; border-bottom:1px solid #f7e3ee; background:#fff; }
+.cu-tab { border:1px solid transparent; background:transparent; color:#9d4b74; font-weight:700; font-size:12.5px; padding:5px 13px; border-radius:999px; cursor:pointer; font-family:inherit; }
 .cu-tab:hover { background:#fff0f7; }
 .cu-tab.active { background:#ec4899; border-color:#ec4899; color:#fff; }
-.cu-body { padding:14px 16px 18px; }
-.cu-sec { font-size:11.5px; font-weight:800; color:#9d174d; letter-spacing:.8px; margin:18px 0 6px; }
-.cu-sec:first-child { margin-top:0; }
-.cu-panel { border:1px solid #f7e3ee; border-radius:10px; padding:12px; background:#fffdfe; }
-.cu-grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; }
+.cu-body { padding:12px 14px 16px; }
+/* 折叠分区：标题常显，内容收起 */
+.cu-sec { border:1px solid var(--line); border-radius:12px; background:#fff; margin:0 0 9px; overflow:hidden; }
+.cu-sec:last-child { margin-bottom:0; }
+.cu-sec > summary { list-style:none; cursor:pointer; display:flex; align-items:center; gap:8px;
+  padding:9px 12px; font-size:12.5px; font-weight:800; color:#9d174d; background:var(--soft); }
+.cu-sec > summary::-webkit-details-marker { display:none; }
+.cu-sec > summary::before { content:'▸'; font-size:10px; color:var(--pink); flex:none; }
+.cu-sec[open] > summary::before { content:'▾'; }
+.cu-sec > summary:hover { background:#fff0f7; }
+.cu-sec-hint { margin-left:auto; font-size:11px; font-weight:600; color:var(--hint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:55%; }
+.cu-sec-body { padding:11px 12px 12px; }
+/* 面板只作语义分组，不再画边框（减少嵌套盒子） */
+.cu-panel { border:none; background:transparent; padding:0; margin:0; }
+.cu-grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px; }
+.cu-grid3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:8px; }
 .cu-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
 .cu-col { display:flex; flex-direction:column; gap:2px; }
 .cu-label { font-size:11.5px; font-weight:700; color:#9d4b74; margin:9px 0 4px; }
 .cu-input, .cu-textarea, .cu-select { width:100%; box-sizing:border-box; border:1px solid #efccdd; border-radius:8px; padding:6px 9px; font-size:12.5px; color:#3f2a38; background:#fff; outline:none; font-family:inherit; }
 .cu-input:focus, .cu-textarea:focus, .cu-select:focus { border-color:#ec4899; }
 .cu-textarea { resize:vertical; line-height:1.5; font-family:Consolas,ui-monospace,monospace; }
-.cu-hint { font-size:11px; color:#b06a8c; margin:4px 0 10px; line-height:1.55; white-space:pre-wrap; }
+.cu-hint { font-size:11.5px; color:var(--hint); margin:5px 0 2px; line-height:1.6; white-space:pre-wrap; }
+/* 长解释折叠：详情默认收起，只看一行摘要 */
+.cu-help { margin:6px 0 2px; font-size:11.5px; color:var(--hint); }
+.cu-help > summary { list-style:none; cursor:pointer; display:inline-flex; align-items:center; gap:6px; color:#9d4b74; font-weight:700; }
+.cu-help > summary::-webkit-details-marker { display:none; }
+.cu-help > summary::before { content:'?'; display:inline-flex; align-items:center; justify-content:center;
+  width:14px; height:14px; border-radius:50%; background:var(--pink); color:#fff; font-size:10px; font-weight:800; flex:none; }
+.cu-help[open] > summary { color:#9d174d; }
+.cu-help .cu-hint { margin:6px 0 0; padding:7px 9px; background:var(--soft); border:1px dashed var(--line); border-radius:8px; }
 .cu-detect { font-size:11.5px; color:#9d174d; background:#fff5fa; border:1px solid #f7d3e6; border-radius:8px; padding:8px 10px; margin:8px 0; white-space:pre-wrap; line-height:1.5; }
 .cu-btn { border:1px solid #efccdd; background:#fff; color:#9d174d; font-weight:700; font-size:12px; padding:6px 12px; border-radius:8px; cursor:pointer; font-family:inherit; }
 .cu-btn:hover { background:#fff0f7; }
@@ -159,14 +192,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 .cu-sw.on { background:#ec4899; }
 .cu-sw.on::after { left:20px; }
 /* 分辨率卡片（沿用被保留的 AddEditableResoCard 的类名） */
-.cfy-reso-card { border:1px solid #f7e3ee; border-radius:12px; padding:11px 12px; background:#fffdfe; }
+.cfy-reso-card { border:1px solid var(--line); border-radius:10px; padding:8px 10px; background:#fff; }
 .cfy-reso-shine { display:none; }
-.cfy-reso-tag { font-size:10.5px; font-weight:800; color:#db2777; letter-spacing:1px; }
-.cfy-reso-input-row { display:flex; align-items:center; gap:6px; margin:7px 0 5px; }
-.cfy-reso-input { width:76px; box-sizing:border-box; border:1px solid #efccdd; border-radius:7px; padding:4px 7px; font-size:12.5px; font-family:inherit; color:#3f2a38; }
-.cfy-reso-sep { color:#b06a8c; font-weight:700; }
-.cfy-reso-name { font-size:12.5px; font-weight:700; color:#9d174d; }
-.cfy-reso-hint { font-size:11px; color:#b06a8c; margin-top:2px; }
+.cfy-reso-tag { font-size:10px; font-weight:800; color:#db2777; letter-spacing:.8px; }
+.cfy-reso-input-row { display:flex; align-items:center; gap:5px; margin:5px 0 3px; }
+.cfy-reso-input { width:62px; box-sizing:border-box; border:1px solid #efccdd; border-radius:7px; padding:3px 6px; font-size:12px; font-family:inherit; color:#3f2a38; }
+.cfy-reso-sep { color:var(--muted); font-weight:700; }
+.cfy-reso-name { font-size:12px; font-weight:700; color:#9d174d; }
+.cfy-reso-hint { font-size:10.5px; color:var(--hint); margin-top:1px; }
 /* 节点概览（沿用被保留的 AddNodeOverview 的类名） */
 .cfy-node-overview { margin-top:8px; }
 .cfy-node-count { font-size:12px; font-weight:700; color:#9d174d; margin-bottom:6px; }
@@ -201,6 +234,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         // 卡片列表惰性加载：不在渲染过程中改 Configuration，避免额外重渲染
         if (!_loadedWorkflowCards) { LoadWorkflowCards(); _loadedWorkflowCards = true; }
         if (!_loadedPresetCards) { LoadPresetCards(); _loadedPresetCards = true; }
+        if (!_loadedStyleCards) { LoadStyleCards(); _loadedStyleCards = true; }
 
         int i = 0;
 
@@ -213,7 +247,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-card");
 
-        // ---------- 头部 ----------
+        // ---------- 头部：只留模式/配置状态 + 一条统一提示 ----------
         var appMcp = IsAppMcp();
         var configured = !string.IsNullOrWhiteSpace(Configuration.BaseUrl)
                          && (appMcp || !string.IsNullOrWhiteSpace(Configuration.WorkflowPath));
@@ -226,25 +260,30 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.CloseElement();
         AddChip(b, ref i, configured ? "已配置" : "未配置", configured);
         AddChip(b, ref i, appMcp ? "APP-MCP 模板" : "工作流模式", appMcp);
-        var styleCount = 0;
-        try
+        b.OpenElement(i++, "span");
+        b.AddAttribute(i++, "class", "cu-spacer");
+        b.CloseElement();
+        if (_backendSwitched)
         {
-            if (JsonNode.Parse(Configuration.StylePresets ?? "[]") is JsonArray styleArr)
-                styleCount = styleArr.Count;
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cu-state warn");
+            b.AddContent(i++, "已切换后端：需重载模块");
+            b.CloseElement();
         }
-        catch { }
-        if (styleCount > 0)
-            AddChip(b, ref i, $"画风 {styleCount}", true);
-        if (Configuration.EnableDanbooruSearch)
-            AddChip(b, ref i, "在线标签", true);
-        if (Configuration.EnableAnimadexCharacterSearch)
-            AddChip(b, ref i, "在线角色", true);
+        else if (_dirty)
+        {
+            // 框架配置面板由宿主保存：这里只提示「有改动」，不新增保存按钮
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cu-state");
+            b.AddContent(i++, "有改动：记得保存");
+            b.CloseElement();
+        }
         b.CloseElement(); // head
 
-        // ---------- 页签（按后端模式生成） ----------
+        // ---------- 页签 ----------
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-tabs");
-        foreach (var (tabId, tabTitle) in EffectiveTabs())
+        foreach (var (tabId, tabTitle) in AllTabs)
         {
             var id = tabId;
             b.OpenElement(i++, "button");
@@ -253,7 +292,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
             {
                 _tab = id;
-                if (id == 5 && Configuration.AdvancedMode)
+                if (id == 3 && Configuration.AdvancedMode)
                     await LoadNodeOverview();
             }));
             b.AddContent(i++, tabTitle);
@@ -261,17 +300,14 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         }
         b.CloseElement(); // tabs
 
-        // ---------- 内容：只渲染当前页签（模式切换后若停在已隐藏页签，回落到基础页） ----------
+        // ---------- 内容：只渲染当前页签 ----------
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-body");
-        var workflowTabUsable = !appMcp;
         switch (_tab)
         {
-            case 1: if (workflowTabUsable) RenderWorkflowTab(b); else RenderBasicTab(b); break;
-            case 2: RenderBackendTab(b); break;
-            case 3: RenderPromptTab(b); break;
-            case 4: RenderSearchTab(b); break;
-            case 5: RenderAdvancedTab(b); break;
+            case 1: RenderBackendTab(b); break;
+            case 2: RenderPromptTab(b); break;
+            case 3: RenderAdvancedTab(b); break;
             default: RenderBasicTab(b); break;
         }
         b.CloseElement(); // body
@@ -284,159 +320,97 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         => string.Equals((Configuration?.BackendMode ?? "").Trim(), "appmcp", StringComparison.OrdinalIgnoreCase);
 
     // ============================================================
-    // 页签 1：基础（连接 / 保存 / 分辨率 / 默认参数 / 生图行为）
+    // 页签 0：生图（连接 / 工作流或模板 / 分辨率 / 生图行为）
     // ============================================================
     void RenderBasicTab(RenderTreeBuilder b)
     {
         int i = 1000;
         var appMcp = IsAppMcp();
+        var expert = Configuration.ShowExpertOptions;
 
-        AddSection(b, ref i, "快速开始（新手看这里）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddSteps(b, ref i,
-            "启动 ComfyUI（默认地址 http://127.0.0.1:8188），确认下面「连接」里的地址与它一致。",
-            appMcp
-                ? "「后端 · 画风」页填好 APP-MCP 的默认模板名，点「测试连通并列出模板」；若提示连接失败，多半是还没装 APP-MCP 节点——该页有安装教程和链接。"
-                : "「工作流」页填工作流 JSON 路径（可点「扫描目录」从列表里选），再点「自动识别节点」。",
-            "让角色生图即可。想要一个工作流出多种画风，就去「后端 · 画风」页配「画风预设」。");
-        AddHint(b, ref i, "改完任何配置记得保存（用框架提供的保存入口）；切换生图后端后需要重载本模块，新设置与新提示词才会生效。");
-        b.CloseElement();
-
-        AddSection(b, ref i, "连接");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        // ---------- 连接 ----------
+        AddSection(b, ref i, "连接", open: true,
+            note: string.IsNullOrWhiteSpace(Configuration.BaseUrl) ? "未填地址" : Configuration.BaseUrl.Trim());
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-grid2");
-        b.OpenElement(i++, "div");
         AddInput(b, ref i, "ComfyUI 地址", Configuration.BaseUrl, v => Configuration.BaseUrl = v);
-        AddInput(b, ref i, "API Token（可选）", Configuration.ApiToken, v => Configuration.ApiToken = v);
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "图片保存目录（额外副本时用）", Configuration.SaveDirectory, v => Configuration.SaveDirectory = v);
-        AddInput(b, ref i, "ComfyUI output 目录（可选）", Configuration.ComfyuiOutputPath, v => Configuration.ComfyuiOutputPath = v);
-        AddInput(b, ref i, "自定义出图目录（可选）", Configuration.CustomOutputPath, v => Configuration.CustomOutputPath = v);
-        b.CloseElement();
-        b.CloseElement();
-        AddHint(b, ref i,
-            "地址例如 http://127.0.0.1:8188（端口不是 8188 就填你自己的）。\n"
-            + "这个地址同时用于：在线状态检查、图生图上传、图片下载；开启模板模式且未填 APP-MCP 地址时，也会由它自动推导。\n"
-            + "「ComfyUI output 目录」填绝对路径后，标准 SaveImage 的图片直接引用该文件，不再重复下载。\n"
-            + "「自定义出图目录」用于 ZML_SaveImageV2 等自定义保存节点写出的目录；填了它，模板模式也会去该目录直接引用图片。两个目录填其一即可，都留空才下载。\n"
-            + "「API Token」只有你的 ComfyUI 藏在带鉴权的反代后面才需要，普通本地使用留空即可。");
-        b.CloseElement();
-
-        AddSection(b, ref i, "图片落盘");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddCheck(b, ref i, "额外保存副本（复制到「图片保存目录」；关闭则直接用工作流保存路径）",
-            Configuration.ExtraSaveCopy, v => Configuration.ExtraSaveCopy = v);
-        var resolvedSaveDir = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
-            ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
-            : Configuration.SaveDirectory;
-        AddHint(b, ref i, Configuration.ExtraSaveCopy
-            ? $"开启：出图后会把图片复制一份到「图片保存目录」（留空则用默认目录）。\n当前实际目录：{resolvedSaveDir}"
-            : $"关闭：直接使用工作流/模板自带的保存路径，不额外复制。\n「图片保存目录」当前为：{resolvedSaveDir}");
-        AddHint(b, ref i,
-            "想「电脑只留一份」：在上面填「ComfyUI output 目录」或「自定义出图目录」，插件会直接引用该目录里的原图，不再复制到「图片保存目录」。\n"
-            + "图片路径会被插件交给 AI 用于发图（QQ 环境用 qimage 标签），所以目录别设成需要权限的位置。");
-        b.CloseElement();
-
-        if (appMcp)
+        if (expert)
         {
-            // 模板模式：尺寸与等待由模板 / APP-MCP 决定 —— 工作流模式的这些项自动隐藏
-            AddSection(b, ref i, "尺寸与等待（模板模式）");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            AddHint(b, ref i,
-                "以下工作流模式专用项在模板模式下不参与，已自动隐藏：分辨率预设、默认方向、兜底宽高、等待出图超时、轮询间隔。\n"
-                + "· 画面尺寸由模板决定；若模板声明了 width / height / 宽 / 高 输入，可用 generateimage 的 params 传。\n"
-                + "· 等待出图超时请在「后端 · 画风」页签的 APP-MCP 设置里调整。");
-            b.CloseElement();
+            AddInput(b, ref i, "API Token（反代鉴权用，可空）", Configuration.ApiToken,
+                v => Configuration.ApiToken = v);
+            AddInput(b, ref i, "图片保存目录（额外副本用，可空）", Configuration.SaveDirectory,
+                v => Configuration.SaveDirectory = v);
+            AddInput(b, ref i, "ComfyUI output 目录（可空）", Configuration.ComfyuiOutputPath,
+                v => Configuration.ComfyuiOutputPath = v);
+            AddInput(b, ref i, "自定义出图目录（可空）", Configuration.CustomOutputPath,
+                v => Configuration.CustomOutputPath = v);
+        }
+        b.CloseElement();
+        if (expert)
+        {
+            AddCheck(b, ref i, "额外保存副本（复制到「图片保存目录」）", Configuration.ExtraSaveCopy,
+                v => Configuration.ExtraSaveCopy = v);
+            AddHint(b, ref i, "关闭则直接用工作流/模板自带的保存路径。");
         }
         else
         {
-            AddSection(b, ref i, "分辨率预设");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-grid2");
-            AddEditableResoCard(b, ref i, "PORTRAIT", "竖版", "全身立绘 · 人物 · 手机壁纸",
-                Configuration.PortraitWidth, v => Configuration.PortraitWidth = v,
-                Configuration.PortraitHeight, v => Configuration.PortraitHeight = v);
-            AddEditableResoCard(b, ref i, "LANDSCAPE", "横版", "风景 · 场景 · 横构图",
-                Configuration.LandscapeWidth, v => Configuration.LandscapeWidth = v,
-                Configuration.LandscapeHeight, v => Configuration.LandscapeHeight = v);
-            AddEditableResoCard(b, ref i, "SQUARE", "正方形", "头像 · 图标 · 对称构图",
-                Configuration.SquareWidth, v => Configuration.SquareWidth = v,
-                Configuration.SquareHeight, v => Configuration.SquareHeight = v);
-            b.CloseElement();
-            AddHint(b, ref i, "AI 传 orientation=portrait/landscape/square 智能选档；也可直接指定 width/height 覆盖。数值改完点空白处生效。");
+            var resolvedSaveDir = string.IsNullOrWhiteSpace(Configuration.SaveDirectory)
+                ? Path.Combine(AlifePath.StorageFolderPath, "Images", "Comfyui")
+                : Configuration.SaveDirectory;
+            AddHelp(b, ref i, "图片存在哪？",
+                $"当前保存目录：{resolvedSaveDir}\n"
+                + "想「电脑只留一份」：在「进阶」页打开「显示专家选项」，再填 ComfyUI output / 自定义出图目录，"
+                + "插件会直接引用该目录里的原图，不再复制。\n"
+                + "地址同时用于状态检查、图生图上传、图片下载；模板模式未填 APP-MCP 地址时也会由它推导。");
+        }
+        AddHelp(b, ref i, "第一次用？三步走",
+            "1) 启动 ComfyUI，确认上面的地址与它一致（默认 http://127.0.0.1:8188）。\n"
+            + (appMcp
+                ? "2) 在下面「APP-MCP 模板」填默认模板名，点「测试连通并列出模板」。\n"
+                : "2) 在下面「工作流」填工作流 JSON 路径（可点「扫描目录」选），再点「自动识别节点」。\n")
+            + "3) 直接让角色生图。想要一个工作流/模板切换多种画风，去「后端 · 画风 → 画风预设」。");
+        EndSection(b, ref i);
 
-            AddSection(b, ref i, "默认参数");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-grid2");
-            b.OpenElement(i++, "div");
-            AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
-            {
-                ("portrait", $"竖版 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}"),
-                ("landscape", $"横版 {Configuration.LandscapeWidth}×{Configuration.LandscapeHeight}"),
-                ("square", $"正方形 {Configuration.SquareWidth}×{Configuration.SquareHeight}")
-            });
-            AddHint(b, ref i, "AI 未传 orientation 时使用");
-            AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), SetInt(v => Configuration.DefaultWidth = v));
-            AddInput(b, ref i, "兜底高度", Configuration.DefaultHeight.ToString(), SetInt(v => Configuration.DefaultHeight = v));
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "等待出图超时（秒）", Configuration.TimeoutSeconds.ToString(), SetInt(v => Configuration.TimeoutSeconds = v));
-            AddHint(b, ref i, "普通模式等待上限");
-            AddInput(b, ref i, "轮询间隔（毫秒）", Configuration.PollIntervalMs.ToString(), SetInt(v => Configuration.PollIntervalMs = v));
-            AddHint(b, ref i, "500~10000");
-            b.CloseElement();
-            b.CloseElement();
-            b.CloseElement();
+        if (appMcp)
+            RenderAppMcpSections(b, ref i, expert);
+        else
+        {
+            RenderWorkflowSections(b, ref i, expert);
+            RenderResolutionSection(b, ref i, expert);
         }
 
-        AddSection(b, ref i, "生图行为");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddCheck(b, ref i, "生完图自动用系统默认图片查看器打开（仅桌面端）", Configuration.AutoOpenImage,
+        // ---------- 生图行为 ----------
+        AddSection(b, ref i, "生图行为", note: Configuration.PriorityImageGen ? "已开优先生图" : null);
+        AddCheck(b, ref i, "生完后用系统默认看图器打开（仅桌面端）", Configuration.AutoOpenImage,
             v => Configuration.AutoOpenImage = v);
-        AddCheck(b, ref i, "优先生图（语音避让）：本轮语音播完后再提交生图（同机本地 TTS 建议开）", Configuration.PriorityImageGen,
+        AddCheck(b, ref i, "优先生图（语音避让）：本轮语音播完后再提交（同机 TTS 建议开）", Configuration.PriorityImageGen,
             v => Configuration.PriorityImageGen = v);
         if (Configuration.PriorityImageGen)
         {
             AddInput(b, ref i, "硬超时上限（秒）", Configuration.PriorityMaxWaitSeconds.ToString(),
                 SetInt(v => Configuration.PriorityMaxWaitSeconds = Math.Clamp(v, 30, 1800)));
-            AddHint(b, ref i, "实际等待 = min(等待出图超时, 本上限)，超时强制结束避免卡死对话。");
         }
-        AddHint(b, ref i,
-            "开启后：AI 调用 generateimage 时先排队，等本轮 <speak> 的语音合成/播放结束再提交 ComfyUI，出图期间下一轮消息会等待；"
+        AddHelp(b, ref i, "优先生图是怎么工作的？",
+            "AI 调用 generateimage 时先排队，等本轮语音合成/播放结束再提交 ComfyUI；出图期间下一轮消息会等待，"
             + "这样 TTS 与 Comfy 不会同时抢 GPU。\n"
-            + "为什么不在函数里直接阻塞：Alife 5.x 的 Speak 是并行内容函数，而 AI 通常先说话后生图，函数内阻塞挡不住已经开始播放的语音。\n"
-            + "本插件不依赖任何语音插件（不引用语音程序集，靠框架「本轮结束」时机保证语音已收尾）。");
-        b.CloseElement();
+            + "实际等待 = min(等待出图超时, 硬超时上限)，超时强制结束，避免卡死对话。\n"
+            + "本插件不依赖任何语音插件（靠框架「本轮结束」时机判断语音已收尾）。");
+        EndSection(b, ref i);
     }
 
-    // ============================================================
-    // 页签 2：工作流（默认工作流 / 扫描 / 识别 / 多工作流）
-    // ============================================================
-    void RenderWorkflowTab(RenderTreeBuilder b)
+    // ---------- 工作流模式：默认工作流 + 节点映射 + 多工作流 ----------
+    void RenderWorkflowSections(RenderTreeBuilder b, ref int i, bool expert)
     {
-        int i = 2000;
+        var wfName = string.IsNullOrWhiteSpace(Configuration.WorkflowPath)
+            ? "未选择文件"
+            : Path.GetFileName(Configuration.WorkflowPath);
+        AddSection(b, ref i, "工作流", open: true, note: wfName);
 
-        if (IsAppMcp())
-        {
-            AddHint(b, ref i, "当前后端是「APP-MCP 模板模式」：本页签的工作流配置不参与生图（保留供切回工作流模式使用）。");
-        }
-
-        AddSection(b, ref i, "默认工作流");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
         AddInput(b, ref i, "工作流 JSON 路径（绝对路径或相对插件目录）", Configuration.WorkflowPath,
             v => Configuration.WorkflowPath = v);
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-row");
+        b.AddAttribute(i++, "style", "margin-top:8px;");
         b.OpenElement(i++, "button");
         b.AddAttribute(i++, "type", "button");
         b.AddAttribute(i++, "class", "cu-btn");
@@ -450,10 +424,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddContent(i++, "自动识别节点");
         b.CloseElement();
         b.CloseElement();
-        AddHint(b, ref i,
-            "「扫描目录」会在路径所在目录 / ComfyUI 的 workflows 目录中列出可用工作流；「自动识别节点」扫描当前工作流的正/负/分辨率节点并回填。\n"
-            + "支持两种文件：ComfyUI 网页里直接保存的 UI 工作流 JSON（插件会自动转成 API 格式），以及官方 Export (API) 导出的 API JSON。\n"
-            + "填相对路径时按「插件目录」解析；填绝对路径最稳妥。");
 
         if (!string.IsNullOrWhiteSpace(_scanDetectMessage))
         {
@@ -474,6 +444,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 b.AddAttribute(i++, "title", picked);
                 b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
                 {
+                    MarkDirty();
                     Configuration.WorkflowPath = picked;
                     _showWorkflowDropdown = false;
                 }));
@@ -489,31 +460,38 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.AddContent(i++, detectMessage);
             b.CloseElement();
         }
-        b.CloseElement();
 
-        AddSection(b, ref i, "节点映射（留空自动识别）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-grid2");
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "正向提示词节点 ID", Configuration.PositivePromptNodeId, v => Configuration.PositivePromptNodeId = v);
-        AddInput(b, ref i, "正向提示词字段名", Configuration.PositivePromptInput, v => Configuration.PositivePromptInput = v);
-        AddInput(b, ref i, "分辨率节点 ID", Configuration.ResolutionNodeId, v => Configuration.ResolutionNodeId = v);
-        b.CloseElement();
-        b.OpenElement(i++, "div");
-        AddInput(b, ref i, "负面提示词节点 ID", Configuration.NegativePromptNodeId, v => Configuration.NegativePromptNodeId = v);
-        AddInput(b, ref i, "负面提示词字段名", Configuration.NegativePromptInput, v => Configuration.NegativePromptInput = v);
-        AddInput(b, ref i, "图生图 LoadImage 节点 ID", Configuration.LoadImageNodeId, v => Configuration.LoadImageNodeId = v);
-        b.CloseElement();
-        b.CloseElement();
-        AddHint(b, ref i, "手动节点 ID 仅作用于默认工作流；命名工作流会按各自连接关系重新识别。");
-        b.CloseElement();
+        if (expert)
+        {
+            AddHint(b, ref i, "节点映射（专家，留空自动识别；仅作用于默认工作流）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-grid2");
+            AddInput(b, ref i, "正向提示词节点 ID", Configuration.PositivePromptNodeId,
+                v => Configuration.PositivePromptNodeId = v);
+            AddInput(b, ref i, "正向提示词字段名", Configuration.PositivePromptInput,
+                v => Configuration.PositivePromptInput = v);
+            AddInput(b, ref i, "分辨率节点 ID", Configuration.ResolutionNodeId,
+                v => Configuration.ResolutionNodeId = v);
+            AddInput(b, ref i, "负面提示词节点 ID", Configuration.NegativePromptNodeId,
+                v => Configuration.NegativePromptNodeId = v);
+            AddInput(b, ref i, "负面提示词字段名", Configuration.NegativePromptInput,
+                v => Configuration.NegativePromptInput = v);
+            AddInput(b, ref i, "图生图 LoadImage 节点 ID", Configuration.LoadImageNodeId,
+                v => Configuration.LoadImageNodeId = v);
+            b.CloseElement();
+        }
 
-        AddSection(b, ref i, "多工作流（可选）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddHint(b, ref i, "启用后 AI 可通过 workflow 参数切换；每个工作流可单独设固定正向前缀（留空沿用全局）。名称需唯一且路径有效。");
+        AddHelp(b, ref i, "支持哪些工作流文件？",
+            "· ComfyUI 网页里直接保存的 UI 工作流 JSON（插件自动转 API 格式）\n"
+            + "· 官方 Export (API) 导出的 API JSON\n"
+            + "「扫描目录」会在路径所在目录 / ComfyUI 的 workflows 目录列出可用工作流；"
+            + "「自动识别节点」会扫描正/负/分辨率节点并回填。相对路径按插件目录解析，绝对路径最稳妥。");
+        EndSection(b, ref i);
+
+        // ---------- 多工作流 ----------
+        var enabledCount = _workflowCards.Count(c => c.Enabled);
+        AddSection(b, ref i, "多工作流（可选）",
+            note: _workflowCards.Count == 0 ? "未添加" : $"已启用 {enabledCount}/{_workflowCards.Count}");
 
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-list");
@@ -626,112 +604,159 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => AddWorkflowCard()));
         b.AddContent(i++, "+ 添加工作流");
         b.CloseElement();
-        if (_scannedWorkflows.Count == 0)
-            AddHint(b, ref i, "提示：先点上方「扫描目录」可把工作流列出来直接选。");
+        b.CloseElement();
+        AddHint(b, ref i, "启用后 AI 可用 workflow 参数切换；名称唯一、路径有效。");
+        EndSection(b, ref i);
+    }
+
+    // ---------- 分辨率 + 默认参数 ----------
+    void RenderResolutionSection(RenderTreeBuilder b, ref int i, bool expert)
+    {
+        AddSection(b, ref i, "分辨率",
+            note: $"竖 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-grid3");
+        AddEditableResoCard(b, ref i, "PORTRAIT", "竖版", "人物 · 手机壁纸",
+            Configuration.PortraitWidth, v => Configuration.PortraitWidth = v,
+            Configuration.PortraitHeight, v => Configuration.PortraitHeight = v);
+        AddEditableResoCard(b, ref i, "LANDSCAPE", "横版", "风景 · 横构图",
+            Configuration.LandscapeWidth, v => Configuration.LandscapeWidth = v,
+            Configuration.LandscapeHeight, v => Configuration.LandscapeHeight = v);
+        AddEditableResoCard(b, ref i, "SQUARE", "正方形", "头像 · 对称构图",
+            Configuration.SquareWidth, v => Configuration.SquareWidth = v,
+            Configuration.SquareHeight, v => Configuration.SquareHeight = v);
+        b.CloseElement();
+        AddHelp(b, ref i, "AI 怎么选尺寸？",
+            "AI 传 orientation=portrait/landscape/square 智能选档，也可直接指定 width/height 覆盖。"
+            + "改完数值点空白处生效。");
+        EndSection(b, ref i);
+
+        if (!expert)
+            return;
+
+        AddSection(b, ref i, "默认参数（专家）");
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-grid2");
+        AddSelect(b, ref i, "默认方向", Configuration.DefaultOrientation, v => Configuration.DefaultOrientation = v, new[]
+        {
+            ("portrait", $"竖版 {Configuration.PortraitWidth}×{Configuration.PortraitHeight}"),
+            ("landscape", $"横版 {Configuration.LandscapeWidth}×{Configuration.LandscapeHeight}"),
+            ("square", $"正方形 {Configuration.SquareWidth}×{Configuration.SquareHeight}")
+        });
+        AddInput(b, ref i, "兜底宽度", Configuration.DefaultWidth.ToString(), SetInt(v => Configuration.DefaultWidth = v));
+        AddInput(b, ref i, "兜底高度", Configuration.DefaultHeight.ToString(), SetInt(v => Configuration.DefaultHeight = v));
+        AddInput(b, ref i, "等待出图超时（秒）", Configuration.TimeoutSeconds.ToString(), SetInt(v => Configuration.TimeoutSeconds = v));
+        AddInput(b, ref i, "轮询间隔（毫秒，500~10000）", Configuration.PollIntervalMs.ToString(), SetInt(v => Configuration.PollIntervalMs = v));
+        b.CloseElement();
+        EndSection(b, ref i);
+    }
+
+    // ---------- 模板模式：APP-MCP 模板 ----------
+    void RenderAppMcpSections(RenderTreeBuilder b, ref int i, bool expert)
+    {
+        var tplName = string.IsNullOrWhiteSpace(Configuration.AppMcpTemplate)
+            ? "未选模板"
+            : Configuration.AppMcpTemplate.Trim();
+        AddSection(b, ref i, "APP-MCP 模板", open: true, note: tplName);
+
+        AddInput(b, ref i, "APP-MCP 地址（留空自动推导）", Configuration.AppMcpUrl,
+            v => Configuration.AppMcpUrl = v);
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-grid2");
+        AddInput(b, ref i, "默认模板名", Configuration.AppMcpTemplate, v => Configuration.AppMcpTemplate = v);
+        AddInput(b, ref i, "提示词输入参数名", Configuration.AppMcpPromptParam,
+            v => Configuration.AppMcpPromptParam = v);
+        b.CloseElement();
+
+        AddTextArea(b, ref i, "模板默认参数（JSON 对象）", Configuration.AppMcpDefaultParams,
+            v => Configuration.AppMcpDefaultParams = v, 3);
+        AddTextArea(b, ref i, "模板自定义说明（会注入 AI 提示词）", Configuration.AppMcpTemplateNotes,
+            v => Configuration.AppMcpTemplateNotes = v, 4);
+
+        if (expert)
+        {
+            AddInput(b, ref i, "等待出图超时（秒）", Configuration.AppMcpTimeoutSeconds.ToString(),
+                SetInt(v => Configuration.AppMcpTimeoutSeconds = Math.Clamp(v, 30, 1800)));
+        }
+
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "cu-row");
+        b.AddAttribute(i++, "style", "margin-top:8px;");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn");
+        b.AddAttribute(i++, "disabled", _appMcpTesting);
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAppMcp));
+        b.AddContent(i++, _appMcpTesting ? "测试中…" : "测试连通并列出模板");
         b.CloseElement();
         b.CloseElement();
+        if (!string.IsNullOrWhiteSpace(_appMcpTestMessage))
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-detect");
+            b.AddContent(i++, _appMcpTestMessage);
+            b.CloseElement();
+        }
+
+        AddHelp(b, ref i, "参数与尺寸怎么填？",
+            "模板默认参数写 {\"参数名\": 值}，只有模板已声明的输入才生效，AI 可用 params 覆盖；"
+            + "改完模板记得点「测试连通并列出模板」核对输入名。\n"
+            + "画面尺寸由模板决定；模板若声明了 width / height / 宽 / 高 输入，AI 可用 params 传。"
+            + "「模板自定义说明」会随系统提示词一起给 AI，用来说明各开关用法。");
+        EndSection(b, ref i);
     }
 
     // ============================================================
-    // 页签 3：后端 · 画风（工作流/APP-MCP、画风预设、显存）
+    // 页签 1：后端 · 画风（后端切换 / 画风预设 / 模型卸载 / 安装教程）
     // ============================================================
     void RenderBackendTab(RenderTreeBuilder b)
     {
         int i = 3000;
         var appMcp = IsAppMcp();
 
-        AddSection(b, ref i, "生图后端");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        AddSection(b, ref i, "生图后端", open: true, note: appMcp ? "APP-MCP 模板" : "工作流");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-row");
         b.OpenElement(i++, "button");
         b.AddAttribute(i++, "type", "button");
         b.AddAttribute(i++, "class", appMcp ? "cu-btn" : "cu-btn primary");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => Configuration.BackendMode = "workflow"));
-        b.AddContent(i++, "工作流模式（原有，默认）");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            MarkDirty();
+            if (Configuration.BackendMode != "workflow")
+                _backendSwitched = true;
+            Configuration.BackendMode = "workflow";
+        }));
+        b.AddContent(i++, "工作流模式（直连 /prompt）");
         b.CloseElement();
         b.OpenElement(i++, "button");
         b.AddAttribute(i++, "type", "button");
         b.AddAttribute(i++, "class", appMcp ? "cu-btn primary" : "cu-btn");
-        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => Configuration.BackendMode = "appmcp"));
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e =>
+        {
+            MarkDirty();
+            if (Configuration.BackendMode != "appmcp")
+                _backendSwitched = true;
+            Configuration.BackendMode = "appmcp";
+        }));
         b.AddContent(i++, "APP-MCP 模板模式");
         b.CloseElement();
         b.CloseElement();
-        AddHint(b, ref i, "切换后端后请「重载本模块」（面板的重载入口，或让 AI 调 reload_plugin），AI 提示词与函数说明才会按新模式生效。模板模式还依赖 ComfyUI 先装上第三方节点 APP-MCP，见下方教程。");
-        b.CloseElement();
+        AddHint(b, ref i, "切换后需重载本模块；模板参数在「生图」页填。");
+        AddHelp(b, ref i, "模板模式还要准备什么？",
+            "模板模式依赖 ComfyUI 先安装第三方开源节点 ComfyUI-APP-MCP（免费开源），"
+            + "安装步骤、新手避坑与文档链接在本页下方「安装 APP-MCP」里。"
+            + "\n重载后「生图」页会变成 APP-MCP 模板设置（地址 / 默认模板 / 参数 / 测试连通）。");
+        EndSection(b, ref i);
 
+        RenderStylePresetsSection(b, ref i);
+        RenderModelUnloadSection(b, ref i);
+
+        // 第三方节点教程：整块默认收起，不占主流程
         if (appMcp)
         {
-            AddSection(b, ref i, "APP-MCP 模板设置");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            AddInput(b, ref i, "APP-MCP 地址", Configuration.AppMcpUrl, v => Configuration.AppMcpUrl = v);
-            AddHint(b, ref i, "可填 http://127.0.0.1:8188/app-mcp 或 http://127.0.0.1:8188/mcp-server/api；留空自动由「ComfyUI 地址」推导。");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-grid2");
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "默认模板名", Configuration.AppMcpTemplate, v => Configuration.AppMcpTemplate = v);
-            AddHint(b, ref i, "如 913流；AI 也可用 template 参数切换。");
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "提示词输入参数名", Configuration.AppMcpPromptParam, v => Configuration.AppMcpPromptParam = v);
-            AddHint(b, ref i, "默认 positive；留空则自动取第一个字符串输入。");
-            b.CloseElement();
-            b.CloseElement();
-
-            AddTextArea(b, ref i, "模板默认参数（JSON 对象）", Configuration.AppMcpDefaultParams,
-                v => Configuration.AppMcpDefaultParams = v, 3);
-            AddHint(b, ref i, "示例 {\"参数名\": 值}；只有模板已声明的输入才生效，AI 可用 params 覆盖。");
-
-            AddTextArea(b, ref i, "模板自定义说明（注入 AI 提示词）", Configuration.AppMcpTemplateNotes,
-                v => Configuration.AppMcpTemplateNotes = v, 5);
-            AddHint(b, ref i, "自由填写，会随系统提示词一起注入给 AI，用来讲清模板各开关/参数的用法（例如每个开关开/关分别是什么效果）。多个模板可自行按模板名分段标注。");
-
-            AddInput(b, ref i, "等待出图超时（秒）", Configuration.AppMcpTimeoutSeconds.ToString(),
-                SetInt(v => Configuration.AppMcpTimeoutSeconds = Math.Clamp(v, 30, 1800)));
-
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-row");
-            b.AddAttribute(i++, "style", "margin-top:10px;");
-            b.OpenElement(i++, "button");
-            b.AddAttribute(i++, "type", "button");
-            b.AddAttribute(i++, "class", "cu-btn");
-            b.AddAttribute(i++, "disabled", _appMcpTesting);
-            b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, TestAppMcp));
-            b.AddContent(i++, _appMcpTesting ? "测试中…" : "测试连通并列出模板");
-            b.CloseElement();
-            b.CloseElement();
-            if (!string.IsNullOrWhiteSpace(_appMcpTestMessage))
-            {
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-detect");
-                b.AddContent(i++, _appMcpTestMessage);
-                b.CloseElement();
-            }
-            b.CloseElement();
-
-            // 画风预设 + 模型卸载：紧跟「APP-MCP 模板设置」，省得每次滑到最底
-            RenderStylePresetsSection(b, ref i);
-            RenderModelUnloadSection(b, ref i);
-        }
-        else
-        {
-            AddHint(b, ref i,
-                "原有模式：直连 ComfyUI /prompt，读取「工作流」页签里的 JSON，行为完全不变。\n"
-                + "想用「APP-MCP 模板模式」？它需要先在 ComfyUI 里安装第三方开源节点 ComfyUI-APP-MCP（免费开源）。点上面那个「APP-MCP 模板模式」按钮，本页就会出现完整安装教程、新手避坑清单与官方文档链接。");
-
-            // 工作流模式下模型卸载仍放在末尾
-            RenderModelUnloadSection(b, ref i);
-        }
-
-        // 模板模式的第三方节点：安装教程 + 避坑 + 文档链接（小白向，只在模板模式显示）
-        if (appMcp)
-        {
-            AddSection(b, ref i, "① 安装 APP-MCP 节点（第三方，模板模式依赖它）");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            AddNote(b, ref i, "本插件只是「调用方」：模板模式必须让 ComfyUI 先装上第三方开源节点 ComfyUI-APP-MCP，否则下面的「测试连通」一定失败。");
+            AddSection(b, ref i, "安装 APP-MCP 节点（第三方，首次使用看这里）", note: "6 步 + 避坑");
+            AddNote(b, ref i, "本插件只是「调用方」：模板模式必须让 ComfyUI 先装上 ComfyUI-APP-MCP，否则「测试连通」一定失败。");
             AddSteps(b, ref i,
                 "装节点（二选一）：① ComfyUI Manager → 搜索 app mode mcp → 安装（推荐）；② 手动：进 ComfyUI/custom_nodes 执行 git clone https://github.com/Lotus0614/ComfyUI-APP-MCP.git，再按该仓库 README 安装 requirements.txt 依赖（Windows 便携包要用包内 python_embeded\\python.exe）。",
                 "重启 ComfyUI（必须），确认启动日志没有报错。",
@@ -740,24 +765,17 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 "工作流用 Save 保存（不是 Export）；再进 ComfyUI 的 Settings → MCP Server → Templates → Create from Workflow 创建模板。",
                 "回到本插件：填「默认模板名」→ 点「测试连通并列出模板」，能看到模板与输入明细就算成功。");
             AddImage(b, ref i, UiAssets.AppBuilderEntryPng,
-                "找不到 App Builder？看这张图：ComfyUI 左上角「图形」下拉左边的那个方框图标就是 App Builder 入口（对应上面第 3 步，点它展开输入/输出标记面板）。");
-            b.CloseElement();
+                "找不到 App Builder？看这张图：ComfyUI 左上角「图形」下拉左边的那个方框图标就是 App Builder 入口（对应上面第 3 步）。");
 
-            AddSection(b, ref i, "② 新手避坑（最常见的 6 个坑）");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
             AddNote(b, ref i,
-                "1) 参数名必须完全一致：AI 传的名字要和模板输入名一字不差（含中文、大小写）；改名后要 Refresh 模板并重载本模块。\n"
+                "新手避坑（最常见的 6 个坑）：\n"
+                + "1) 参数名必须完全一致：AI 传的名字要和模板输入名一字不差（含中文、大小写）；改名后要 Refresh 模板并重载本模块。\n"
                 + "2) 自定义 UI 选项不能当输入：要标记的是它上方的「数据内容输入框」。例如 ZML 强力 LoRA 加载器需要暴露 lora_loader_data（本插件正是靠它切换画风组）。\n"
                 + "3) 模板的「输出」必须包含保存图片节点，否则插件拿不到图（会提示「未找到输出图片」）。\n"
                 + "4) 模板列表为空？工作流要用 Save 保存，且模板不能在 Templates 里被禁用。\n"
                 + "5) 改过工作流：在 Templates 里对同名模板点 Refresh，然后重载本模块。\n"
                 + "6) 想让每次自动随机 seed：把那个输入命名为 seed，运行时自动填随机值，AI 不用传。");
-            b.CloseElement();
 
-            AddSection(b, ref i, "③ 官方文档与源码（点不开可直接复制地址）");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
             AddLinkRow(b, ref i, "ComfyUI-APP-MCP 仓库（GitHub，含安装说明）",
                 "https://github.com/Lotus0614/ComfyUI-APP-MCP");
             AddLinkRow(b, ref i, "《工具参考》中文文档（模板/参数/输出格式）",
@@ -766,36 +784,121 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 "https://github.com/Lotus0614/ComfyUI-APP-MCP/blob/master/docs/zh/troubleshooting.md");
             AddLinkRow(b, ref i, "《独立部署与远程访问》文档",
                 "https://github.com/Lotus0614/ComfyUI-APP-MCP/blob/master/docs/zh/standalone.md");
-            AddHint(b, ref i,
-                "· 仓库地址以 Lotus0614 为准（旧链接 Luo-Lotus 会自动跳转，能打开但不是规范地址）。\n"
-                + "· 本插件走它的 REST 接口（/mcp-server/api），不需要你再配任何 MCP 客户端。\n"
-                + "· ComfyUI 端口不是 8188 也能用：地址填 http://127.0.0.1:<你的端口>/app-mcp 即可。");
+            EndSection(b, ref i);
+        }
+    }
+
+    /// <summary>画风预设：卡片式编辑器（工作流模式=节点覆盖，模板模式=模板输入）。</summary>
+    void RenderStylePresetsSection(RenderTreeBuilder b, ref int i)
+    {
+        var appMcp = IsAppMcp();
+        AddSection(b, ref i, "画风预设",
+            note: _styleCards.Count == 0 ? "未配置" : $"{_styleCards.Count} 个");
+
+        if (_styleCards.Count == 0)
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-empty");
+            b.AddContent(i++, appMcp
+                ? "暂无画风。填名称后点「添加画风」，再在卡片里填 ZML 组名即可。"
+                : "暂无画风。可在卡片里填节点覆盖参数，让同一工作流切换画风。");
+            b.CloseElement();
+        }
+        else
+        {
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cu-list");
+            for (var si = 0; si < _styleCards.Count; si++)
+            {
+                var styleIndex = si;
+                var card = _styleCards[si];
+                var expanded = _activeStyleIndex == si;
+
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-item");
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-itemhead");
+                b.AddAttribute(i++, "style", "cursor:pointer;");
+                b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => ToggleStyleExpand(styleIndex)));
+                b.OpenElement(i++, "span");
+                b.AddAttribute(i++, "class", "cu-label");
+                b.AddAttribute(i++, "style", "margin:0;");
+                b.AddContent(i++, string.IsNullOrWhiteSpace(card.Name) ? "(未命名)" : card.Name);
+                b.CloseElement();
+                b.OpenElement(i++, "span");
+                b.AddAttribute(i++, "class", "cu-empty");
+                b.AddAttribute(i++, "style", "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+                var preview = !string.IsNullOrWhiteSpace(card.Group) ? $"组 {card.Group}"
+                    : !string.IsNullOrWhiteSpace(card.Template) ? $"模板 {card.Template}" : "未填参数";
+                b.AddContent(i++, preview);
+                b.CloseElement();
+                b.OpenElement(i++, "span");
+                b.AddAttribute(i++, "class", "cu-label");
+                b.AddAttribute(i++, "style", "margin:0;");
+                b.AddContent(i++, expanded ? "收起" : "展开");
+                b.CloseElement();
+                b.CloseElement();
+
+                if (expanded)
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "style", "margin-top:8px;");
+                    AddInput(b, ref i, "画风名（AI 用 style=这个名字）", card.Name, v => UpdateStyleCardName(styleIndex, v));
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-grid2");
+                    AddInput(b, ref i, "模板名（可空，仅模板模式）", card.Template, v => UpdateStyleCardTemplate(styleIndex, v));
+                    AddInput(b, ref i, "ZML LoRA 组名（可空）", card.Group, v => UpdateStyleCardGroup(styleIndex, v));
+                    b.CloseElement();
+                    AddTextArea(b, ref i, "附加正向前缀（可空）", card.Prefix, v => UpdateStyleCardPrefix(styleIndex, v), 2);
+                    AddTextArea(b, ref i, appMcp ? "模板输入参数（JSON，可空）" : "节点覆盖参数（JSON，可空）",
+                        card.Params, v => UpdateStyleCardParams(styleIndex, v), 3);
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-row");
+                    b.OpenElement(i++, "button");
+                    b.AddAttribute(i++, "type", "button");
+                    b.AddAttribute(i++, "class", "cu-del");
+                    b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => RemoveStyleCard(styleIndex)));
+                    b.AddContent(i++, "删除");
+                    b.CloseElement();
+                    b.CloseElement();
+                    b.CloseElement();
+                }
+                b.CloseElement();
+            }
             b.CloseElement();
         }
 
-    }
-
-    /// <summary>画风预设区块（仅 APP-MCP 模板模式显示）。</summary>
-    void RenderStylePresetsSection(RenderTreeBuilder b, ref int i)
-    {
-        AddSection(b, ref i, "画风预设（一个模板切换多种画风）");
         b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddTextArea(b, ref i, "画风预设（JSON 数组）", Configuration.StylePresets,
-            v => Configuration.StylePresets = v, 8);
-        AddHint(b, ref i,
-            "最简用法：只写 ZML 组名 —— [{\"n\":\"示例组名\",\"g\":\"示例组名\"}]（只开该组即一种画风，数据由插件从当前模板读取）。\n"
-            + "精细用法：可选 \"t\" 模板名、\"f\" 附加前缀、\"p\" 模板输入（如 {\"lora_loader_data\":\"……\"}）。\n"
-            + "AI 在 generateimage 里传 style=\"画风名\" 切换；它也能用 getcomfyuistyle 查看可用的 ZML 组名。");
+        b.AddAttribute(i++, "class", "cu-grid2");
+        b.AddAttribute(i++, "style", "margin-top:10px;");
+        AddInput(b, ref i, "新画风名", _newStyleName, v => _newStyleName = v);
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "style", "display:flex;align-items:flex-end;");
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "class", "cu-btn primary");
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => AddStyleCard()));
+        b.AddContent(i++, "+ 添加画风");
         b.CloseElement();
+        b.CloseElement();
+        b.CloseElement();
+
+        AddHelp(b, ref i, "画风预设怎么用？",
+            "AI 在 generateimage 里传 style=\"画风名\" 即可切换；也能用 getcomfyuistyle 查看已配画风与模板可用的 ZML 组名。\n"
+            + (appMcp
+                ? "最简用法：只填「ZML LoRA 组名」——插件会从当前模板读出该组并只开它。\n"
+                  + "精细用法：再填模板名、附加前缀与模板输入 JSON（如 {\"lora_loader_data\":\"……\"}）。"
+                : "工作流模式下，「节点覆盖参数」是 JSON：键为节点 ID，值为该节点要覆盖的 inputs，例如 {\"11\":{\"lora_loader_data\":\"…\"}}。"));
+        EndSection(b, ref i);
     }
 
     /// <summary>模型卸载与显存释放区块（两种后端模式共用）。</summary>
     void RenderModelUnloadSection(RenderTreeBuilder b, ref int i)
     {
-        AddSection(b, ref i, "模型卸载与显存释放");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        AddSection(b, ref i, "模型卸载与显存释放",
+            note: Configuration.EnableAutoUnload
+                ? $"空闲 {Configuration.AutoUnloadIdleHours}h{Configuration.AutoUnloadIdleMinutes}m"
+                : "仅手动");
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-row");
         b.OpenElement(i++, "button");
@@ -805,17 +908,16 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(i++, "onclick", EventCallback.Factory.Create(this, UnloadModels));
         b.AddContent(i++, _unloadingModel ? "卸载中…" : "立即卸载模型（释放显存）");
         b.CloseElement();
+        b.CloseElement();
         if (!string.IsNullOrWhiteSpace(_unloadMessage))
         {
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cu-detect");
-            b.AddAttribute(i++, "style", "margin:0;");
             b.AddContent(i++, _unloadMessage);
             b.CloseElement();
         }
-        b.CloseElement();
 
-        AddCheck(b, ref i, "空闲自动卸载：距上次生图空闲超时后自动卸载模型", Configuration.EnableAutoUnload,
+        AddCheck(b, ref i, "空闲自动卸载：距上次生图空闲超时后自动卸载", Configuration.EnableAutoUnload,
             v => Configuration.EnableAutoUnload = v);
         if (Configuration.EnableAutoUnload)
         {
@@ -832,71 +934,71 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 SetInt(v => Configuration.AutoUnloadIdleMinutes = Math.Clamp(v, 0, 59)));
             b.CloseElement();
             b.CloseElement();
-            AddHint(b, ref i, $"合计空闲 {Configuration.AutoUnloadIdleHours} 小时 {Configuration.AutoUnloadIdleMinutes} 分钟后自动卸载（需保存配置后生效）。");
         }
-        b.CloseElement();
+        AddHint(b, ref i, "生图中不会自动卸载；时长改完需保存配置。");
+        EndSection(b, ref i);
     }
 
     // ============================================================
-    // 页签 4：提示词（种类 / 前缀 / 负面 / 预设）
+    // 页签 2：提示词（种类 / 前缀与负面 / 预设）
     // ============================================================
     void RenderPromptTab(RenderTreeBuilder b)
     {
         int i = 4000;
         var appMcp = IsAppMcp();
 
-        AddSection(b, ref i, "提示词种类");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        AddSection(b, ref i, "提示词种类", open: true,
+            note: Configuration.PromptStyle switch
+            {
+                "natural" => "自然语言",
+                "hybrid" => "混合",
+                _ => "纯 Tag"
+            });
         AddSelect(b, ref i, "提示词种类", Configuration.PromptStyle, v => Configuration.PromptStyle = v, new[]
         {
             ("tag", "纯 Tag — 全小写英文标签，逗号分隔"),
             ("natural", "自然语言 — 角色 Tag 置前 + 英文短句"),
             ("hybrid", "混合模式 — 静态用标签，动作/关系用短句")
         });
-        AddHint(b, ref i, "控制 AI 落笔格式；与固定前缀叠加时仍会自动去重。AI 默认不写画风/质量词（由前缀或工作流决定）。");
-        b.CloseElement();
+        AddHint(b, ref i, "只影响 AI 的写法；提示词原样进工作流（不拆段、不去重）。");
+        EndSection(b, ref i);
 
-        AddSection(b, ref i, "固定前缀与负面（两个模式通用）");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        var hasPrefix = !string.IsNullOrWhiteSpace(Configuration.PositivePromptPrefix);
+        AddSection(b, ref i, "固定前缀与负面", open: !hasPrefix,
+            note: hasPrefix ? "已设前缀" : null);
 
         if (appMcp)
         {
             AddCheck(b, ref i, "模板模式下也拼接上面的固定正向提示词前缀", Configuration.AppMcpUseGlobalPrefix,
                 v => Configuration.AppMcpUseGlobalPrefix = v);
-            AddHint(b, ref i, "默认开（两个模式行为一致）。若模板内部已带画风/质量前缀（如 913流 的节点 52），关闭可避免重复。");
         }
 
         AddTextArea(b, ref i, "固定正向提示词前缀（逗号或换行均可）",
-            Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 5);
-        AddHint(b, ref i, appMcp
-            ? "拼在 prompt 最前，与 AI 提示词合并去重后统一英文逗号+空格；留空则不拼接。"
-            : "与 AI 提示词合并后自动去重，统一英文逗号+空格。命名工作流可在「工作流」页签各自设前缀；留空则不拼接。");
+            Configuration.PositivePromptPrefix, v => Configuration.PositivePromptPrefix = v, 4);
+        AddHint(b, ref i, "原样拼在 AI 提示词最前，用「, 」连接；留空则不拼接。");
 
         AddTextArea(b, ref i, "固定负面提示词", Configuration.NegativePrompt, v => Configuration.NegativePrompt = v, 3);
         AddHint(b, ref i, appMcp
-            ? "模板模式下仅当模板声明了 negative / 负面提示词 输入时才会写入；留空则不发送。"
-            : "留空=用工作流自带负面；填写则覆盖并规范为英文逗号分隔。");
-        b.CloseElement();
+            ? "模板声明了 negative / 负面提示词 输入时才会写入；留空则不发送。"
+            : "留空=用工作流自带负面；填写则原样覆盖。");
+        AddHelp(b, ref i, "命名工作流的前缀在哪设？",
+            "「生图 → 多工作流」里每张卡片都能单独设固定正向前缀，留空则沿用这里的全局前缀。"
+            + "模板模式若模板内部已带画风/质量前缀（如 913流 的节点 52），可关掉上面的开关避免重复。");
+        EndSection(b, ref i);
 
-        AddSection(b, ref i, "提示词预设");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
-        AddHint(b, ref i, "保存常用片段（角色人设/动作/背景），AI 用 getpromptpreset 检索复用。数据存于 Storage/Config/Alife.Plugin.Comfyui/（插件更新不会清空）。");
+        AddSection(b, ref i, "提示词预设",
+            note: _presetCards.Count == 0 ? "未配置" : $"{_presetCards.Count} 个");
 
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "cu-grid2");
-        b.OpenElement(i++, "div");
         AddInput(b, ref i, "预设名称", _newPresetName, v => _newPresetName = v);
-        b.CloseElement();
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "style", "display:flex;align-items:flex-end;");
         b.OpenElement(i++, "button");
         b.AddAttribute(i++, "type", "button");
         b.AddAttribute(i++, "class", "cu-btn primary");
         b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, e => AddPresetCard()));
-        b.AddContent(i++, "保存预设");
+        b.AddContent(i++, "+ 保存预设");
         b.CloseElement();
         b.CloseElement();
         b.CloseElement();
@@ -961,43 +1063,45 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             b.CloseElement();
         }
         b.CloseElement();
-        b.CloseElement();
+        AddHelp(b, ref i, "预设存在哪？AI 怎么用？",
+            "数据存于 Storage/Config/Alife.Plugin.Comfyui/prompt-presets.json，插件更新不会清空。\n"
+            + "AI 用 getpromptpreset 按名检索复用；同名保存会覆盖。");
+        EndSection(b, ref i);
     }
 
     // ============================================================
-    // 页签 5：检索（在线标签 / 在线角色）
+    // 进阶页 · 在线检索（标签 / 角色）
     // ============================================================
-    void RenderSearchTab(RenderTreeBuilder b)
+    void RenderOnlineSections(RenderTreeBuilder b, ref int i)
     {
-        int i = 5000;
-
-        AddSection(b, ref i, "在线 Danbooru 语义标签检索");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        AddSection(b, ref i, "在线标签检索", note: Configuration.EnableDanbooruSearch ? "已开" : "未开");
         AddCheck(b, ref i, "启用语义标签检索（search / related）", Configuration.EnableDanbooruSearch,
             v => Configuration.EnableDanbooruSearch = v);
-        AddCheck(b, ref i, "启用画师推荐（额外外网调用，依赖总开关）", Configuration.EnableDanbooruArtistRecommend,
+        AddCheck(b, ref i, "启用画师推荐（依赖总开关）", Configuration.EnableDanbooruArtistRecommend,
             v => Configuration.EnableDanbooruArtistRecommend = v,
             enabled: Configuration.EnableDanbooruSearch);
-        AddHint(b, ref i, "默认关=零外网。有服装/姿势/场景等细节时 AI 可检索标准 tag；失败会自写英文仍可生图。需重载模块后函数才注册。");
+        AddHint(b, ref i, "默认关=零外网；开启后需重载模块函数才注册。");
 
         if (Configuration.EnableDanbooruSearch)
         {
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-grid2");
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "主源 URL", Configuration.DanbooruSearchPrimaryUrl, v => Configuration.DanbooruSearchPrimaryUrl = v);
-            AddHint(b, ref i, "默认官方备份域（大陆通常更快）；自建后不再自动回退备用。");
-            AddInput(b, ref i, "超时秒数（总预算）", Configuration.DanbooruSearchTimeoutSeconds.ToString(),
-                SetInt(v => Configuration.DanbooruSearchTimeoutSeconds = Math.Clamp(v, 10, 120)));
-            b.CloseElement();
-            b.OpenElement(i++, "div");
-            AddInput(b, ref i, "备用 URL（可空）", Configuration.DanbooruSearchFallbackUrl, v => Configuration.DanbooruSearchFallbackUrl = v);
-            AddHint(b, ref i, "默认 HF Space，可能冷启 30–60s。");
-            AddCheck(b, ref i, "包含 NSFW 标签（默认关，用 SFW）", Configuration.DanbooruSearchShowNsfw,
-                v => Configuration.DanbooruSearchShowNsfw = v);
-            b.CloseElement();
-            b.CloseElement();
+            if (Configuration.ShowExpertOptions)
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cu-grid2");
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "主源 URL", Configuration.DanbooruSearchPrimaryUrl, v => Configuration.DanbooruSearchPrimaryUrl = v);
+                AddHint(b, ref i, "默认官方备份域（大陆通常更快）；自建后不再自动回退备用。");
+                AddInput(b, ref i, "超时秒数（总预算）", Configuration.DanbooruSearchTimeoutSeconds.ToString(),
+                    SetInt(v => Configuration.DanbooruSearchTimeoutSeconds = Math.Clamp(v, 10, 120)));
+                b.CloseElement();
+                b.OpenElement(i++, "div");
+                AddInput(b, ref i, "备用 URL（可空）", Configuration.DanbooruSearchFallbackUrl, v => Configuration.DanbooruSearchFallbackUrl = v);
+                AddHint(b, ref i, "默认 HF Space，可能冷启 30–60s。");
+                AddCheck(b, ref i, "包含 NSFW 标签（默认关，用 SFW）", Configuration.DanbooruSearchShowNsfw,
+                    v => Configuration.DanbooruSearchShowNsfw = v);
+                b.CloseElement();
+                b.CloseElement();
+            }
 
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cu-row");
@@ -1017,18 +1121,20 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 b.AddContent(i++, _danbooruTestMessage);
                 b.CloseElement();
             }
-            AddHint(b, ref i, "使用公开服务时请友情链接上游（点不开可直接复制地址）：");
+            AddHint(b, ref i, "使用公开服务时请友情链接上游：");
             AddLinkRow(b, ref i, "DanbooruSearch 在线服务（Hugging Face Space）",
                 "https://huggingface.co/spaces/SAkizuki/DanbooruSearch");
         }
-        b.CloseElement();
+        AddHelp(b, ref i, "为什么要开？",
+            "有服装/姿势/场景等细节时，AI 可把自然语言转成标准 Danbooru tag，出图更准；"
+            + "检索失败会自动回到自写英文，仍能正常生图。");
+        EndSection(b, ref i);
 
-        AddSection(b, ref i, "在线角色检索扩充");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
+        AddSection(b, ref i, "在线角色检索",
+            note: Configuration.EnableAnimadexCharacterSearch ? "已开" : "未开");
         AddCheck(b, ref i, "启用在线角色检索（本地未命中时联网补查）", Configuration.EnableAnimadexCharacterSearch,
             v => Configuration.EnableAnimadexCharacterSearch = v);
-        AddHint(b, ref i, "仅作本地索引补充：本地未命中、或带作品名仍歧义时联网查在线角色库。本地命中仍优先，默认关=零外网。");
+        AddHint(b, ref i, "仅补充本地索引：本地命中仍优先，默认关=零外网。");
 
         if (Configuration.EnableAnimadexCharacterSearch)
         {
@@ -1051,19 +1157,22 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
             if (useMirror)
             {
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-grid2");
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "镜像地址", Configuration.CharacterMirrorUrl, v => Configuration.CharacterMirrorUrl = v);
-                AddHint(b, ref i, "默认与「在线标签检索」同一个 DanbooruSearch 服务（国内可直连）。");
-                b.CloseElement();
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "超时秒数", Configuration.CharacterMirrorTimeoutSeconds.ToString(),
-                    SetInt(v => Configuration.CharacterMirrorTimeoutSeconds = Math.Clamp(v, 3, 60)));
-                AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
-                    SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
-                b.CloseElement();
-                b.CloseElement();
+                if (Configuration.ShowExpertOptions)
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-grid2");
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "镜像地址", Configuration.CharacterMirrorUrl, v => Configuration.CharacterMirrorUrl = v);
+                    AddHint(b, ref i, "默认与「在线标签检索」同一个 DanbooruSearch 服务（国内可直连）。");
+                    b.CloseElement();
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "超时秒数", Configuration.CharacterMirrorTimeoutSeconds.ToString(),
+                        SetInt(v => Configuration.CharacterMirrorTimeoutSeconds = Math.Clamp(v, 3, 60)));
+                    AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
+                        SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
+                    b.CloseElement();
+                    b.CloseElement();
+                }
 
                 b.OpenElement(i++, "div");
                 b.AddAttribute(i++, "class", "cu-row");
@@ -1090,20 +1199,23 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
             if (useBooru)
             {
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-grid2");
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "Danbooru API 地址", Configuration.DanbooruCharacterBaseUrl,
-                    v => Configuration.DanbooruCharacterBaseUrl = v);
-                AddHint(b, ref i, "默认 https://danbooru.donmai.us。连不上可填自建反向代理；不要填网页版路径。");
-                b.CloseElement();
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "超时秒数", Configuration.DanbooruCharacterTimeoutSeconds.ToString(),
-                    SetInt(v => Configuration.DanbooruCharacterTimeoutSeconds = Math.Clamp(v, 5, 60)));
-                AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
-                    SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
-                b.CloseElement();
-                b.CloseElement();
+                if (Configuration.ShowExpertOptions)
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-grid2");
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "Danbooru API 地址", Configuration.DanbooruCharacterBaseUrl,
+                        v => Configuration.DanbooruCharacterBaseUrl = v);
+                    AddHint(b, ref i, "默认 https://danbooru.donmai.us。连不上可填自建反向代理；不要填网页版路径。");
+                    b.CloseElement();
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "超时秒数", Configuration.DanbooruCharacterTimeoutSeconds.ToString(),
+                        SetInt(v => Configuration.DanbooruCharacterTimeoutSeconds = Math.Clamp(v, 5, 60)));
+                    AddInput(b, ref i, "最少图片数（过滤冷门/背景角色）", Configuration.DanbooruCharacterMinPosts.ToString(),
+                        SetInt(v => Configuration.DanbooruCharacterMinPosts = Math.Clamp(v, 0, 100000)));
+                    b.CloseElement();
+                    b.CloseElement();
+                }
 
                 b.OpenElement(i++, "div");
                 b.AddAttribute(i++, "class", "cu-row");
@@ -1130,17 +1242,20 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
 
             if (useAnimadex)
             {
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-grid2");
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "AnimaDex 服务地址", Configuration.AnimadexBaseUrl, v => Configuration.AnimadexBaseUrl = v);
-                AddHint(b, ref i, "默认 animadex.net。部分地区/网络无法直连时会超时，建议改用 Danbooru。");
-                b.CloseElement();
-                b.OpenElement(i++, "div");
-                AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(),
-                    SetInt(v => Configuration.AnimadexTimeoutSeconds = Math.Clamp(v, 5, 60)));
-                b.CloseElement();
-                b.CloseElement();
+                if (Configuration.ShowExpertOptions)
+                {
+                    b.OpenElement(i++, "div");
+                    b.AddAttribute(i++, "class", "cu-grid2");
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "AnimaDex 服务地址", Configuration.AnimadexBaseUrl, v => Configuration.AnimadexBaseUrl = v);
+                    AddHint(b, ref i, "默认 animadex.net。部分地区/网络无法直连时会超时，建议改用 Danbooru。");
+                    b.CloseElement();
+                    b.OpenElement(i++, "div");
+                    AddInput(b, ref i, "超时秒数", Configuration.AnimadexTimeoutSeconds.ToString(),
+                        SetInt(v => Configuration.AnimadexTimeoutSeconds = Math.Clamp(v, 5, 60)));
+                    b.CloseElement();
+                    b.CloseElement();
+                }
 
                 b.OpenElement(i++, "div");
                 b.AddAttribute(i++, "class", "cu-row");
@@ -1163,39 +1278,39 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 AddHint(b, ref i, "AnimaDex 不支持中文检索：中文角色名本地未收录时会提示改用英文/罗马字。");
             }
         }
-        b.CloseElement();
+        EndSection(b, ref i);
     }
 
     // ============================================================
-    // 页签 6：高级（注入方式 / 节点控制 / 节点概览）
+    // 页签 3：进阶（显示选项 / AI 注入 / 节点 / 在线检索 / 关于）
     // ============================================================
     void RenderAdvancedTab(RenderTreeBuilder b)
     {
         int i = 6000;
-
         var appMcp = IsAppMcp();
+        var expert = Configuration.ShowExpertOptions;
 
-        AddSection(b, ref i, "AI 注入方式");
+        AddSection(b, ref i, "显示选项", open: true, note: expert ? "专家模式" : "精简模式");
+        AddToggle(b, ref i, "显示专家选项", "EXPERT", Configuration.ShowExpertOptions,
+            v => Configuration.ShowExpertOptions = v);
+        AddHint(b, ref i, "默认只显示必填项；打开后可微调节点 ID、轮询间隔、在线地址与超时等。");
+        EndSection(b, ref i);
+
+        AddSection(b, ref i, "AI 注入方式", note: Configuration.ImplicitInjection ? "隐式" : "显式");
         AddToggle(b, ref i, "隐式注入（省 token）", "4.0", Configuration.ImplicitInjection,
             v => Configuration.ImplicitInjection = v);
-        AddHint(b, ref i, "开启后函数文档不直接注入系统提示词，AI 先调用 <comfyuiimagegeneration/> 按需加载；关闭为显式注入（默认）。改动需重载模块后生效。");
+        AddHint(b, ref i, "改动需重载模块后生效。");
+        AddHelp(b, ref i, "显式 / 隐式有什么区别？",
+            "显式（默认）：函数文档直接注入系统提示词，AI 立刻会用。\n"
+            + "隐式：文档不直接注入，AI 需先调用 <comfyuiimagegeneration/> 按需加载，省 token 但多一次调用。");
+        EndSection(b, ref i);
 
-        if (appMcp)
+        if (!appMcp)
         {
-            AddSection(b, ref i, "工作流节点相关");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cu-panel");
-            AddHint(b, ref i,
-                "「AI 节点控制」与「工作流节点概览」在 APP-MCP 模板模式下不适用（模板不使用工作流节点），"
-                + "已自动隐藏，相关规则也已从 AI 提示词中移除；切回工作流模式即恢复。");
-            b.CloseElement();
-        }
-        else
-        {
+            AddSection(b, ref i, "节点控制与概览",
+                note: Configuration.AdvancedMode ? "概览已开" : null);
             AddToggle(b, ref i, "AI 节点控制", "ADVANCED", Configuration.EnableNodeControl,
                 v => Configuration.EnableNodeControl = v);
-            AddHint(b, ref i, "开启后 AI 可直接操控工作流节点参数（换模型/步数/CFG/采样器等）。不开启则保持原有简单模式。");
-
             AddToggle(b, ref i, "工作流节点概览", "BETA", Configuration.AdvancedMode,
                 v => Configuration.AdvancedMode = v,
                 afterToggleAsync: async () =>
@@ -1203,13 +1318,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                     if (Configuration.AdvancedMode)
                         await LoadNodeOverview();
                 });
-            AddHint(b, ref i, "开启后展示工作流全部节点类型与关键参数，便于排查问题或手动配置节点映射。");
+            AddHint(b, ref i, "节点控制让 AI 能换模型/步数/采样器；概览用于排查工作流。");
 
             if (Configuration.AdvancedMode)
             {
-                AddSection(b, ref i, "节点概览");
-                b.OpenElement(i++, "div");
-                b.AddAttribute(i++, "class", "cu-panel");
                 if (!string.IsNullOrWhiteSpace(_nodeOverviewError))
                 {
                     b.OpenElement(i++, "div");
@@ -1221,44 +1333,89 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
                 {
                     b.OpenElement(i++, "div");
                     b.AddAttribute(i++, "class", "cu-empty");
-                    b.AddContent(i++, "尚未加载。切换一次本页签或关闭再开启上面开关即可加载。");
+                    b.AddContent(i++, "尚未加载。切换一次本页签或重开上面开关即可加载。");
                     b.CloseElement();
                 }
-                AddNodeOverview(b, ref i);
-                b.CloseElement();
+                else
+                {
+                    AddNodeOverview(b, ref i);
+                }
             }
+            EndSection(b, ref i);
         }
 
+        RenderOnlineSections(b, ref i);
+
         AddSection(b, ref i, "关于与依赖");
-        b.OpenElement(i++, "div");
-        b.AddAttribute(i++, "class", "cu-panel");
         AddHint(b, ref i,
-            "ComfyUI × Alife · Doro 的妙妙工具。\n"
-            + "配置改完请用面板的保存入口应用；切换生图后端后需要重载本模块才会生效。\n"
-            + "本插件可在 Alife 的「插件市场」里搜索安装/更新。\n"
-            + "提示词预设存放目录（插件更新不会清空）：\n" + ComfyuiService.GetUserDataDirectory());
-        AddHint(b, ref i,
-            "可选依赖（按需，装完请重载本模块）：\n"
-            + "· 模板模式 → ComfyUI 侧需装第三方节点 ComfyUI-APP-MCP（「后端 · 画风」页有安装教程与链接）。\n"
-            + "· 工作流用到的自定义节点（ZML / WeiLin / Crystools / DLSS 等）必须在 ComfyUI 侧已安装，工作流才能在那边跑通。");
+            "ComfyUI × Alife · Doro 的妙妙工具，可在插件市场搜索安装/更新。\n"
+            + "配置改完用面板的保存入口应用；切换后端需重载模块。");
+        AddHelp(b, ref i, "依赖与数据目录",
+            "可选依赖（装完请重载本模块）：\n"
+            + "· 模板模式 → ComfyUI 侧需装第三方节点 ComfyUI-APP-MCP（「后端 · 画风」页有教程）。\n"
+            + "· 工作流用到的自定义节点（ZML / WeiLin / Crystools / DLSS 等）需在 ComfyUI 侧已安装。\n"
+            + "提示词预设目录（插件更新不会清空）：" + ComfyuiService.GetUserDataDirectory());
         AddLinkRow(b, ref i, "ComfyUI-APP-MCP（模板模式依赖，GitHub）",
             "https://github.com/Lotus0614/ComfyUI-APP-MCP");
         AddLinkRow(b, ref i, "在线标签检索上游 DanbooruSearchOnline（MIT）",
             "https://github.com/SuzumiyaAkizuki/DanbooruSearchOnline");
         AddLinkRow(b, ref i, "在线角色检索上游 AnimaDex", "https://animadex.net");
-        b.CloseElement();
+        EndSection(b, ref i);
     }
 
     // ============================================================
     // 轻量渲染辅助
     // ============================================================
-    void AddSection(RenderTreeBuilder b, ref int seq, string text)
+    /// <summary>
+    /// 可折叠分区：标题常显、内容默认收起（open=true 的分区默认展开）。
+    /// 用原生 &lt;details&gt;，不依赖 JS；展开状态由浏览器自己保存，重渲染不会把用户展开的分区收回去。
+    /// 必须与 <see cref="EndSection"/> 成对使用。
+    /// </summary>
+    void AddSection(RenderTreeBuilder b, ref int seq, string title, bool open = false, string? note = null)
     {
-        b.OpenElement(seq++, "div");
+        b.OpenElement(seq++, "details");
         b.AddAttribute(seq++, "class", "cu-sec");
-        b.AddContent(seq++, text);
+        if (open)
+            b.AddAttribute(seq++, "open", true);
+
+        b.OpenElement(seq++, "summary");
+        b.AddContent(seq++, title);
+        if (!string.IsNullOrWhiteSpace(note))
+        {
+            b.OpenElement(seq++, "span");
+            b.AddAttribute(seq++, "class", "cu-sec-hint");
+            b.AddAttribute(seq++, "title", note);
+            b.AddContent(seq++, note);
+            b.CloseElement();
+        }
+        b.CloseElement(); // summary
+
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-sec-body");
+    }
+
+    void EndSection(RenderTreeBuilder b, ref int seq)
+    {
+        b.CloseElement(); // cu-sec-body
+        b.CloseElement(); // details
+    }
+
+    /// <summary>长解释折叠块：默认只显示一行摘要，点开才看详情。</summary>
+    void AddHelp(RenderTreeBuilder b, ref int seq, string summary, string detail)
+    {
+        b.OpenElement(seq++, "details");
+        b.AddAttribute(seq++, "class", "cu-help");
+        b.OpenElement(seq++, "summary");
+        b.AddContent(seq++, summary);
+        b.CloseElement();
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "cu-hint");
+        b.AddContent(seq++, detail);
+        b.CloseElement();
         b.CloseElement();
     }
+
+    void MarkDirty() => _dirty = true;
 
     void AddHint(RenderTreeBuilder b, ref int seq, string text)
     {
@@ -1288,7 +1445,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "class", "cu-input");
         b.AddAttribute(seq++, "value", value ?? "");
         b.AddAttribute(seq++, "onchange",
-            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                MarkDirty();
+                onChange(e.Value?.ToString() ?? "");
+            }));
         b.CloseElement();
     }
 
@@ -1306,7 +1467,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "spellcheck", "false");
         b.AddAttribute(seq++, "value", value ?? "");
         b.AddAttribute(seq++, "onchange",
-            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                MarkDirty();
+                onChange(e.Value?.ToString() ?? "");
+            }));
         b.CloseElement();
     }
 
@@ -1321,7 +1486,11 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "class", "cu-select");
         b.AddAttribute(seq++, "value", value ?? "");
         b.AddAttribute(seq++, "onchange",
-            EventCallback.Factory.Create<ChangeEventArgs>(this, e => onChange(e.Value?.ToString() ?? "")));
+            EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
+            {
+                MarkDirty();
+                onChange(e.Value?.ToString() ?? "");
+            }));
         foreach (var opt in options)
         {
             b.OpenElement(seq++, "option");
@@ -1346,6 +1515,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, e =>
         {
             if (!enabled) return;
+            MarkDirty();
             onChanged((bool)(e.Value ?? false));
         }));
         b.CloseElement();
@@ -1363,6 +1533,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddAttribute(seq++, "class", "cu-toggle");
         b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, async e =>
         {
+            MarkDirty();
             onChanged(!value);
             if (afterToggleAsync != null)
                 await afterToggleAsync();
@@ -2090,6 +2261,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             });
         }
         Configuration.NamedWorkflows = arr.ToJsonString();
+        MarkDirty();
     }
 
     void AddWorkflowCard()
@@ -2243,6 +2415,151 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
     void TogglePresetExpand(int index)
     {
         _activePresetIndex = _activePresetIndex == index ? -1 : index;
+        StateHasChanged();
+    }
+
+    // ===================== 画风预设卡片管理 =====================
+
+    void LoadStyleCards()
+    {
+        _styleCards = new();
+        var json = Configuration?.StylePresets ?? "[]";
+        if (string.IsNullOrWhiteSpace(json)) return;
+
+        try
+        {
+            if (JsonNode.Parse(json) is not JsonArray arr)
+                return;
+            foreach (var item in arr.OfType<JsonObject>())
+            {
+                var name = WfJsonString(item, "n") ?? WfJsonString(item, "name") ?? "";
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+                var template = WfJsonString(item, "t") ?? WfJsonString(item, "template") ?? "";
+                var prefix = WfJsonString(item, "f") ?? WfJsonString(item, "prefix") ?? "";
+                var group = WfJsonString(item, "g") ?? WfJsonString(item, "group") ?? "";
+
+                var pNode = item["p"] ?? item["params"];
+                var paramsJson = pNode switch
+                {
+                    JsonObject po => po.ToJsonString(),
+                    JsonValue pv when pv.GetValueKind() == System.Text.Json.JsonValueKind.String
+                        => pv.GetValue<string>() ?? "",
+                    _ => ""
+                };
+
+                _styleCards.Add(new StyleCard
+                {
+                    Name = name,
+                    Template = template,
+                    Prefix = prefix,
+                    Group = group,
+                    Params = paramsJson
+                });
+            }
+        }
+        catch
+        {
+            // 配置里的 JSON 坏了：当作没有画风，避免整个面板打不开
+        }
+    }
+
+    void SaveStyleCards()
+    {
+        var arr = new JsonArray();
+        foreach (var card in _styleCards)
+        {
+            if (string.IsNullOrWhiteSpace(card.Name))
+                continue;
+
+            var obj = new JsonObject { ["n"] = card.Name.Trim() };
+            if (!string.IsNullOrWhiteSpace(card.Template))
+                obj["t"] = card.Template.Trim();
+            if (!string.IsNullOrWhiteSpace(card.Prefix))
+                obj["f"] = card.Prefix;
+            if (!string.IsNullOrWhiteSpace(card.Group))
+                obj["g"] = card.Group.Trim();
+            if (!string.IsNullOrWhiteSpace(card.Params))
+            {
+                var p = card.Params.Trim();
+                try { obj["p"] = JsonNode.Parse(p)?.DeepClone(); }
+                catch { obj["p"] = p; } // 非法 JSON 原样保留，调用时会给出可读报错
+            }
+            arr.Add(obj);
+        }
+
+        Configuration.StylePresets = arr.ToJsonString();
+        MarkDirty();
+    }
+
+    void AddStyleCard()
+    {
+        var name = _newStyleName?.Trim() ?? "";
+        if (name.Length == 0)
+        {
+            StateHasChanged();
+            return;
+        }
+        if (name.Length > 60) name = name[..60];
+
+        _styleCards = _styleCards
+            .Where(c => !c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        // 模板模式最省事的用法是「组名 = 画风名」，默认帮用户填上
+        _styleCards.Add(new StyleCard { Name = name, Group = IsAppMcp() ? name : "" });
+        _newStyleName = "";
+        SaveStyleCards();
+        _activeStyleIndex = _styleCards.Count - 1;
+        StateHasChanged();
+    }
+
+    void RemoveStyleCard(int index)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards.RemoveAt(index);
+        _activeStyleIndex = -1;
+        SaveStyleCards();
+        StateHasChanged();
+    }
+
+    void UpdateStyleCardName(int index, string name)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards[index] = _styleCards[index] with { Name = name };
+        SaveStyleCards();
+    }
+
+    void UpdateStyleCardTemplate(int index, string template)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards[index] = _styleCards[index] with { Template = template };
+        SaveStyleCards();
+    }
+
+    void UpdateStyleCardPrefix(int index, string prefix)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards[index] = _styleCards[index] with { Prefix = prefix };
+        SaveStyleCards();
+    }
+
+    void UpdateStyleCardGroup(int index, string group)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards[index] = _styleCards[index] with { Group = group };
+        SaveStyleCards();
+    }
+
+    void UpdateStyleCardParams(int index, string parameters)
+    {
+        if (index < 0 || index >= _styleCards.Count) return;
+        _styleCards[index] = _styleCards[index] with { Params = parameters };
+        SaveStyleCards();
+    }
+
+    void ToggleStyleExpand(int index)
+    {
+        _activeStyleIndex = _activeStyleIndex == index ? -1 : index;
         StateHasChanged();
     }
 }

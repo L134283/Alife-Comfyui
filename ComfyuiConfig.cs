@@ -16,10 +16,10 @@ public class ComfyuiConfig
     [Description("正向提示词输入字段名，默认 positive；标准 CLIPTextEncode 用 text")]
     public string PositivePromptInput { get; set; } = "positive";
 
-    [Description("固定正向提示词前缀（默认工作流用）。命名工作流可在各自卡片里单独设置前缀，留空则沿用此项。生图时与 AI 提示词合并后自动去重，统一为「英文逗号+空格」分隔；此项留空则不拼接")]
+    [Description("固定正向提示词前缀（默认工作流用）。命名工作流可在各自卡片里单独设置前缀，留空则沿用此项。生图时原样拼在 AI 提示词最前（不拆段、不去重），用「, 」连接；此项留空则不拼接")]
     public string PositivePromptPrefix { get; set; } = "";
 
-    [Description("固定负面提示词。填写后覆盖工作流负面，并规范为英文逗号分隔；留空则使用工作流自带负面")]
+    [Description("固定负面提示词。填写后原样覆盖工作流负面（不去重、不改写）；留空则使用工作流自带负面")]
     public string NegativePrompt { get; set; } = "";
 
     [Description("默认工作流的负面提示词节点 ID。留空则自动识别；命名工作流始终按各自连接关系识别")]
@@ -108,6 +108,9 @@ public class ComfyuiConfig
 
     [Description("高级模式开关：开启后显示工作流节点概览，供进阶用户使用")]
     public bool AdvancedMode { get; set; } = false;
+
+    [Description("显示专家选项：开启后可见节点映射、API Token、兜底宽高、轮询间隔、图目录、在线检索地址与超时等低频配置。默认关，只显示必填项")]
+    public bool ShowExpertOptions { get; set; } = false;
 
     [Description("AI 节点控制开关：开启后 AI 可操控模型/步数/采样器等节点参数。不影响原有简单模式")]
     public bool EnableNodeControl { get; set; } = false;
