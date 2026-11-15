@@ -18,7 +18,7 @@
 - **复杂工作流兼容**：支持 GetNode/SetNode 跨图引用、多采样器（一采+二采+局部重绘）、多保存节点目录
 - **模型卸载与显存释放**：UI 一键卸载已加载模型释放显存/内存；可设置空闲 N 小时 N 分钟后自动卸载；AI 可调 `unloadcomfyuimodels` 立即卸载、`setcomfyuiidleunload` 查看/设置空闲自动卸载（设置会持久化）
 - **APP-MCP 模板模式（可选，与原有工作流模式共存）**：直接调用 ComfyUI-APP-MCP 的模板，AI 只填模板输入（如 `positive` 等模板已声明的输入），无需在本插件里配置节点；`templateparams` 可传任意已声明的模板输入（含 ZML LoRA 组等可切换参数）
-- **画风预设**：给「画风」起名，每个预设携带一段参数（节点覆盖或模板输入）。AI 用 `generateimage` 的 `style="画风名"` 一键切换画风——**一个工作流或一个模板即可出多种画风**，不再需要「一个画风配一个工作流」
+- **画风预设**：给「画风」起名，每个预设携带一段参数（节点覆盖或模板输入）。AI 用 `generateimage` 的 `style="画风名"` 一键切换画风——**一个工作流或一个模板即可出多种画风**，不再需要「一个画风配一个工作流」。需先安装第三方节点 **ZML 强力 LoRA 加载器**（[ComfyUI-ZML-Image](https://github.com/zml-w/ComfyUI-ZML-Image)）
 - AI 调用参数：正向提示词（必填）、方向 / 宽高（可选）、画风 `style`（可选）、模板 `template` / `templateparams`（模板模式）
 
 ## 角色提示词检索
@@ -225,7 +225,6 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 | APP-MCP 地址 | 可填 `http://127.0.0.1:8188/app-mcp` 或 `http://127.0.0.1:8188/mcp-server/api`；留空自动由「ComfyUI 地址」推导 |
 | 默认模板名 | 如 `动漫7`；AI 也可用 `template` 参数临时切换 |
 | 提示词输入参数名 | 默认 `positive`；留空/模板无此输入时自动取第一个字符串输入 |
-| 模板默认参数 | JSON 对象，如 `{"参数名": 值}`；只有模板已声明的输入才生效 |
 | 等待出图超时 | 等待上限（秒）；服务端超时后会继续轮询结果 |
 
 - 点「测试连通并列出模板」可即时验证连通性与可用模板。
@@ -265,7 +264,7 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 | 仅工作流模式 | 仅 APP-MCP 模板模式 |
 |---|---|
 | 工作流路径 / 目录扫描 / 自动识别 / 节点映射 | APP-MCP 地址 / 默认模板 / 提示词输入参数名 |
-| 多工作流卡片（含各自前缀） | 模板默认参数 / 模板等待超时 |
+| 多工作流卡片（含各自前缀） | 模板等待超时 |
 | 方向 `orientation` / 宽高 / 三档分辨率预设 / 兜底宽高 | 「模板模式下也拼接固定前缀」开关 |
 | 等待出图超时 / 轮询间隔 | |
 | AI 节点控制（`getcomfyuicontrols`/`nodeOverrides`） | |
@@ -287,10 +286,11 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 **2. 把工作流做成模板**
 
 1. 打开工作流 → 左上角菜单进 **App Builder**（就是「图形」下拉左边的那个方框图标；插件面板「后端 · 画风」页的教程里附了示意图，找不到就点开照着看）
-2. 把 AI 要填的控件标记为**输入**并起**清晰参数名**（如 `positive`）；把保存图片的节点标记为**输出**
-3. 在工作流里加一个 Markdown Note：`title` = 模板短名（如 `913流`），`description` = 说明（可空）
-4. 工作流用 **Save** 保存（不是 Export）→ ComfyUI 的 **Settings → MCP Server → Templates → Create from Workflow**
-5. 回到本插件：填「默认模板名」→ 点「测试连通并列出模板」
+2. 在 App Builder 里把 AI 要填的控件标记为**输入**并起**清晰参数名**（如「正面提示词」「宽度」「高度」）；把保存图片的节点标记为**输出**
+3. 工作流用 **Save** 保存（不是 Export）→ ComfyUI 的 **Settings → MCP Server → Templates → Create from Workflow**
+4. 回到本插件：填「默认模板名」→ 点「测试连通并列出模板」
+
+> 新版 ComfyUI 创建模板时，弹窗里的工作流下拉可能显示 `Error loading workflows`、按钮点不动，此时按一下键盘 **Esc** 就能继续创建（插件面板的教程里附了这个弹窗的示意图）。
 
 **3. 新手避坑**
 
@@ -309,6 +309,8 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 > 以上教程在插件面板「后端 · 画风」页的「安装 APP-MCP 节点」折叠区里也有一份（可点击链接 + 可复制地址，切到模板模式即显示）。
 
 ## 画风预设（一个工作流 / 模板切换多种画风）
+
+依赖 ComfyUI 侧的第三方节点 **ZML 强力 LoRA 加载器**（[ComfyUI-ZML-Image](https://github.com/zml-w/ComfyUI-ZML-Image)），没装的话画风切换无法生效。模板模式下还需要让 agent 修改模板，把 ZML 强力加载器节点的 `lora_loader_data` 设置为**输入**——这个数据输入在 ComfyUI 界面里无法手动选中。
 
 在配置 UI「后端 · 画风 → 画风预设」里用卡片维护（新增后点卡片展开填参数），底层仍是 JSON 数组。**最推荐的用法是只填 ZML LoRA 组名**（模板模式下新增画风时会自动把组名填成画风名）：
 
@@ -370,6 +372,13 @@ AI 默认不再写画风/质量类提示词（如 masterpiece、best quality、s
 超时或连接失败时，提示中会提醒：若同机开了语音优先，Comfy 进程可能已被结束，需手动重启 ComfyUI。
 
 ## 版本历史
+
+### v5.1.1（2026-11-15）
+
+- **后端模式说明更清楚**：配置 UI「生图后端」直接写明工作流模式适合简单工作流、小白易上手，复杂或包含较多第三方节点的工作流建议用 APP-MCP 模板模式（兼容性好，但首次使用相对复杂且需下载第三方 ComfyUI 插件）
+- **画风预设补充依赖说明**：需先安装第三方节点 ZML 强力 LoRA 加载器（附仓库链接）；模板模式还需让 agent 修改模板，把 `lora_loader_data` 设置为模板输入（ComfyUI 界面里无法手动选中）
+- **APP-MCP 安装教程精简为 5 步**：删去「加 Markdown Note」一步，App Builder 一步改为「正面提示词 / 分辨率宽高」示例并新增输入/输出标记示意图，Create from Workflow 一步补充弹窗示意图与「下拉显示 Error loading workflows、按钮点不动时按 Esc 继续」的说明
+- **APP-MCP 模板设置去掉「模板默认参数」输入框**：模板参数改由 AI 按模板已声明的输入传（`templateparams`）
 
 ### v5.1.0（2026-11-07）
 

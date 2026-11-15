@@ -668,8 +668,6 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
             v => Configuration.AppMcpPromptParam = v);
         b.CloseElement();
 
-        AddTextArea(b, ref i, "模板默认参数（JSON 对象）", Configuration.AppMcpDefaultParams,
-            v => Configuration.AppMcpDefaultParams = v, 3);
         AddTextArea(b, ref i, "模板自定义说明（会注入 AI 提示词）", Configuration.AppMcpTemplateNotes,
             v => Configuration.AppMcpTemplateNotes = v, 4);
 
@@ -699,8 +697,7 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         }
 
         AddHelp(b, ref i, "参数与尺寸怎么填？",
-            "模板默认参数写 {\"参数名\": 值}，只有模板已声明的输入才生效，AI 可用 params 覆盖；"
-            + "改完模板记得点「测试连通并列出模板」核对输入名。\n"
+            "改完模板记得点「测试连通并列出模板」核对输入名；只有模板已声明的输入才生效，AI 用 params 传。\n"
             + "画面尺寸由模板决定；模板若声明了 width / height / 宽 / 高 输入，AI 可用 params 传。"
             + "「模板自定义说明」会随系统提示词一起给 AI，用来说明各开关用法。");
         EndSection(b, ref i);
@@ -742,7 +739,10 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         b.AddContent(i++, "APP-MCP 模板模式");
         b.CloseElement();
         b.CloseElement();
-        AddHint(b, ref i, "切换后需重载本模块；模板参数在「生图」页填。");
+        AddHint(b, ref i,
+            "工作流模式：适合简单工作流，小白易上手；复杂工作流或包含较多第三方节点时容易出问题。\n"
+            + "APP-MCP 模板模式：适合较复杂的工作流，兼容性好；但首次使用相对复杂，且需要下载第三方 ComfyUI 插件（见下方「安装 APP-MCP 节点」）。\n"
+            + "切换后需重载本模块；模板参数在「生图」页填。");
         AddHelp(b, ref i, "模板模式还要准备什么？",
             "模板模式依赖 ComfyUI 先安装第三方开源节点 ComfyUI-APP-MCP（免费开源），"
             + "安装步骤、新手避坑与文档链接在本页下方「安装 APP-MCP」里。"
@@ -755,17 +755,21 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         // 第三方节点教程：整块默认收起，不占主流程
         if (appMcp)
         {
-            AddSection(b, ref i, "安装 APP-MCP 节点（第三方，首次使用看这里）", note: "6 步 + 避坑");
+            AddSection(b, ref i, "安装 APP-MCP 节点（第三方，首次使用看这里）", note: "5 步 + 避坑");
             AddNote(b, ref i, "本插件只是「调用方」：模板模式必须让 ComfyUI 先装上 ComfyUI-APP-MCP，否则「测试连通」一定失败。");
             AddSteps(b, ref i,
                 "装节点（二选一）：① ComfyUI Manager → 搜索 app mode mcp → 安装（推荐）；② 手动：进 ComfyUI/custom_nodes 执行 git clone https://github.com/Lotus0614/ComfyUI-APP-MCP.git，再按该仓库 README 安装 requirements.txt 依赖（Windows 便携包要用包内 python_embeded\\python.exe）。",
                 "重启 ComfyUI（必须），确认启动日志没有报错。",
-                "打开你要用的工作流 → 左上角菜单进 App Builder → 把 AI 要填的控件标记为「输入」并起清晰参数名（例如 positive）→ 把保存图片的节点标记为「输出」。",
-                "在该工作流里加一个 Markdown Note：title 填模板短名（例如 913流），description 填说明（可留空）。",
-                "工作流用 Save 保存（不是 Export）；再进 ComfyUI 的 Settings → MCP Server → Templates → Create from Workflow 创建模板。",
+                "打开你要用的工作流 → 左上角菜单进 App Builder → 把 AI 要填的控件标记为「输入」并起清晰参数名（例如 正面提示词、分辨率宽高）→ 把保存图片的节点标记为「输出」。",
+                "工作流用 Save 保存（不是 Export）；再进 ComfyUI 的 Settings → MCP Server → Templates → Create from Workflow 创建模板。"
+                + "新版 ComfyUI 创建模板时，弹窗里的工作流下拉可能显示 Error loading workflows、按钮点不动，此时按一下键盘 Esc 就能继续创建。",
                 "回到本插件：填「默认模板名」→ 点「测试连通并列出模板」，能看到模板与输入明细就算成功。");
             AddImage(b, ref i, UiAssets.AppBuilderEntryPng,
                 "找不到 App Builder？看这张图：ComfyUI 左上角「图形」下拉左边的那个方框图标就是 App Builder 入口（对应上面第 3 步）。");
+            AddImage(b, ref i, UiAssets.AppBuilderInputPng,
+                "App Builder 里：顶部是「输入 / 输出 / 预览」三步。勾选要交给 AI 填的控件（例如「正面提示词」「宽度」「高度」），再点「输出」把保存图片的节点标记为输出（对应上面第 3 步）。");
+            AddImage(b, ref i, UiAssets.CreateTemplatePng,
+                "Templates → Create from Workflow 弹窗。若这里显示 Error loading workflows、按钮点不动，按一下键盘 Esc 即可恢复并继续创建（对应上面第 4 步）。");
 
             AddNote(b, ref i,
                 "新手避坑（最常见的 6 个坑）：\n"
@@ -794,6 +798,12 @@ public partial class ComfyuiServiceUI : ModuleUIBase<ComfyuiService, ComfyuiConf
         var appMcp = IsAppMcp();
         AddSection(b, ref i, "画风预设",
             note: _styleCards.Count == 0 ? "未配置" : $"{_styleCards.Count} 个");
+
+        AddHint(b, ref i,
+            "需要先安装第三方节点「ZML 强力 LoRA 加载器」（ComfyUI-ZML-Image）：https://github.com/zml-w/ComfyUI-ZML-Image"
+            + (appMcp
+                ? "\n模板模式还要让 agent 修改模板，把 ZML 强力加载器节点的 lora_loader_data 设置为「输入」——ComfyUI 界面里无法手动选中这个数据输入。"
+                : ""));
 
         if (_styleCards.Count == 0)
         {
